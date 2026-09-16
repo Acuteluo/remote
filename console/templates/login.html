@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>MEOW控制台 · {{title}}</title>
+<link rel="icon" href="/static/vendor/favicon.svg">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="login-body">
+  <div class="login-card">
+    <div class="login-logo">{{logo}}</div>
+    <h1 id="login-title">{{heading}}</h1>
+    <p class="login-sub">{{sub}}</p>
+    {{form}}
+    <p class="login-tip">{{tip}}</p>
+  </div>
+<script>
+  const h = document.getElementById('login-title');
+  if (h && !h.dataset.fx) { h.dataset.fx = 1; const t = h.textContent; h.textContent = '';
+    let i = 0; (function ty(){ if (i <= t.length) { h.textContent = t.slice(0, i++); setTimeout(ty, 90); } })(); }
+  // 设置页: 两次密码不一致时立刻提示, 别等提交
+  const p2 = document.getElementById('pw2');
+  if (p2) p2.addEventListener('input', () => {
+    const p1 = document.getElementById('pw1');
+    p2.setCustomValidity(p1 && p2.value && p1.value !== p2.value ? '两次输入的密码不一致' : '');
+  });
+</script>
+</body>
+</html>

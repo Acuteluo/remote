@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>MEOW控制台 · {{host}}</title>
+<link rel="icon" href="/static/vendor/favicon.svg">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="logo">MEOW控制台</span>
+  <span class="host" id="clock">连接中…</span>
+  <a href="/logout">退出</a>
+</div>
+<div class="wrap">
+
+  <div class="quick">
+    <a href="/term"><span class="ic">⌨️</span><span class="ti">终端</span><span class="de">bash · 干一切</span></a>
+    <a href="/vnc"><span class="ic">🖥️</span><span class="ti">远程桌面</span><span class="de">实时图传 · 可操控</span></a>
+    <a href="/cam"><span class="ic">📷</span><span class="ti">摄像头</span><span class="de">后台采集 · 电脑不弹窗</span></a>
+    {{extras}}
+  </div>
+
+  <div class="alerts" id="alerts"></div>
+
+  <div class="chips" id="chips"></div>
+
+  <div class="grid">
+    <div class="card">
+      <h3>CPU</h3>
+      <div class="big"><span id="cpu-total">--</span><small style="font-size:13px;color:var(--dim)"> %</small></div>
+      <div class="bar"><i id="cpu-bar"></i></div>
+      <canvas id="cpu-hist" width="440" height="40" style="width:100%;height:40px"></canvas>
+      <div class="cores" id="cpu-cores"></div>
+      <div class="kv"><span class="d">负载均值</span><span id="load">--</span></div>
+    </div>
+    <div class="card">
+      <h3>内存 / 交换</h3>
+      <div class="big"><span id="mem-used">--</span><small style="font-size:13px;color:var(--dim)"> / <span id="mem-total">--</span></small></div>
+      <div class="bar"><i id="mem-bar"></i></div>
+      <div class="kv"><span class="d">Swap</span><span id="swap">--</span></div>
+      <div class="kv"><span class="d">运行时长</span><span id="uptime">--</span></div>
+    </div>
+    <div class="card">
+      <h3>温度</h3>
+      <div id="temps"></div>
+    </div>
+    <div class="card">
+      <h3>网络</h3>
+      <div id="net"></div>
+    </div>
+    <div class="card">
+      <h3>磁盘</h3>
+      <div id="disks"></div>
+    </div>
+    <div class="card">
+      <h3>电池 / GPU</h3>
+      <div id="batgpu"></div>
+    </div>
+    <div class="card">
+      <h3>进程 TOP(CPU)</h3>
+      <table class="tbl" id="tbl-cpu"></table>
+    </div>
+    <div class="card">
+      <h3>进程 TOP(内存)</h3>
+      <table class="tbl" id="tbl-mem"></table>
+    </div>
+    <div class="card">
+      <h3>窗口(桌面)</h3>
+      <div id="windows" style="font-size:12.5px"></div>
+    </div>
+    <div class="card">
+      <h3>Tailscale 设备</h3>
+      <div id="peers" style="font-size:12.5px"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:10px">
+    <h3>电源控制</h3>
+    <div class="power">
+      <button data-act="screen-off">熄屏</button>
+      <button data-act="screen-on">亮屏</button>
+      <button data-act="lock">锁屏</button>
+      <button data-act="suspend">睡眠</button>
+      <button data-act="reboot" class="danger">重启</button>
+      <button data-act="poweroff" class="danger">关机</button>
+    </div>
+    <div class="kv" style="margin-top:8px"><span class="d" id="power-msg">危险操作需二次确认</span></div>
+  </div>
+
+  <div class="card" style="margin-top:10px">
+    <h3>修改密码</h3>
+    <div class="pwform">
+      <input type="password" id="pw-old" placeholder="原密码" autocomplete="current-password">
+      <input type="password" id="pw-new" placeholder="新密码(至少 6 位)" autocomplete="new-password">
+      <input type="password" id="pw-new2" placeholder="再输一次新密码" autocomplete="new-password">
+      <button id="pw-btn">修改</button>
+    </div>
+    <div class="kv" style="margin-top:8px"><span class="d" id="pw-msg"></span></div>
+  </div>
+
+  <div class="foot">MEOW Console · 数据每 2s 推送<br>
+    <a href="/log">审计日志</a> · 谁在什么时候连过、做了什么</div>
+</div>
+<script src="/static/home.js"></script>
+</body>
+</html>

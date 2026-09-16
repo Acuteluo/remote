@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#0b0f14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>远程桌面 · {{host}}</title>
+<link rel="icon" href="/static/vendor/favicon.svg">
+<link rel="stylesheet" href="/static/app.css">
+<style>
+  .audiobtn { flex: none; padding: 4px 9px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--card2); color: var(--fg); font-size: 14px; }
+  .audiobtn.on { background: var(--acc); color: #04121f; }
+  /* 电脑音量: 已改到设置面板滑块(#set-vol) —— 不再在画面上浮任何声音控件。
+     (2026-09-16 用户要求: 画面上的静音圆按钮不要了, 在设置里用滑块调节。) */
+
+  /* ---- 全屏(横屏)模式 ----
+     像视频播放器: 只展示画面 + 声音, **完全不响应远程触控**。
+     注意: 这里的顶栏用渐变而不是 backdrop-filter —— 画布上方禁止毛玻璃。 */
+  body.vnc-fs { overflow: hidden; background: #000; }
+  body.vnc-fs .topbar,
+  body.vnc-fs .vnc-toolbar,
+  body.vnc-fs #keybar,
+  body.vnc-fs #pad-panel,
+  body.vnc-fs #vnc-banner { display: none !important; }
+  body.vnc-fs #screen-wrap { position: fixed; inset: 0; z-index: 9999; }
+  body.vnc-fs #pad-cursor { display: none !important; }
+  /* 接住所有触摸: 它盖在画布上, 事件不会传到 noVNC 的 canvas */
+  #vnc-fs-tap { position: absolute; inset: 0; z-index: 40; touch-action: none; }
+  #vnc-fs-tap.hide { display: none; }
+  #vnc-fs-ui { position: absolute; left: 0; right: 0; top: 0; z-index: 46;
+    display: flex; align-items: center; gap: 10px;
+    padding: calc(8px + env(safe-area-inset-top)) calc(14px + env(safe-area-inset-right))
+             calc(26px + env(safe-area-inset-top)) calc(14px + env(safe-area-inset-left));
+    background: linear-gradient(180deg, rgba(0,0,0,.78), rgba(0,0,0,0));
+    opacity: 0; pointer-events: none; transition: opacity .28s ease; }
+  #vnc-fs-ui.hide { display: none; }
+  #vnc-fs-ui.show { opacity: 1; pointer-events: auto; }
+  #vnc-fs-ui button { background: rgba(0,0,0,.6); color: #e8f1fa;
+    border: 1px solid rgba(255,255,255,.24); border-radius: 999px;
+    padding: 8px 16px; font-size: 15px; font-family: inherit; line-height: 1; }
+  /* 全屏里的退出键**不要框**(用户要求): 就一个 ‹ 压在画面上,
+     靠 text-shadow 保证亮背景上也看得清。主界面的 ‹ 保留框(见 app.css .back)。 */
+  #vnc-fs-ui #vnc-fs-exit { font-size: 30px; padding: 0 14px 6px;
+    background: transparent; border: 0;
+    text-shadow: 0 1px 4px #000, 0 0 12px rgba(0, 0, 0, .75); }
+  #vnc-fs-ui #vnc-fs-info { flex: 1; color: #cfe3f5; font-size: 12px;
+    font-variant-numeric: tabular-nums; text-shadow: 0 1px 3px #000; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; }
+
+  /* 连接维护 */
+  #vnc-clients { font-size: 12px; color: var(--fg); font-variant-numeric: tabular-nums; }
+  #vnc-clients.warn { color: var(--warn); }
+  #vnc-clients.bad { color: var(--bad); }
+  #vnc-reset { flex: 0 1 auto; min-width: 104px; }
+  #vnc-reset:disabled { opacity: .6; }
+  /* 设置行排版: 面板只有 302px。标签不折行、按钮文字不断行,
+     滑块允许压缩 —— 这样每行都能塞得下, 不用折行。
+     (标签一折行会变成"触控板/高度", 按钮一压缩会竖排成单字。) */
+  .setrow > span:first-child { flex: none; white-space: nowrap; }
+  .setrow .seg { flex: none; margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }
+  .setrow .seg button { white-space: nowrap; padding: 5px 11px; }
+  .setrow input[type=range] { flex: 1 1 60px; min-width: 60px; }
+
+  .vnc-toolbar { display: flex; gap: 8px; padding: 8px 10px; background: var(--card);
+    border-bottom: 1px solid var(--line); overflow-x: auto; }
+  .vnc-toolbar button { flex: none; padding: 8px 14px; border-radius: 9px; border: 1px solid var(--line);
+    background: var(--card2); color: var(--fg); font-size: 13px; }
+  .vnc-toolbar button:active { border-color: var(--acc); }
+  .vnc-toolbar button.on { background: var(--acc); color: #04121f; font-weight: 600; }
+  #pad-panel { flex: none; background: var(--card); border-top: 1px solid var(--line);
+    padding: 8px 10px calc(8px + env(safe-area-inset-bottom)); }
+  #pad-panel.hide { display: none; }
+  #pad-area { flex: 1; border: 1px solid var(--line); border-radius: 12px; background: var(--card2);
+    position: relative; touch-action: none; overflow: hidden; }
+  #pad-area .hint { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: var(--dim); font-size: 12px; text-align: center; line-height: 1.9; pointer-events: none; }
+  .padbtn { padding: 14px 4px; border-radius: 10px; border: 1px solid var(--line);
+    background: var(--card2); color: var(--fg); font-size: 14px; }
+  .padbtn.big { flex: 1; }
+  .padbtn.mini { flex: 1; padding: 9px 4px; font-size: 12px; color: var(--dim); }
+  .padbtn:active { border-color: var(--acc); background: #1a2735; }
+  .padbtn.on { background: var(--warn); color: #241a04; font-weight: 700; border-color: var(--warn); }
+  #pad-cursor { position: fixed; z-index: 65; width: 26px; height: 26px; margin: -13px 0 0 -13px;
+    border: 2px solid rgba(77,163,255,.9); border-radius: 50%; pointer-events: none;
+    box-shadow: 0 0 6px rgba(0,0,0,.6); }
+  #pad-cursor::after { content: ''; position: absolute; left: 50%; top: 50%; width: 4px; height: 4px;
+    margin: -2px 0 0 -2px; border-radius: 50%; background: rgba(77,163,255,.95); }
+  .setrow { display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 7px 0; font-size: 13px; border-bottom: 1px solid #1b2531; }
+  .setrow:last-of-type { border-bottom: 0; }
+  .setrow .seg { display: flex; gap: 4px; }
+  .setrow .seg button { padding: 5px 14px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--card2); color: var(--fg); font-size: 12px; }
+  .setrow .seg button.on { background: var(--acc); color: #04121f; font-weight: 700; }
+  .setrow input[type="range"] { accent-color: var(--acc); }
+  .setrow input[type="checkbox"] { width: 17px; height: 17px; accent-color: var(--acc); }
+  .setnote { color: var(--dim); font-size: 11px; margin: 4px 0 0; line-height: 1.6; }
+  /* 快捷键条: 手机软键盘没有 Esc/Tab/方向键, 也没有修饰键, 只能靠这一排 */
+  #keybar { flex: none; display: flex; gap: 6px; padding: 7px 10px; background: var(--card);
+    border-bottom: 1px solid var(--line); overflow-x: auto; }
+  #keybar.hide { display: none; }
+  #keybar .kb { flex: none; min-width: 46px; padding: 9px 11px; border-radius: 9px;
+    border: 1px solid var(--line); background: var(--card2); color: var(--fg);
+    font-size: 13px; font-family: inherit; }
+  #keybar .kb:active { border-color: var(--acc); background: #1a2735; }
+  #keybar .kb.mod.on { background: var(--warn); color: #241a04; font-weight: 700;
+    border-color: var(--warn); }
+  #keybar .kb.combo { color: var(--dim); }
+  #keybar .sep { flex: none; width: 1px; background: var(--line); margin: 3px 3px; }
+  .cbtn { flex: 1 1 auto; min-width: 78px; padding: 9px 10px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--card2); color: var(--fg); font-size: 12.5px; }
+  .cbtn:active { border-color: var(--acc); }
+  .cbtn.pri { background: var(--acc); color: #04121f; font-weight: 600; }
+  /* 服务端版本提示: 前端是每次请求从磁盘读的, 后端改了必须重启才生效。
+     不提示的话只会静默失败(接口 404), 让人以为改的代码没起作用。 */
+  #vnc-banner { flex: none; display: none; padding: 8px 12px; background: #3a2418;
+    border-bottom: 1px solid #5a3a22; color: var(--warn); font-size: 12px; line-height: 1.6; }
+  #vnc-banner.show { display: block; }
+  /* 右上角实时延迟: 绿 <80ms / 黄 <200ms / 红 >=200ms */
+  /* 网络 / 画面 合成**一个胶囊**: 手机顶栏太窄, 两个独立胶囊各自带边框+内边距
+     要多占 ~20px, 正好把"返回/远程桌面"挤成竖排。合成一个框后显示
+     "网络 20ms │ 画面 45ms"。 */
+  .pingbox { flex: none; display: inline-flex; align-items: center;
+    border: 1px solid var(--line); border-radius: 999px;
+    background: var(--card2); overflow: hidden; margin-left: auto; }
+  /* 连上以后**不显示"已连接"**(2026-09-16 用户要求): 那是默认状态, 顶栏位置紧张,
+     没必要一直占着。断线/重连/出错时才显示 —— 那才是需要你知道的。
+     文字本身还在 DOM 里(测试拿它当连接判据), 只是不显示。
+     状态栏一藏, 就靠 .pingbox 的 margin-left:auto 把右边这组顶到最右。 */
+  #vnc-status.ok { display: none; }
+  .pingbox #vnc-ping, .pingbox #vnc-rate {
+    border: 0; border-radius: 0; background: transparent; padding: 3px 7px; }
+  .pingbox #vnc-rate { border-left: 1px solid var(--line); }
+  #vnc-ping { flex: none; font-size: 11px; font-variant-numeric: tabular-nums;
+    padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line);
+    background: var(--card2); color: var(--dim); white-space: nowrap; }
+  #vnc-ping.ok { color: var(--ok); border-color: #1f4a37; }
+  #vnc-ping.warn { color: var(--warn); border-color: #4a3a1f; }
+  #vnc-ping.bad { color: var(--bad); border-color: #4a2530; }
+  /* 帧率/码率: 和延迟并排。延迟低≠不卡, 卡不卡要看帧率 */
+  #vnc-rate { flex: none; font-size: 11px; font-variant-numeric: tabular-nums;
+    padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line);
+    background: var(--card2); color: var(--dim); white-space: nowrap; }
+  #vnc-rate.ok { color: var(--ok); border-color: #1f4a37; }
+  #vnc-rate.warn { color: var(--warn); border-color: #4a3a1f; }
+  #vnc-rate.bad { color: var(--bad); border-color: #4a2530; }
+</style>
+</head>
+<body class="vnc-page">
+<div class="topbar">
+  <a class="back" href="/home" title="返回" aria-label="返回">‹</a>
+  <span class="logo">远程桌面</span>
+  <span class="host" id="vnc-status">连接中…</span>
+  <span class="pingbox">
+    <span id="vnc-ping" class="ping" title="网络延迟(HTTP 往返)。点一下立刻重测">网络 --</span>
+    <span id="vnc-rate" class="ping" title="画面延时估算(网络单程 + 25ms)。帧率/码率也在这里看">画面 --</span>
+  </span>
+  <button id="vnc-audio" class="audiobtn" title="把电脑正在放的声音转发到手机">🔕</button>
+</div>
+<audio id="vnc-audio-el" preload="none"></audio>
+<div id="vnc-banner"></div>
+<div class="vnc-toolbar">
+  <button id="vnc-kbbtn">键盘</button>
+  <button id="vnc-keybtn">按键</button>
+  <button id="vnc-padbtn" class="on">触控板</button>
+  <button id="vnc-clipbtn">剪贴板</button>
+  <button id="vnc-shot" title="把当前远程画面保存为图片到手机">截图</button>
+  <button id="vnc-setbtn">设置</button>
+  <button id="vnc-fs" title="全屏横屏观看(只展示画面和声音)">⛶ 全屏</button>
+</div>
+<div id="keybar" class="hide">
+  <button class="kb mod" data-mod="ctrl">Ctrl</button>
+  <button class="kb mod" data-mod="alt">Alt</button>
+  <button class="kb mod" data-mod="shift">Shift</button>
+  <button class="kb mod" data-mod="super">Super</button>
+  <span class="sep"></span>
+  <button class="kb" data-key="esc">Esc</button>
+  <button class="kb" data-key="tab">Tab</button>
+  <button class="kb" data-key="enter">⏎</button>
+  <button class="kb" data-key="backspace">⌫</button>
+  <button class="kb" data-key="delete">Del</button>
+  <span class="sep"></span>
+  <button class="kb" data-key="left">←</button>
+  <button class="kb" data-key="up">↑</button>
+  <button class="kb" data-key="down">↓</button>
+  <button class="kb" data-key="right">→</button>
+  <span class="sep"></span>
+  <button class="kb" data-key="home">Home</button>
+  <button class="kb" data-key="end">End</button>
+  <button class="kb" data-key="pgup">PgUp</button>
+  <button class="kb" data-key="pgdn">PgDn</button>
+  <span class="sep"></span>
+  <button class="kb combo" data-combo="ctrl+a">Ctrl+A</button>
+  <button class="kb combo" data-combo="ctrl+c">Ctrl+C</button>
+  <button class="kb combo" data-combo="ctrl+v">Ctrl+V</button>
+  <button class="kb combo" data-combo="ctrl+x">Ctrl+X</button>
+  <button class="kb combo" data-combo="ctrl+z">Ctrl+Z</button>
+  <button class="kb combo" data-combo="ctrl+enter">Ctrl+↵</button>
+  <button class="kb combo" data-combo="alt+tab">Alt+Tab</button>
+  <button class="kb combo" data-combo="shift+tab">Shift+Tab</button>
+  <button class="kb combo" id="vnc-cad">Ctrl+Alt+Del</button>
+</div>
+<div id="screen-wrap">
+  <div id="screen"></div>
+  <div class="vnc-status" id="vnc-overlay">
+    <span id="vnc-overlay-msg">正在连接远程桌面…</span>
+    <button id="vnc-reconnect" style="display:none">重新连接</button>
+  </div>
+  <div id="pad-cursor" style="display:none"></div>
+
+  <!-- 全屏(横屏)模式专用:
+       #vnc-fs-tap 是一层透明层, **盖在画布上面** —— 全屏时所有触摸都落在它身上,
+       noVNC 完全收不到事件, 所以画面就真的只是"看", 不会误触远程桌面。
+       #vnc-fs-ui 是控件(退出/声音/信息), 默认隐藏, 点屏幕才淡入。 -->
+  <div id="vnc-fs-tap" class="hide"></div>
+  <div id="vnc-fs-ui" class="hide">
+    <button id="vnc-fs-exit" title="退出全屏">‹</button>
+    <span id="vnc-fs-info"></span>
+    <button id="vnc-fs-audio" title="声音">🔕</button>
+  </div>
+
+  <!-- 电脑音量改在设置面板滑块(#set-vol); 画面上不再浮声音控件(2026-09-16)。 -->
+
+  <textarea id="vnc-kb" autocapitalize="off" autocomplete="off" autocorrect="off"
+    spellcheck="false" enterkeyhint="enter"
+    style="position:fixed;top:-40px;left:0;width:1px;height:1px;opacity:0.01;"></textarea>
+
+  <div id="set-panel" style="display:none;position:absolute;right:8px;top:8px;width:302px;
+       max-height:calc(100% - 16px);overflow-y:auto;
+       background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;z-index:70">
+    <div class="setrow"><span>远程桌面连接数</span>
+      <b id="vnc-clients">查询中…</b>
+    </div>
+    <p class="setnote" id="vnc-clients-note">x11vnc 是共享模式，连它的客户端越多，
+      画面越卡、越容易反复重连。正常只有你自己 1 个。</p>
+    <div class="setrow"><span>连接维护</span>
+      <button id="vnc-reset" class="cbtn">清理并重启</button>
+    </div>
+    <p class="setnote">清掉所有遗留连接并重启控制台。手机锁屏/切网留下的半死连接
+      要等 90 秒才自动消失，这期间会拖慢画面 —— 点一下立刻清干净，只留你自己。</p>
+    <div class="setrow"><span>画质</span>
+      <div class="seg q">
+        <button data-q="3">低</button><button data-q="6">中</button><button data-q="9">高</button>
+      </div>
+    </div>
+    <div class="setrow"><span>电脑音量</span>
+      <input type="range" id="set-vol" min="0" max="150" step="1">
+      <b id="set-vol-v" style="min-width:48px;text-align:right;font-size:12px"></b>
+    </div>
+    <p class="setnote">调的是电脑本机的扬声器音量(不限于这次远程会话), 换手机打开也是同一个
+      值 —— 所以它存在电脑上。<b>超过 100% 会变成红色</b>(对应 Linux 音量条从白色进入红色区,
+      属于软件放大、可能失真); 拖到底 0% 即静音。</p>
+    <div class="setrow"><span>触控板高度</span>
+      <input type="range" id="set-padh" min="120" max="300" step="5">
+      <b id="set-padh-v" style="min-width:44px;text-align:right;font-size:12px"></b>
+    </div>
+    <div class="setrow"><span>滚动速度</span>
+      <input type="range" id="set-scroll" min="5" max="25" step="1">
+      <b id="set-scroll-v" style="min-width:44px;text-align:right;font-size:12px"></b>
+    </div>
+    <div class="setrow"><span>滚动方向</span>
+      <div class="seg" id="set-scrolldir">
+        <button data-d="1">上滑=内容上移</button>
+        <button data-d="-1">上滑=内容下移</button>
+      </div>
+    </div>
+    <div class="setrow"><span>输入方式</span>
+      <div class="seg" id="set-typemode">
+        <button data-m="auto">自动</button>
+        <button data-m="term">终端</button>
+        <button data-m="paste">粘贴</button>
+        <button data-m="type">键入</button>
+      </div>
+    </div>
+    <p class="setnote">「自动」: 认出是终端就用 Ctrl+Shift+V, 其它应用用 Ctrl+V
+      (绕开 Chromium 的键盘布局缓存问题)。<b>你手动选过一次之后, 服务端会按窗口
+      类名记住</b> —— 像 VSCode 这种"编辑器里 Ctrl+V 正常、集成终端里不行"的,
+      选一次「终端」以后进 VSCode 就自动用 Ctrl+Shift+V。</p>
+    <div class="setrow"><span>输入响应</span>
+      <div class="seg" id="set-typebatch">
+        <button data-b="40">灵敏</button>
+        <button data-b="80">标准</button>
+        <button data-b="160">省流量</button>
+      </div>
+    </div>
+    <p class="setnote">攒够多久发一次。灵敏=手感跟手但请求多; 省流量=一次发更长一句,
+      移动网络下更划算。</p>
+    <label class="setrow"><span>手机屏幕常亮</span>
+      <input type="checkbox" id="set-awake"></label>
+    <label class="setrow"><span>切到后台仍保持连接</span>
+      <input type="checkbox" id="set-bgkeep"></label>
+    <p class="setnote">关掉(默认)时切后台 4 秒会主动断开, 免得在 x11vnc 侧留下半死连接
+      拖慢画面; 打开则保持连接, 但来回切会更费电、也可能残留僵尸客户端。</p>
+    <label class="setrow"><span>触控板提示文字</span>
+      <input type="checkbox" id="set-hints"></label>
+    <label class="setrow"><span>右上角显示延迟</span>
+      <input type="checkbox" id="set-ping"></label>
+    <label class="setrow"><span>边缘助弹</span>
+      <input type="checkbox" id="set-edge"></label>
+    <p class="setnote">贴边已经能直接触到屏幕最边缘, 一般不用开这个; 万一换到会夹客户端
+      坐标的 x11vnc 版本, 再打开它由服务端用 xdotool 钉住。</p>
+    <label class="setrow"><span>Dock 贴到底边就弹出(推荐开)</span>
+      <input type="checkbox" id="set-dock"></label>
+    <div class="setrow"><span>Dock 弹出延迟</span>
+      <div class="seg" id="set-dockdelay">
+        <button data-sd="0.08">快</button>
+        <button data-sd="0.25">标准</button>
+        <button data-sd="0.5">慢</button>
+      </div>
+    </div>
+    <p class="setnote" id="dock-state">读取系统设置中…</p>
+    <p class="setnote">远程指针是被"锁"在边缘的, 延迟大点更稳; 但**电脑上用真实鼠标**
+      快速划过底边不会停那么久, 延迟一大就"拉下去不弹, 偶尔才弹"。电脑上嫌迟钝
+      就选「快」(0.08 秒), 基本是贴到就出。</p>
+    <p class="setnote">Ubuntu 默认要求"把指针顶住屏幕边缘"才弹 Dock, 但远程注入的指针
+      触发不了那个压力判定, 会让 Dock 彻底不弹。勾选即关闭该要求, 改用"贴到边缘就弹"
+      的驻留判定。画质/触控板/滚动只存在本机。</p>
+    <div style="display:flex;justify-content:flex-end;margin-top:8px">
+      <button id="set-close" style="padding:6px 16px;border-radius:8px;border:1px solid var(--line);
+        background:var(--card2);color:var(--dim);font-size:12px">关闭</button>
+    </div>
+  </div>
+
+  <div id="clip-panel" style="display:none;position:absolute;left:8px;right:8px;bottom:8px;
+       background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px;z-index:60">
+    <textarea id="clip-text" rows="3" autocapitalize="off" autocomplete="off" spellcheck="false"
+      placeholder="在这里输入或粘贴文本, 再选下面的操作"
+      style="width:100%;border:1px solid var(--line);border-radius:8px;background:var(--card2);
+      color:var(--fg);padding:8px;font-size:14px;font-family:inherit"></textarea>
+    <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">
+      <button class="cbtn" id="clip-get">读取远端</button>
+      <button class="cbtn" id="clip-set">写入远端</button>
+      <button class="cbtn pri" id="clip-paste">粘贴到光标(Ctrl+V)</button>
+      <button class="cbtn" id="clip-type">直接键入</button>
+      <button class="cbtn" id="clip-close" style="color:var(--dim);flex:0 1 auto">关闭</button>
+    </div>
+    <p id="clip-msg" style="color:var(--dim);font-size:11px;margin:7px 0 0"></p>
+    <p style="color:var(--dim);font-size:11px;margin:3px 0 0">
+      终端(xterm 等)不响应 Ctrl+V, 请用"直接键入"; 读取到的内容长按可复制到手机。</p>
+  </div>
+</div>
+
+<div id="pad-panel">
+  <div id="pad-area" style="height:195px">
+    <div class="hint">滑动＝移动鼠标　轻点＝左键<br>双击后按住＝拖拽　双指点按＝右键<br>双指上下滑＝滚轮(带惯性)　左右滑＝横向</div>
+  </div>
+  <div style="display:flex;gap:8px;margin-top:8px">
+    <button class="padbtn big" id="pad-l">左键</button>
+    <button class="padbtn big" id="pad-r">右键</button>
+  </div>
+  <div style="display:flex;gap:8px;margin-top:8px">
+    <button class="padbtn mini" id="pad-drag">拖动锁</button>
+    <button class="padbtn mini" id="pad-speed">速度 中</button>
+    <button class="padbtn mini" id="pad-wu">滚 ↑</button>
+    <button class="padbtn mini" id="pad-wd">滚 ↓</button>
+  </div>
+</div>
+{{preloads}}
+<script type="module" src="/static/vnc.js"></script>
+</body>
+</html>

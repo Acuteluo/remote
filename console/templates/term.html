@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>终端 · {{host}}</title>
+<link rel="icon" href="/static/vendor/favicon.svg">
+<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/static/vendor/xterm/xterm.css">
+</head>
+<body class="term-page">
+<div class="topbar">
+  <a class="back" href="/home" title="返回" aria-label="返回">‹</a>
+  <span class="logo">终端</span>
+  <span class="host" id="term-status">连接中…</span>
+  <button id="term-reconnect">重连</button>
+</div>
+<div id="terminal"></div>
+<div class="qkbar">
+  <button id="qk-fontd" title="减小字号">A−</button>
+  <button id="qk-fonti" title="增大字号">A+</button>
+  <button data-seq="esc">Esc</button>
+  <button data-seq="tab">Tab</button>
+  <button data-seq="ctrl-c">Ctrl+C</button>
+  <button data-seq="ctrl-d">Ctrl+D</button>
+  <button data-seq="ctrl-u">Ctrl+U</button>
+  <button data-seq="up">↑</button>
+  <button data-seq="down">↓</button>
+  <button data-seq="left">←</button>
+  <button data-seq="right">→</button>
+  <button data-seq="pipe">|</button>
+  <button data-seq="slash">/</button>
+  <button data-seq="dash">--</button>
+  <button data-seq="kb">键盘</button>
+</div>
+<script src="/static/vendor/xterm/xterm.js"></script>
+<script src="/static/vendor/xterm/addon-fit.js"></script>
+<script src="/static/term.js"></script>
+</body>
+</html>

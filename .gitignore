@@ -1,0 +1,50 @@
+# 注意: git 的 .gitignore **只支持整行注释**。
+# 行尾写 `# xxx` 会被当成文件名的一部分(之前踩过, 导致几条规则全部失效)。
+# 要说明就单独起一行, 不要跟在规则后面。
+
+# ---------------------------------------------------------------- 运行时
+# 一切运行产生的东西都在 console/data/ 下: 凭据、会话密钥、审计日志、配置。
+# 整目录排除 —— 备份就是拷它, 清空就是删它, 也不会有哪个漏网进仓库。
+console/data/
+
+# 2026-09-16 之前这些文件是散在 console/ 根下的。老机器上还会残留一份
+# (正在跑的服务仍在用它们, 要等重启切到 data/ 后才能删), 一并排除,
+# 免得哪天手滑 git add -A 把凭据提交上去。
+console/auth.json
+console/.secret
+console/audit.log
+console/config.json
+console/.clipboard.tmp
+console/.type_mode
+console/.type_delay_ms
+console/.initial-password
+console/.testpass
+console/.dsh-web.url
+
+# ---------------------------------------------------------------- 本机私有模块
+# 这两个项目(文件管理 / DSH 助手)不随本仓库发布, 只是本机在用:
+#   console/extras_local.py  面板入口 + 私有路由(没有它就是纯远程桌面)
+#   ports.local.txt          转发器额外要暴露的端口(8330 / 3080)
+# 留在本机即可, 不进仓库; 删掉它们本仓库功能不受任何影响。
+console/extras_local.py
+console/extras_local.pyc
+ports.local.txt
+
+# 上面两个模块自带的东西(二进制 / 数据库 / 明文凭据 / 定制皮肤)
+bin/
+filebrowser/
+
+# ---------------------------------------------------------------- 测试产物
+console/tests/artifacts/
+
+# ---------------------------------------------------------------- 其它
+**/__pycache__/
+*.pyc
+*.pyo
+*.log
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store

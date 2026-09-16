@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>摄像头 · {{host}}</title>
+<link rel="icon" href="/static/vendor/favicon.svg">
+<link rel="stylesheet" href="/static/app.css">
+<style>
+  .cam-wrap{max-width:min(100%,980px);margin:10px auto;padding:0 10px}
+  .cam-stage{position:relative;background:#000;border-radius:10px;overflow:hidden;
+             display:flex;align-items:center;justify-content:center;min-height:220px;
+             /* 接管手势: 双指缩放/拖动都由我们处理, 别让浏览器去缩放整个页面 */
+             touch-action:none;-webkit-user-select:none;user-select:none}
+  .cam-stage img{display:block;width:100%;height:auto;max-height:70vh;object-fit:contain;
+                 transform-origin:center center;will-change:transform}
+  /* 信息放在**画面外面**, 不挡图; 全屏没有"外面", 才退化成底部一条半透明 */
+  .cam-osd{margin-top:8px;background:#111820;border:1px solid #1e2a36;border-radius:8px;
+    color:#cfe3f5;font:12.5px/1.75 ui-monospace,SFMono-Regular,Menlo,monospace;
+    padding:8px 11px;white-space:pre-wrap;letter-spacing:.2px;transition:opacity .28s ease}
+  .cam-osd b{color:#7fd1ff;font-weight:600}
+
+  /* 全屏: 优先 Fullscreen API; 不支持的(iPhone Safari)退化为 fixed 铺满的伪全屏。
+     全屏目标是 .cam-wrap(含 stage + 信息条), 这样信息条在全屏时仍可见。 */
+  /* 全屏里的覆盖层(顶部按钮 / "横过来看"提示 / 底部信息条) 3.5 秒没操作自动淡出,
+     点一下屏幕就回来 —— 和远程桌面全屏同一套逻辑。
+     用 **opacity 淡出而不是 display:none**: 一来有淡入淡出, 二来不触发重排
+     (display 会让 stage 变大 → 画面重新缩放, 看着会跳)。
+     **绝对不要用 filter/backdrop-filter**(画面上方的毛玻璃每帧都要重算, 手机必卡)。 */
+  .cam-fs-top{display:none;position:absolute;left:10px;top:10px;z-index:3;gap:8px;
+    transition:opacity .28s ease}
+  .cam-fs-top button{background:rgba(0,0,0,.55);color:#dfe9f3;
+    border:1px solid rgba(255,255,255,.25);border-radius:18px;padding:7px 13px;font-size:13px}
+  /* 全屏里的退出键不要框(和远程桌面的 ‹ 一致), 靠 text-shadow 保证看得清 */
+  .cam-fs-top #cam-fs-exit{background:transparent;border:0;font-size:22px;
+    padding:2px 12px 4px;text-shadow:0 1px 4px #000, 0 0 12px rgba(0,0,0,.75)}
+  body.cam-fs .cam-fs-top,.cam-wrap:fullscreen .cam-fs-top{display:flex}
+  body.cam-fs .cam-wrap.hideui .cam-fs-top,
+  body.cam-fs .cam-wrap.hideui .cam-rotate,
+  body.cam-fs .cam-wrap.hideui .cam-osd,
+  .cam-wrap:fullscreen.hideui .cam-fs-top,
+  .cam-wrap:fullscreen.hideui .cam-rotate,
+  .cam-wrap:fullscreen.hideui .cam-osd{opacity:0;pointer-events:none}
+
+  body.cam-fs{overflow:hidden;background:#000}
+  body.cam-fs .cam-wrap,.cam-wrap:fullscreen{position:fixed;inset:0;z-index:9999;
+    margin:0;padding:0;max-width:none;background:#000;
+    display:flex;flex-direction:column}
+  body.cam-fs .cam-stage,.cam-wrap:fullscreen .cam-stage{flex:1;min-height:0;border-radius:0}
+  body.cam-fs .cam-stage img,.cam-wrap:fullscreen .cam-stage img{
+    width:100%;height:100%;max-height:none;object-fit:contain}
+  body.cam-fs .cam-bar,body.cam-fs .cam-note,
+  .cam-wrap:fullscreen .cam-bar,.cam-wrap:fullscreen .cam-note{display:none}
+  body.cam-fs .cam-osd,.cam-wrap:fullscreen .cam-osd{margin:0;border:0;border-radius:0;
+    background:rgba(0,0,0,.55);text-align:center;font-size:11.5px;padding:6px 10px}
+
+  .cam-rotate{display:none;position:absolute;left:50%;top:12px;transform:translateX(-50%);
+    z-index:3;background:rgba(0,0,0,.55);color:#cfe3f5;border-radius:16px;
+    padding:5px 12px;font-size:12px;white-space:nowrap;transition:opacity .28s ease}
+  body.cam-fs .cam-wrap.portrait .cam-rotate,
+  .cam-wrap:fullscreen.portrait .cam-rotate{display:block}
+  .cam-hint{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+            color:#8b98a5;font-size:14px;text-align:center;padding:20px;line-height:1.7}
+  .cam-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px;font-size:13px}
+  .cam-bar select,.cam-bar button{background:#151c24;color:#d7e0ea;border:1px solid #253141;
+    border-radius:8px;padding:7px 11px;font-size:13px}
+  .cam-bar button.on{background:#123a2a;border-color:#1f7a55;color:#7ee2b8}
+  /* 麦克风实时电平: 一眼看出"到底有没有采到声音" */
+  .cam-level{width:56px;height:6px;background:#1b2531;border-radius:3px;overflow:hidden;
+    flex:0 0 auto}
+  .cam-level i{display:block;height:100%;width:0;background:#4ade80;transition:width .12s}
+  .cam-level.dead i{background:#64748b}
+  .mic-info{font-size:12px;color:#8b98a5;max-width:220px;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  .mic-info.ok{color:#7ee2b8}
+  .mic-info.bad{color:#ff8a8a}
+  .rec-dot{color:#ff6b6b;font-size:12px;white-space:nowrap;animation:cam-blink 1.5s infinite}
+  @keyframes cam-blink{50%{opacity:.3}}
+  .cam-bar button:active{background:#1e2833}
+  .cam-bar .sp{flex:1}
+  .cam-note{margin-top:10px;font-size:12.5px;color:#7d8894;line-height:1.75}
+  .cam-err{color:#ff8a8a}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <a class="back" href="/home" title="返回" aria-label="返回">‹</a>
+  <span class="logo">摄像头</span>
+  <span class="host" id="cam-status">连接中…</span>
+  <button id="cam-reconnect">重连</button>
+</div>
+
+<div class="cam-wrap" id="cam-wrap">
+  <div class="cam-stage">
+    <img id="cam-img" alt="摄像头画面">
+    <div class="cam-fs-top">
+      <button id="cam-fs-exit" title="退出全屏" aria-label="退出全屏">✕</button>
+      <button id="cam-fs-snap" title="截图">⤓ 截图</button>
+      <button id="cam-fs-audio" title="声音">🔊</button>
+    </div>
+    <div class="cam-rotate" id="cam-rotate">横过来看更清楚</div>
+    <div class="cam-hint" id="cam-hint">正在连接摄像头…</div>
+  </div>
+
+  <div class="cam-osd" id="cam-osd">等待画面…</div>
+
+  <div class="cam-bar">
+    <button id="cam-switch" title="切换摄像头" style="{{sw_hidden}}">🔄 切换</button>
+    <span id="cam-devs" hidden data-devs='{{devs_json}}'></span>
+    <select id="cam-size" title="分辨率">
+      <option value="320x240">320×240 省流量</option>
+      <option value="640x480" selected>640×480 标准</option>
+      <option value="1280x720">1280×720 高清</option>
+    </select>
+    <select id="cam-fps" title="帧率">
+      <option value="5">5 fps</option>
+      <option value="12" selected>12 fps</option>
+      <option value="20">20 fps</option>
+      <option value="30">30 fps</option>
+    </select>
+    <span class="sp"></span>
+    <button id="cam-audio" title="开启/关闭电脑麦克风">🔊</button>
+    <span id="cam-mic-info" class="mic-info">检测麦克风…</span>
+    <input type="range" id="cam-vol" min="0" max="100" step="5" value="80"
+           title="音量" style="width:88px">
+    <div class="cam-level" id="cam-level" title="麦克风实时电平"><i id="cam-level-bar"></i></div>
+    <span id="cam-audio-state" class="rec-dot" hidden>● 收音中</span>
+    <button id="cam-fs">⛶ 全屏</button>
+    <button id="cam-snap">截图</button>
+  </div>
+
+  <audio id="cam-audio-el" preload="none"></audio>
+
+  <div class="cam-note">
+    画面从电脑摄像头采集后直接推送到手机，<b>电脑屏幕上不会弹出任何窗口</b>。<br>
+    没人观看时采集会立即停止（摄像头指示灯也会熄灭）。<br>
+    双指可缩放/拖动，双击复位。<br>
+    <b>声音默认关闭</b>——点 <b>🔊</b> 才会采集电脑麦克风，旁边滑块调音量
+    （全屏时用手机侧面的音量键）。关掉页面或再点一次立即停止收音。
+  </div>
+  <div class="cam-note cam-err" id="cam-err"></div>
+</div>
+
+<script src="/static/cam.js"></script>
+</body>
+</html>
