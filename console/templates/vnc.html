@@ -48,6 +48,27 @@
   #vnc-fs-ui #vnc-fs-info { flex: 1; color: #cfe3f5; font-size: 12px;
     font-variant-numeric: tabular-nums; text-shadow: 0 1px 3px #000; white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis; }
+  /* 全屏里可点亮的开关(「滚轮」)与声音按钮并排, 亮起 = 右侧滚轮钮挂在画面上 */
+  #vnc-fs-ui button.on { background: rgba(77, 163, 255, .88); color: #04121f;
+    border-color: rgba(255, 255, 255, .4); font-weight: 600; }
+
+  /* ---- 全屏滚轮按钮(2026-09-16 加) ----
+     右上角「滚轮」开关打开后, 画面右缘中部出现上/下两个半透明圆钮, 只发滚轮。
+     不放进 #vnc-fs-ui: 那层 3.5 秒就淡出, 滚轮钮要一直挂在画面上供翻文档;
+     也不放进 #vnc-fs-tap: 它压在触摸层上方收自己的触摸, 点它不应晃出顶部控件。
+     半透明纯色(刻意不用 backdrop-filter —— 画布上方禁毛玻璃), 不挡后面的画面。 */
+  #vnc-fs-wheelbtns { display: none; position: absolute;
+    right: calc(10px + env(safe-area-inset-right)); top: 50%; transform: translateY(-50%);
+    flex-direction: column; gap: 14px; z-index: 45; touch-action: none; }
+  body.vnc-fs #vnc-fs-wheelbtns.show { display: flex; }
+  #vnc-fs-wheelbtns button { width: 54px; height: 54px; border-radius: 50%;
+    padding: 0; font-size: 22px; line-height: 1; font-family: inherit;
+    background: rgba(0, 0, 0, .38); color: rgba(232, 241, 250, .92);
+    border: 1px solid rgba(255, 255, 255, .22);
+    text-shadow: 0 1px 3px #000; touch-action: none;
+    user-select: none; -webkit-user-select: none; }
+  #vnc-fs-wheelbtns button:active { background: rgba(0, 0, 0, .62);
+    border-color: rgba(255, 255, 255, .45); }
 
   /* 连接维护 */
   #vnc-clients { font-size: 12px; color: var(--fg); font-variant-numeric: tabular-nums; }
@@ -219,6 +240,14 @@
     <button id="vnc-fs-exit" title="退出全屏">‹</button>
     <span id="vnc-fs-info"></span>
     <button id="vnc-fs-audio" title="声音">🔕</button>
+    <button id="vnc-fs-wheel" title="在画面右侧显示滚轮按钮(翻文档用)">滚轮</button>
+  </div>
+
+  <!-- 全屏滚轮按钮(2026-09-16 加): 右上角「滚轮」开关打开后才出现,
+       只发滚轮上下档位, 不做任何指针/触控操作; 退出全屏自动收回。 -->
+  <div id="vnc-fs-wheelbtns">
+    <button id="vnc-fs-wup" title="向上滚(长按连发)" aria-label="滚轮向上">↑</button>
+    <button id="vnc-fs-wdn" title="向下滚(长按连发)" aria-label="滚轮向下">↓</button>
   </div>
 
   <!-- 电脑音量改在设置面板滑块(#set-vol); 画面上不再浮声音控件(2026-09-16)。 -->

@@ -47,7 +47,8 @@ const DEFAULTS = { quality: 6, padH: 195, hints: true, scrollDir: 1, scrollSpeed
                    typeMode: 'auto', typeBatch: 80,
                    speed: 1,          // 触控板指针速度档位
                    keepAwake: true,   // 手机端屏幕常亮
-                   bgKeep: false };   // 切后台时保持连接
+                   bgKeep: false,     // 切后台时保持连接
+                   fsWheel: false };  // 全屏右侧的半透明滚轮钮(下次进全屏自动恢复)
 const S = Object.assign({}, DEFAULTS,
   JSON.parse(localStorage.getItem('meow_vnc') || '{}'));
 // 兼容旧版本存的 natural(语义与 scrollDir 相反)
@@ -1806,6 +1807,7 @@ if (shotBtn) {
 }
 
 syncAudioUI();
+fsWheelApply();   // 初始化「滚轮」开关的点亮态(容器本身要进全屏才会显示)
 
 // 离开页面时主动断开声音流 —— 别指望浏览器一定发 close 帧,
 // 否则服务端要等超时才发现, 回环/麦克风会白开一段。
@@ -1863,6 +1865,7 @@ async function fsEnter() {
   document.body.classList.add('vnc-fs');
   $('vnc-fs-tap').classList.remove('hide');
   $('vnc-fs-ui').classList.remove('hide');
+  fsWheelApply();                   // 上次开着滚轮钮的话, 进全屏就自动挂上
   try {                             // 只有真全屏下才允许锁方向
     if (screen.orientation && screen.orientation.lock) {
       await screen.orientation.lock('landscape');
@@ -1877,6 +1880,7 @@ function fsExit() {
   $('vnc-fs-tap').classList.add('hide');
   $('vnc-fs-ui').classList.remove('show');
   $('vnc-fs-ui').classList.add('hide');
+  fsWheelApply();                   // 滚轮钮只在全屏挂载, 退出即收回(开关状态仍记住)
   clearTimeout(fsHideTimer);
   zReset();                       // 放大状态不带出去(普通视图不能有变化)
   try {
@@ -1916,6 +1920,33 @@ if ($('vnc-fs-audio')) {
     fsShowUi();
   });
 }
+// ---- 全屏滚轮按钮(2026-09-16 加) ----
+// 全屏是"完全只看"模式, 想翻文档就得退出全屏去触控板划两下。这两个半透明圆钮
+// 只发滚轮档位(复用触控板的 wheelStep, 支持长按连发), 不带指针移动/点击等
+// 任何其它输入; 开关和声音按钮并排放在全屏右上角, 状态记进 localStorage,
+// 下次进全屏自动恢复。圆钮压在 #vnc-fs-tap 上方: 点它只滚轮, 不会晃出顶部控件。
+function fsWheelApply() {
+  const box = $('vnc-fs-wheelbtns');
+  if (!box) return;
+  // body.vnc-fs 不在时 CSS 也不会显示它, 这里同步收掉 .show 保持状态一致
+  box.classList.toggle('show', !!S.fsWheel && fsOn());
+  const btn = $('vnc-fs-wheel');
+  if (btn) {
+    btn.classList.toggle('on', !!S.fsWheel);
+    btn.title = S.fsWheel ? '收起右侧的滚轮按钮' : '在画面右侧显示滚轮按钮(翻文档用)';
+  }
+}
+if ($('vnc-fs-wheel')) {
+  $('vnc-fs-wheel').addEventListener('click', (e) => {
+    e.stopPropagation();
+    S.fsWheel = !S.fsWheel;
+    saveS();
+    fsWheelApply();
+    fsShowUi();                       // 重新计时, 让用户看清开关结果再淡出
+  });
+}
+holdRepeat($('vnc-fs-wup'), () => wheelStep(-1, 0));
+holdRepeat($('vnc-fs-wdn'), () => wheelStep(1, 0));
 // ---- 全屏里的双指缩放 / 拖动平移(2026-09-16 加) ----
 // 和摄像头页**同一套手感**(那套你已经验收过): 双指捏合缩放、放大后单指拖动平移、
 // 双击复位。只给 `#screen` 加 CSS transform ——
