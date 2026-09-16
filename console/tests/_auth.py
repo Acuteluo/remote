@@ -56,14 +56,14 @@ def creds():
         if ":" in t:
             a, b = t.split(":", 1)
             return a.strip(), b.strip()
-        return "Acuteluo", t
+        return "tester", t
 
     # install.sh 首次启动生成的随机密码
     u2, p2 = _kv(_read(os.path.join(_CONSOLE, ".initial-password")),
                  ("user", "用户名", "账号"), ("pass", "密码"))
     if u2 and p2:
         return u2, p2
-    return (u or "Acuteluo"), p
+    return (u or "tester"), p
 
 
 def login_body():

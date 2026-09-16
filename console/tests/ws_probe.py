@@ -96,7 +96,7 @@ st, hdrs, _, _ = http_req("GET", "/home")
 ok("unauthed redirect", st in (301, 302) and "/login" in hdrs.get("Location", ""))
 
 # 3) 登录(错误密码)
-form = "user=Acuteluo&pass=wrongpass"
+form = f"user={creds()[0]}&pass=wrongpass"
 st, _, body, _ = http_req("POST", "/login", form,
                           {"Content-Type": "application/x-www-form-urlencoded"})
 ok("login reject", st == 200 and "错误".encode() in body)

@@ -279,7 +279,7 @@ def change_password(old_pw, new_pw):
     if len(new_pw) > 128:
         return False, "新密码太长(上限 128 位)"
     salt = secrets.token_hex(8)
-    auth = {"user": AUTH.get("user", "Acuteluo"), "salt": salt,
+    auth = {"user": AUTH.get("user", "user"), "salt": salt,
             "hash": hashlib.sha256((salt + new_pw).encode()).hexdigest()}
     try:
         with open(AUTH_FILE, "w") as f:
@@ -1393,7 +1393,7 @@ class Collector:
                                       "f2fs", "vfat", "exfat", "ntfs", "fuseblk"):
                         continue
                     # 按**设备**去重, 不能只按挂载点: 同一个分区经常被 bind mount
-                    # 到多个路径(这台机器上 / 和 /usr /etc /home/cly/... 全是
+                    # 到多个路径(同一块磁盘可能挂到 /、/usr、/etc、/home/<用户>/... 多个挂载点
                     # /dev/nvme0n1p9), 不去重磁盘卡片会被同一块盘刷屏,
                     # 告警也会把同一条重复报十几遍。
                     if dev in seen_dev or mp in seen_mp:
@@ -1676,7 +1676,7 @@ _term_count = 0
 def _term_env():
     """终端子进程的环境 —— **全部按当前机器推导, 不写死**。
 
-    之前把 HOME/USER/PATH 硬编码成 /home/cly, 换台机器(或换个用户名)终端就会
+    之前把 HOME/USER/PATH 硬编码成具体路径, 换台机器(或换个用户名)终端就会
     跑在错误的家目录和身份下。这里用 pwd 模块 + os 实际取值拼出来。
     """
     import pwd
