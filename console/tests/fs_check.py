@@ -4,7 +4,8 @@
 用法: DISPLAY=:0 python3 tests/fs_check.py [port]
 
 检查: 元素就位 / 标签语义(网络延迟 vs 画面延时) / 进入全屏后布局正确且
-**工具栏和触控板被隐藏** / 点屏幕先淡入再点退出 / ‹ 按钮退出 / 无 JS 报错。
+**工具栏和触控板被隐藏** / 点屏幕先淡入再点退出 / ‹ 按钮退出 /
+滚轮按钮: 开关出现与收回、只发滚轮不晃出控件、退出收回、重进自动恢复 / 无 JS 报错。
 """
 import os
 import sys
@@ -47,7 +48,8 @@ def main():
 
         print("【1】元素就位")
         for k in ("vnc-fs", "vnc-fs-tap", "vnc-fs-ui", "vnc-fs-exit",
-                  "vnc-fs-audio", "vnc-fs-info"):
+                  "vnc-fs-audio", "vnc-fs-info", "vnc-fs-wheel",
+                  "vnc-fs-wheelbtns", "vnc-fs-wup", "vnc-fs-wdn"):
             chk(f"#{k}", pg.evaluate(f"() => !!document.getElementById('{k}')"))
         chk("全屏按钮文字", "全屏" in pg.eval_on_selector("#vnc-fs", "e=>e.textContent"))
 
@@ -101,9 +103,63 @@ def main():
         chk("之后仍然自动收起",
             pg.evaluate("() => !document.getElementById('vnc-fs-ui').classList.contains('show')"))
 
-        print("【5】‹ 退出 → 再进一次 → 再用 ‹ 退出")
-        # 注意: 第 4 段结束时**仍然在全屏**(点屏幕不再退出), 而且控件已经自动收起了
-        # —— 所以要先点一下屏幕让 ‹ 淡入, 才点得到它(控件层收起时是 pointer-events:none)。
+        print("【5】全屏滚轮按钮: 开关 -> 出现 -> 只滚轮不晃控件 -> 退出收回 -> 重进自动恢复")
+        # 第 4 段结束时仍在全屏且控件已自动收起。滚轮钮默认关着(新会话 localStorage 是空的)。
+        chk("开关默认不亮",
+            pg.evaluate("() => !document.getElementById('vnc-fs-wheel').classList.contains('on')"))
+        chk("滚轮钮默认隐藏",
+            pg.evaluate("() => getComputedStyle(document.getElementById('vnc-fs-wheelbtns')).display") == "none")
+        pg.click("#vnc-fs-tap", position={"x": 200, "y": 400})
+        pg.wait_for_timeout(400)
+        pg.click("#vnc-fs-wheel")
+        pg.wait_for_timeout(300)
+        chk("开关点亮",
+            pg.evaluate("() => document.getElementById('vnc-fs-wheel').classList.contains('on')"))
+        chk("滚轮钮出现",
+            pg.evaluate("() => getComputedStyle(document.getElementById('vnc-fs-wheelbtns')).display") == "flex")
+        pos = pg.evaluate("""() => {
+            const r = document.getElementById('vnc-fs-wheelbtns').getBoundingClientRect();
+            return {right: window.innerWidth - r.right, cy: r.top + r.height / 2,
+                    vh: window.innerHeight};
+        }""")
+        chk("滚轮钮贴右缘垂直居中",
+            pos["right"] <= 30 and abs(pos["cy"] - pos["vh"] / 2) < pos["vh"] / 3,
+            f"右边距={pos['right']:.0f}px 中点y={pos['cy']:.0f}/{pos['vh']}")
+        bg = pg.eval_on_selector("#vnc-fs-wdn", "e => getComputedStyle(e).backgroundColor")
+        chk("滚轮钮半透明", "rgba" in bg and not bg.endswith(", 1)"), bg)
+        pg.wait_for_timeout(3700)             # 等顶部控件自己淡出
+        chk("控件淡出后滚轮钮仍挂着",
+            pg.evaluate("""() => !document.getElementById('vnc-fs-ui').classList.contains('show')
+                                && getComputedStyle(document.getElementById('vnc-fs-wheelbtns')).display === 'flex'"""))
+        pg.click("#vnc-fs-wdn")               # 点滚轮钮本身(能点到 = 压在触摸层上方)
+        pg.wait_for_timeout(400)
+        chk("点滚轮钮不退出全屏",
+            pg.evaluate("() => document.body.classList.contains('vnc-fs')"))
+        chk("点滚轮钮不晃出控件",
+            pg.evaluate("() => !document.getElementById('vnc-fs-ui').classList.contains('show')"))
+        pg.click("#vnc-fs-tap", position={"x": 200, "y": 400})
+        pg.wait_for_timeout(400)
+        pg.click("#vnc-fs-exit")
+        pg.wait_for_timeout(500)
+        chk("退出全屏滚轮钮收回",
+            pg.evaluate("() => getComputedStyle(document.getElementById('vnc-fs-wheelbtns')).display") == "none")
+        pg.click("#vnc-fs")
+        pg.wait_for_timeout(800)
+        chk("重进全屏自动恢复(上次开着)",
+            pg.evaluate("() => getComputedStyle(document.getElementById('vnc-fs-wheelbtns')).display") == "flex")
+        pg.click("#vnc-fs-tap", position={"x": 200, "y": 400})
+        pg.wait_for_timeout(400)
+        pg.click("#vnc-fs-wheel")             # 关掉, 也验证关闭路径
+        pg.wait_for_timeout(300)
+        chk("再点开关滚轮钮收回",
+            pg.evaluate("() => getComputedStyle(document.getElementById('vnc-fs-wheelbtns')).display") == "none")
+        chk("开关已熄灭",
+            pg.evaluate("() => !document.getElementById('vnc-fs-wheel').classList.contains('on')"))
+
+        print("【6】‹ 退出 → 再进一次 → 再用 ‹ 退出")
+        # 注意: 前面各段结束时**仍然在全屏**(点屏幕/滚轮钮都不会退出), 控件可能已
+        # 自动收起 —— 所以先点一下屏幕让 ‹ 淡入, 才点得到它(控件层收起时是
+        # pointer-events:none)。
         pg.click("#vnc-fs-tap", position={"x": 200, "y": 400})
         pg.wait_for_timeout(400)
         pg.click("#vnc-fs-exit")
@@ -119,7 +175,7 @@ def main():
         pg.wait_for_timeout(500)
         chk("再点 ‹ 仍然能退出", not pg.evaluate("() => document.body.classList.contains('vnc-fs')"))
 
-        print("【6】无 JS 报错")
+        print("【7】无 JS 报错")
         chk("pageerror 为空", not errs, "; ".join(errs[:2]))
         ctx.close()
         b.close()
