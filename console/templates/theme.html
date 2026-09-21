@@ -24,9 +24,10 @@
     color: var(--dim); margin-top: 12px; }
   .th-hex b { color: var(--acc); font-size: 15px; letter-spacing: .6px; }
   /* 这句话用主题色实时渲染 —— 取色一变, 字色和句子一起换 */
-  .th-say { margin: 16px auto 2px; max-width: 26em; text-align: center;
+  /* 保证一行: 不换行, 太长由 JS 把字号往下缩(theme.js 的 fitOneLine) */
+  .th-say { margin: 16px auto 2px; max-width: 100%; text-align: center;
     font-size: 19px; line-height: 1.65; font-weight: 600; color: var(--acc);
-    transition: color .1s linear; }
+    white-space: nowrap; transition: color .1s linear; }
   .th-bar { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-top: 18px; }
   .th-bar button { padding: 9px 16px; border-radius: 10px; border: 1px solid var(--line);
     background: var(--card2); color: var(--fg); font-size: 13px; }
