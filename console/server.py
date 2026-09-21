@@ -2899,15 +2899,14 @@ def _default_sink_name():
 def _volume_target():
     """音量滑块该调哪个 sink。
 
-    坑: "只发手机"模式下我们会把**默认输出**也切到虚拟输出, 所以不能直接用
-    _default_sink_name() —— 那时它指的就是虚拟输出, 拖滑块等于改手机音量 ✗。
-
-    用户要的语义是: 电脑侧只负责把**满幅**声音转出去, 音量完全交给手机自己调。
-    所以滑块永远调**硬件**输出: 它上面没有音频流, 于是拖它既不影响手机、也绝不会
-    让电脑出声。"只发手机"时用进模式前记住的那个硬件输出。
+    这是**故意的**二级控制(用户明确要的语义):
+      - 电脑输出: 调硬件默认输出 —— 就是电脑扬声器的音量
+      - 模拟输出: 调**虚拟输出** —— 声音已经在那儿了, 于是滑块成了"发给手机的音量",
+        手机上还能用自己的音量键再调一次, 两级互不冲突
+    (原来靠"默认输出恰好被切成虚拟输出"间接实现, 太脆; 现在写死。)
     """
-    if audio_out_mode() == "silent" and _NULL_PREV_DEFAULT["sink"]:
-        return _NULL_PREV_DEFAULT["sink"]
+    if audio_out_mode() == "silent" and _sink_idx(NULL_SINK):
+        return NULL_SINK
     return _default_sink_name()
 
 

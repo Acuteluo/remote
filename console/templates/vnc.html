@@ -276,11 +276,11 @@
         <button data-q="3">低</button><button data-q="6">中</button><button data-q="9">高</button>
       </div>
     </div>
-    <div class="setrow"><span>电脑音量</span>
+    <div class="setrow"><span id="vol-label">电脑音量</span>
       <input type="range" id="set-vol" min="0" max="150" step="1">
       <b id="set-vol-v" style="min-width:48px;text-align:right;font-size:12px"></b>
     </div>
-    <p class="setnote">调的是电脑本机的扬声器音量(不限于这次远程会话), 换手机打开也是同一个
+    <p class="setnote" id="vol-note">调的是电脑本机的扬声器音量(不限于这次远程会话), 换手机打开也是同一个
       值 —— 所以它存在电脑上。<b>超过 100% 会变成红色</b>(对应 Linux 音量条从白色进入红色区,
       属于软件放大、可能失真); 拖到底 0% 即静音。</p>
     <div class="setrow"><span>声音去向</span>
