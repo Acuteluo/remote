@@ -2896,13 +2896,28 @@ def _default_sink_name():
         return ""
 
 
+def _volume_target():
+    """音量滑块该调哪个 sink。
+
+    坑: "只发手机"模式下我们会把**默认输出**也切到虚拟输出, 所以不能直接用
+    _default_sink_name() —— 那时它指的就是虚拟输出, 拖滑块等于改手机音量 ✗。
+
+    用户要的语义是: 电脑侧只负责把**满幅**声音转出去, 音量完全交给手机自己调。
+    所以滑块永远调**硬件**输出: 它上面没有音频流, 于是拖它既不影响手机、也绝不会
+    让电脑出声。"只发手机"时用进模式前记住的那个硬件输出。
+    """
+    if audio_out_mode() == "silent" and _NULL_PREV_DEFAULT["sink"]:
+        return _NULL_PREV_DEFAULT["sink"]
+    return _default_sink_name()
+
+
 def get_pc_volume():
     """读默认输出设备的当前主音量。
 
     返回 {"vol": 0~150 整数(取声道最大值), "muted": bool, "sink": 名}；
     pactl 不可用 / 找不到默认设备时返回 None。
     """
-    sink = _default_sink_name()
+    sink = _volume_target()
     if not sink:
         return None
     try:
@@ -2929,7 +2944,7 @@ def get_pc_volume():
 
 def set_pc_volume(pct):
     """设默认输出设备主音量为 pct(0~150 整数)。返回 (ok, msg)。"""
-    sink = _default_sink_name()
+    sink = _volume_target()
     if not sink:
         return False, "找不到默认输出设备(pactl get-default-sink 无输出)"
     try:
