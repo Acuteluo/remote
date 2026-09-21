@@ -276,6 +276,15 @@
         <button data-q="3">低</button><button data-q="6">中</button><button data-q="9">高</button>
       </div>
     </div>
+    <div class="setrow"><span>声音去向</span>
+      <div class="seg ao">
+        <button data-ao="pc">电脑输出</button><button data-ao="silent">模拟输出</button>
+      </div>
+    </div>
+    <p class="setnote"><b>电脑输出</b> = 电脑扬声器正常出声, 手机同时能听。
+      <b>模拟输出</b> = 一键把电脑音量按到 1%(电脑几乎听不见), 手机照常收到完整音量 ——
+      深夜不想外放时用。它只是替你按一下, 之后<b>上面的音量滑块仍可随意调</b>,
+      不会被锁住; 按到 0% 或静音才会真的没声音。</p>
     <div class="setrow"><span id="vol-label">电脑音量</span>
       <input type="range" id="set-vol" min="0" max="150" step="1">
       <b id="set-vol-v" style="min-width:48px;text-align:right;font-size:12px"></b>
@@ -283,14 +292,6 @@
     <p class="setnote" id="vol-note">调的是电脑本机的扬声器音量(不限于这次远程会话), 换手机打开也是同一个
       值 —— 所以它存在电脑上。<b>超过 100% 会变成红色</b>(对应 Linux 音量条从白色进入红色区,
       属于软件放大、可能失真); 拖到底 0% 即静音。</p>
-    <div class="setrow"><span>声音去向</span>
-      <div class="seg ao">
-        <button data-ao="pc">电脑输出</button><button data-ao="silent">模拟输出</button>
-      </div>
-    </div>
-    <p class="setnote"><b>电脑输出</b> = 电脑扬声器正常出声, 手机同时能听。
-      <b>模拟输出</b> = 把声音搬到虚拟输出设备, <b>电脑完全静音</b>, 只发到手机 ——
-      深夜不想外放时用; 停止收听时自动搬回电脑。改动在<b>下次开启声音</b>时生效。</p>
     <div class="setrow"><span>分辨率</span>
       <select id="set-mode" style="flex:1;background:var(--card2);color:var(--fg);
         border:1px solid var(--line);border-radius:8px;padding:5px 8px;font-size:12px"></select>
