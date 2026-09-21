@@ -3147,6 +3147,28 @@ def audio_candidates(mode="auto"):
     return cands
 
 
+# 选源探测很慢(要真去开设备试采), 而这台机器光开一个 pulse 源就要 2s+ ——
+# 每次点 🔊 都等 2~3 秒才出声不值得, 而结果短时间内是稳定的。缓存它。
+_audio_pick_cache = {}
+_audio_pick_lock = threading.Lock()
+
+
+def audio_pick_source_cached(mode="auto", ttl=120):
+    """audio_pick_source 的缓存版(给正常播放路径用)。
+
+    诊断接口 /api/audio/check 一律走**不缓存**的原函数 —— 排查时就是要看实时的。
+    """
+    now = time.time()
+    with _audio_pick_lock:
+        hit = _audio_pick_cache.get(mode)
+        if hit and hit[0] > now:
+            return hit[1]
+    val = audio_pick_source(mode)
+    with _audio_pick_lock:
+        _audio_pick_cache[mode] = (now + ttl, val)
+    return val
+
+
 def audio_pick_source(mode="auto", seconds=0.9):
     """挑一个真的有信号的源, 返回 (kind, src, 尝试记录)。
 
@@ -3641,7 +3663,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             kind, src = mic["kind"], mic["src"]
             audit("audio", f"选源(mic): {kind}:{src}")
         elif mode != "auto" or src in (None, "", "default"):
-            kind, src, _tried = audio_pick_source(mode)
+            kind, src, _tried = audio_pick_source_cached(mode)
             audit("audio", f"选源({mode}): {kind}:{src} "
                            f"(试过 {len(_tried)} 个候选)")
         if kind == "pulse" and src != "default":
