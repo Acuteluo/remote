@@ -152,12 +152,23 @@
   const oneOf = (a) => a[Math.floor(Math.random() * a.length)];
   const recent = [];                    // 最近出现过的几条, 避免"怎么又是这句"
 
+  // 把"叫一声"贴到句子上。中文里更顺的是**贴在问号前面**:
+  //   要不要吃个汉堡喵？   ← 比 "要不要吃个汉堡？ 喵" 自然得多
+  // 两种都留着随机出现(用户点名说这几种都通顺)。
+  function withCry(body, cry) {
+    const m = /^([\s\S]*?)([？?])$/.exec(body);
+    if (!m) return body + cry;                    // 不是问句: 直接贴上
+    return Math.random() < 0.6
+      ? m[1] + cry + m[2]                         // 要不要吃个汉堡喵？
+      : body + cry;                              // 要不要吃个汉堡？喵
+  }
+
   function compose() {
     const body = oneOf(SAYS), r = Math.random();
-    if (r < 0.22) return body;                                  // 纯句子
-    if (r < 0.62) return body + ' ' + oneOf(TAILS_END);          // 句尾挂颜文字
-    if (r < 0.72) return oneOf(TAILS_FRONT) + '，' + body;        // 叫一声 + 提议
-    return body + ' ' + oneOf(TAILS_FRONT);                     // 句尾挂叫声
+    if (r < 0.20) return body;                          // 纯句子
+    if (r < 0.52) return body + ' ' + oneOf(TAILS_END);  // 句尾颜文字(空格隔开)
+    if (r < 0.64) return oneOf(TAILS_FRONT) + '，' + body; // 喵，要不要吃个汉堡？
+    return withCry(body, oneOf(TAILS_FRONT));           // 喵/啾直接贴上去
   }
 
   function newSentence() {
