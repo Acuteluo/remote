@@ -3055,15 +3055,21 @@ def bg_css():
         ".topbar{background:rgb(11 15 20 / calc(var(--panel-a) * .97))}",
     ]
     if has:
-        # 底图用两个 position:fixed 的层(图 + 暗化)放在最底下, 而不是
+        # 底图层的高度用 100lvh(large viewport height)而不是 inset:0:
+        # 手机上地址栏收起/展开会改变 100vh/100dvh, cover 跟着重算, 背景就会
+        # 跟着"放大/缩小"(实测反馈)。lvh 是恒定值, 图片就不会再被缩放。
+        # 另外: 用两个 position:fixed 的层(图 + 暗化)放在最底下, 而不是
         # background-attachment:fixed —— 后者在 iOS Safari 上很不可靠。
         out += [
-            "html{background:#0b0f14}body{background:transparent}",
-            "body::before{content:'';position:fixed;inset:0;z-index:-1;"
+            "html{background:#0b0f14}body{background:transparent}"
+            # 远程桌面页 body 是 body.vnc-page{background:#000}(见 app.css),
+            # 类选择器比光秃秃的 body 优先级高, 会把底图整个盖住 —— 显式盖回去。
+            "body.vnc-page{background:transparent}",
+            "body::before{content:'';position:fixed;left:0;right:0;top:0;height:100lvh;z-index:-1;"
             "background:#0b0f14 url('/bg/img?v=%d') center/cover no-repeat;"
             "pointer-events:none%s}"
             % (ver, (";filter:blur(%dpx)" % blur) if blur else ""),
-            "body::after{content:'';position:fixed;inset:0;z-index:-1;"
+            "body::after{content:'';position:fixed;left:0;right:0;top:0;height:100lvh;z-index:-1;"
             "background:rgba(11,15,20,%.2f);pointer-events:none}" % (dim / 100.0),
         ]
     return "<style>%s</style>\n" % "".join(out)
