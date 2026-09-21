@@ -1502,13 +1502,21 @@ class Collector:
         if not env or not shutil.which("wmctrl"):
             return []
         try:
-            r = subprocess.run(["wmctrl", "-l"], env={**os.environ, **env},
+            # 用 -lx 带上 WM_CLASS: 光靠标题分不出"GNOME Shell 自己的隐形窗口"。
+            r = subprocess.run(["wmctrl", "-lx"], env={**os.environ, **env},
                                capture_output=True, text=True, timeout=4)
             out = []
             for ln in r.stdout.splitlines():
-                parts = ln.split(None, 3)
-                if len(parts) >= 4:
-                    out.append({"id": parts[0], "title": parts[3]})
+                parts = ln.split(None, 4)          # ID 桌面 WM_CLASS 主机 标题
+                if len(parts) < 5:
+                    continue
+                wid, desk, cls, _host, title = parts
+                # 滤掉 GNOME Shell / 扩展的内部窗口: WM_CLASS 是 gjs.Gjs,
+                # 或者标题是 GTK 的占位串(@!<x>,<y>;<随机>) —— 它们不可见,
+                # 列在面板里就是纯噪音(用户反馈过 "0x04200003 @!0,0;BDHF 是什么")。
+                if cls == "gjs.Gjs" or re.match(r"^@!\d+,\d+;", title):
+                    continue
+                out.append({"id": wid, "title": title, "cls": cls})
             return out
         except (OSError, subprocess.SubprocessError):
             return []
@@ -2256,7 +2264,10 @@ def read_audit(n=400):
         p = ln.split(" ", 3)
         if len(p) < 3:
             continue
-        out.append({"d": p[0], "t": p[1], "c": p[2],
+        # 详细一丢丢: 只给**非今天**的行带上日期(月-日), 今天的仍只显示时分秒 ——
+        # 翻旧记录时不用猜是哪天的, 又不至于每行都堆一串日期显得吵。
+        t = p[1] if p[0] == time.strftime("%Y-%m-%d") else p[0][5:] + " " + p[1]
+        out.append({"d": p[0], "t": t, "c": p[2],
                     "m": p[3] if len(p) > 3 else ""})
     out.reverse()
     return out
