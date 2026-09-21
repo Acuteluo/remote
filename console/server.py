@@ -2896,24 +2896,13 @@ def _default_sink_name():
         return ""
 
 
-def _volume_target():
-    """音量该调哪个 sink。
-
-    "只发手机"模式下声音已经被搬到虚拟输出上, 这时候调硬件 sink 的音量对手机
-    **毫无影响**(滑块动了、手机不变) —— 必须跟着声音走, 调到它真正在的那个 sink。
-    """
-    if audio_out_mode() == "silent" and _sink_idx(NULL_SINK):
-        return NULL_SINK
-    return _default_sink_name()
-
-
 def get_pc_volume():
     """读默认输出设备的当前主音量。
 
     返回 {"vol": 0~150 整数(取声道最大值), "muted": bool, "sink": 名}；
     pactl 不可用 / 找不到默认设备时返回 None。
     """
-    sink = _volume_target()
+    sink = _default_sink_name()
     if not sink:
         return None
     try:
@@ -2940,7 +2929,7 @@ def get_pc_volume():
 
 def set_pc_volume(pct):
     """设默认输出设备主音量为 pct(0~150 整数)。返回 (ok, msg)。"""
-    sink = _volume_target()
+    sink = _default_sink_name()
     if not sink:
         return False, "找不到默认输出设备(pactl get-default-sink 无输出)"
     try:
@@ -3352,6 +3341,10 @@ def silent_sink_ensure():
             return False, "建虚拟输出失败: " + out
     # 把**默认输出**也切到虚拟输出: 否则只对当时正在播的那几路生效, 之后新开的
     # 声音还是从扬声器出来(而且手机听不到) —— 用户要的是"电脑彻底不出声"。
+    # 虚拟输出固定 100% 且不静音: 这样"转发给手机的是 100% 信号", 手机自己调音量。
+    # 用户的要求: 电脑侧不要再参与音量调节, 只负责把满幅声音送出去。
+    _pactl("set-sink-mute", NULL_SINK, "0")
+    _pactl("set-sink-volume", NULL_SINK, "100%")
     if not _NULL_PREV_DEFAULT["sink"]:
         ok, cur = _pactl("get-default-sink")
         _NULL_PREV_DEFAULT["sink"] = (cur or "").strip() or "@DEFAULT_SINK@"
