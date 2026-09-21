@@ -127,8 +127,11 @@ function render(s) {
       '<span style="display:block;line-height:1.55;word-break:break-word">' +
       esc(s.wifi.ssid || '(未命名)') +
       ` · 信号 ${s.wifi.pct == null ? '--' : s.wifi.pct + '%'}` +
-      `${s.wifi.level == null ? '' : ` (${Number(s.wifi.level).toFixed(0)} dBm)`}` +
-      `<span style="color:var(--dim)"> · ${esc(s.wifi.iface)}</span></span></div>`
+      // dBm 是原始信号强度, 放括号里并弱化 —— 百分比才是给人看的那个数
+      `${s.wifi.level == null ? '' : ' <span style="color:var(--dim)">(' +
+        Number(s.wifi.level).toFixed(0) + ' dBm)</span>'}` +
+      // 网卡名不在这里重复: 下一行速率那个标签就是它(原来两行都写, 显得重复)
+      '</span></div>'
     : '';
   $('net').innerHTML = wifiRow + ((s.net || []).slice(0, 6).map(n =>
     `<div class="kv"><span class="d">${n.if}</span><span>↓${fmtRate(n.rx)} ↑${fmtRate(n.tx)}</span></div>`
