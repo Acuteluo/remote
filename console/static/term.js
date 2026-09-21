@@ -2,16 +2,21 @@
 'use strict';
 const statusEl = document.getElementById('term-status');
 const FONT_KEY = 'meow_term_font';
+// 主题色: 终端的光标、以及 ANSI 蓝, 都跟着它走(原来写死成默认蓝 #4da3ff)。
+// 页面里 render() 注入的 :root{--acc} 已经生效, 所以这里读得到。
+// 主题色只在浅/亮范围里取, 所以拿来当 ANSI 蓝也不会看不清。
+const ACC = (getComputedStyle(document.documentElement)
+  .getPropertyValue('--acc').trim()) || '#4da3ff';
 const term = new Terminal({
   fontSize: Math.min(22, Math.max(10, Number(localStorage.getItem(FONT_KEY)) || 14)),
   fontFamily: '"Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace',
   cursorBlink: true,
   scrollback: 5000,
   theme: {
-    background: '#0b0f14', foreground: '#dce6f2', cursor: '#4da3ff',
+    background: '#0b0f14', foreground: '#dce6f2', cursor: ACC,
     selectionBackground: '#264f78',
     black: '#0b0f14', red: '#ff6b6b', green: '#3ecf8e', yellow: '#ffb454',
-    blue: '#4da3ff', magenta: '#c792ea', cyan: '#56d4dd', white: '#dce6f2',
+    blue: ACC, magenta: '#c792ea', cyan: '#56d4dd', white: '#dce6f2',
   },
 });
 const fit = new FitAddon.FitAddon();

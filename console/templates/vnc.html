@@ -49,7 +49,8 @@
     font-variant-numeric: tabular-nums; text-shadow: 0 1px 3px #000; white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis; }
   /* 全屏里可点亮的开关(「滚轮」)与声音按钮并排, 亮起 = 右侧滚轮钮挂在画面上 */
-  #vnc-fs-ui button.on { background: rgba(77, 163, 255, .88); color: #04121f;
+  #vnc-fs-ui button.on { background: var(--acc);
+    background: color-mix(in srgb, var(--acc) 88%, transparent); color: #04121f;
     border-color: rgba(255, 255, 255, .4); font-weight: 600; }
 
   /* ---- 全屏滚轮按钮(2026-09-16 加) ----
@@ -103,11 +104,12 @@
   .padbtn.mini { flex: 1; padding: 9px 4px; font-size: 12px; color: var(--dim); }
   .padbtn:active { border-color: var(--acc); background: #1a2735; }
   .padbtn.on { background: var(--warn); color: #241a04; font-weight: 700; border-color: var(--warn); }
+  /* 代表鼠标的那个小圆圈: 颜色跟着主题色走(原来是写死的默认蓝) */
   #pad-cursor { position: fixed; z-index: 65; width: 26px; height: 26px; margin: -13px 0 0 -13px;
-    border: 2px solid rgba(77,163,255,.9); border-radius: 50%; pointer-events: none;
+    border: 2px solid var(--acc); border-radius: 50%; pointer-events: none;
     box-shadow: 0 0 6px rgba(0,0,0,.6); }
   #pad-cursor::after { content: ''; position: absolute; left: 50%; top: 50%; width: 4px; height: 4px;
-    margin: -2px 0 0 -2px; border-radius: 50%; background: rgba(77,163,255,.95); }
+    margin: -2px 0 0 -2px; border-radius: 50%; background: var(--acc); }
   .setrow { display: flex; align-items: center; justify-content: space-between; gap: 10px;
     padding: 7px 0; font-size: 13px; border-bottom: 1px solid #1b2531; }
   .setrow:last-of-type { border-bottom: 0; }

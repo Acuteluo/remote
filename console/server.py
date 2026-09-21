@@ -80,12 +80,13 @@ AUDIT_FILE = os.path.join(DATA_DIR, "audit.log")
 #   - typeDelayMs 逐字键入时每字符间隔, 仅终端路径生效
 #   - volume     电脑主音量(0~150, 百分比, 由设置面板滑块控制并持久化)
 #   - brightness 电脑屏幕亮度(5~100, 百分比, 同上; xrandr 软件调光)
+#   - themeAcc   主题色(#RRGGBB)。所有 var(--acc) 渲染的地方都跟着它走
 # 启动时读一次; 之后文件 mtime 变了就重读 —— 手改文件也能即时生效, 不用重启。
 # 注意: save_config 只认 DEFAULT_CONFIG 里有的键(防脏数据), 新设置**必须**加进来,
 # 否则 POST 会"看着成功"但什么都没存(2026-09-22 加 brightness 时就踩了这个)。
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 DEFAULT_CONFIG = {"typeMode": "auto", "typeBatch": 80, "typeDelayMs": 20,
-                  "volume": 100, "brightness": 100,
+                  "volume": 100, "brightness": 100, "themeAcc": "#4da3ff",
                   # 端口也归配置管(命令行 --port / 环境变量 MEOW_PORT 优先级更高):
                   # port = 控制台对外端口; vncPort = x11vnc 的内部 RFB 端口。
                   "port": DEFAULT_PORT, "vncPort": DEFAULT_VNC_PORT,
@@ -2969,6 +2970,49 @@ def set_pc_brightness(pct):
     return True, "ok"
 
 
+# ---------------------------------------------------------------- 主题色
+# 影响所有用 var(--acc) 渲染的地方(文字/按钮底/选中态/边框...)。
+# 页面侧不用改模板: 所有页面都过 render(), 在那里统一注入一个 :root{--acc:...},
+# 排在 app.css 之后所以能盖住默认蓝。
+THEME_DEFAULT = "#4da3ff"          # 就是原来那抹蓝
+# 太暗的不给用: 控制台是暗底, 主题色还要当**文字颜色**用, 深色在上面看不清。
+# 前端那个圆盘本身只画浅色范围, 这里再兜一道(接口也能被直接调用)。
+THEME_MIN_LUM = 0.30
+
+
+def _hex_rgb(s):
+    m = re.fullmatch(r"#?([0-9a-fA-F]{6})", (s or "").strip())
+    if not m:
+        return None
+    v = m.group(1)
+    return tuple(int(v[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def theme_luminance(rgb):
+    """WCAG 相对亮度(0~1)。"""
+    def f(c):
+        c /= 255.0
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = (f(c) for c in rgb)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def get_theme_acc():
+    v = (load_config() or {}).get("themeAcc") or THEME_DEFAULT
+    return v if _hex_rgb(v) else THEME_DEFAULT
+
+
+def set_theme_acc(hexv):
+    """设主题色, 返回 (ok, msg)。太暗的直接拒绝。"""
+    rgb = _hex_rgb(hexv)
+    if rgb is None:
+        return False, "颜色要写成 #RRGGBB"
+    if theme_luminance(rgb) < THEME_MIN_LUM:
+        return False, "这个颜色太暗了, 暗底上看不清 —— 挑个亮一点的"
+    save_config({"themeAcc": "#%02x%02x%02x" % rgb})
+    return True, "ok"
+
+
 def audio_default_monitor():
     """默认输出设备对应的 monitor —— 采它就能拿到"电脑正在放的声音"。
 
@@ -3354,6 +3398,13 @@ def render(name, **kw):
         html = f.read()
     for k, v in kw.items():
         html = html.replace("{{" + k + "}}", str(v))
+    # 主题色统一在这里注入: 所有页面都过 render(), 所以一处管全部 ——
+    # 不用挨个改模板, 将来新增模板也自动带上。
+    # 放在 </head> 前 = 排在 app.css 之后; 同优先级后者生效, 正好盖住默认 --acc。
+    if "</head>" in html:
+        html = html.replace(
+            "</head>",
+            "<style>:root{--acc:%s}</style>\n</head>" % get_theme_acc(), 1)
     return html
 
 
@@ -3726,6 +3777,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 devs_json=json.dumps(pairs),
                 # 只有一个摄像头就别显示切换按钮了, 没什么可切的
                 sw_hidden="display:none" if len(devs) <= 1 else ""))
+        elif path == "/theme":
+            # 主题色: 圆盘取色页。颜色本身走 /api/theme, 这里只给页面和默认值。
+            self._html(200, render("theme.html", user=user,
+                                   host=COLLECTOR.hostname, default=THEME_DEFAULT))
         elif path == "/log":
             self._html(200, render("log.html", user=user,
                                    host=COLLECTOR.hostname))
@@ -3743,6 +3798,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/brightness":
             # 屏幕亮度: 值是滑块写的、存在 config.json(和音量一套做法)
             self._json({"ok": True, "pct": get_pc_brightness()})
+        elif path == "/api/theme":
+            self._json({"ok": True, "acc": get_theme_acc(),
+                        "default": THEME_DEFAULT})
         elif path == "/api/screen":
             w, h = screen_size()
             self._json({"ok": bool(w), "w": w, "h": h})
@@ -3985,6 +4043,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if ok:
                 audit("bri", f"屏幕亮度 → {pct}%")
                 self._json({"ok": True, "pct": get_pc_brightness()})
+            else:
+                self._json({"ok": False, "err": msg})
+        elif path == "/api/theme":
+            # 主题色: 太暗的会被 set_theme_acc 拒掉(暗底上没法当文字色用)
+            ok, msg = set_theme_acc(data.get("acc"))
+            if ok:
+                audit("theme", f"主题色 → {get_theme_acc()}")
+                self._json({"ok": True, "acc": get_theme_acc()})
             else:
                 self._json({"ok": False, "err": msg})
         elif path == "/api/password":

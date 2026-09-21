@@ -176,7 +176,10 @@ function drawHist() {
   ctx.clearRect(0, 0, W, H);
   if (hist.length < 2) return;
   const span = hist.length - 1;
-  ctx.strokeStyle = '#4da3ff'; ctx.lineWidth = 2; ctx.beginPath();
+  // CPU 曲线的颜色也跟着主题色走(原来写死默认蓝)
+  ctx.strokeStyle = (getComputedStyle(document.documentElement)
+    .getPropertyValue('--acc').trim()) || '#4da3ff';
+  ctx.lineWidth = 2; ctx.beginPath();
   hist.forEach((v, i) => {
     const x = i / span * W, y = H - Math.min(100, v) / 100 * (H - 4) - 2;
     i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
