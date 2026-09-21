@@ -3819,6 +3819,25 @@ def vnc_module_preloads():
     return _vnc_preload["html"]
 
 
+_ASSET_V_RE = re.compile(r'''(/static/(?!vendor/)[^"\'\s?]+\.(?:js|css))(?:\?v=\d+)?''')
+
+
+def _asset_v(m):
+    """给自家的 js/css 挂上"文件修改时间"当版本号。
+
+    为什么要: 手机上那个网络里有一台锐捷设备会拦 TLS(还能缓存静态文件), 页面刷新
+    之后有时仍旧拿到**旧的 JS** —— 之前出现过"改了却不生效"就是这个。带上
+    ?v=mtime 以后文件一变 URL 就变, 任何中间缓存都绕过去了。vendor 下的第三方库
+    内容永不变, 保持长期缓存不动。
+    """
+    rel = m.group(1)
+    try:
+        return "%s?v=%d" % (rel, int(os.path.getmtime(
+            os.path.join(STATIC_DIR, rel[len("/static/"):]))))
+    except OSError:
+        return rel
+
+
 def render(name, **kw):
     with open(os.path.join(TEMPLATE_DIR, name)) as f:
         html = f.read()
@@ -3829,6 +3848,7 @@ def render(name, **kw):
     # 放在 </head> 前 = 排在 app.css 之后; 同优先级后者生效, 正好盖住默认值。
     if "</head>" in html:
         html = html.replace("</head>", bg_css() + "</head>", 1)
+    html = _ASSET_V_RE.sub(_asset_v, html)      # 静态文件防中间缓存(见 _asset_v)
     return html
 
 
@@ -4331,7 +4351,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "sources": audio_sources(), "tried": tried})
         elif path == "/api/audio/pos":
             pos, gen, on = _audio_pos()
-            self._json({"ok": True, "on": on, "pos": round(pos, 3), "gen": gen})
+            self._json({"ok": True, "on": on, "pos": round(pos, 3), "gen": gen},
+                       extra={"Cache-Control": "no-store"})
         elif path == "/api/audio":
             # 声音**默认不采**: 只有用户主动点了「开启声音」才会来请求这里。
             # 断开(关页面/点停止)时 ffmpeg 立刻收工。

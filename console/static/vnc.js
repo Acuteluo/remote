@@ -240,7 +240,7 @@ let pingEma = 0, pingTimer = 0, pingBusy = false;
 //   9.00 秒音频正好对应 9.0 秒墙钟, 零丢包), 合计按 0.25s 计。
 // 所以这个数大 = 手机播放器为了不断流自己攒得多 —— 越稳越慢, 是个取舍, 不是故障。
 const AUDIO_CHAIN_S = 0.25;
-let audioEma = 0, audioShownS = 0;
+let audioEma = 0, audioShownS = 0, audioShownExact = false;
 
 // ---- "实际延时"的测法: 把两边的时间轴对齐 --------------------------------
 // 服务端知道自己这一路流已经发出多少秒音频(/api/audio/pos, 与墙钟严格 1:1),
@@ -250,7 +250,7 @@ let audioEma = 0, audioShownS = 0;
 // 难点只在"起点对齐": 手机是**中途**挂上这条流的(采集是共享的, 不会为谁重开),
 // 所以元素时间轴的 0 点对应服务端流的第 aPos0 秒。aPos0 这样求: 第一次拿到
 // 服务端位置 pos 时, 往回推"从开始播到现在经过的时间"即得。
-let aPos0 = null, aT0 = 0, aGen = -1, aLastCur = 0, aPosTimer = 0;
+let aPos0 = null, aT0 = 0, aGen = -1, aLastCur = 0, aPosTimer = 0, audioExact = false;
 
 function nowMs() {
   return (typeof performance !== 'undefined' && performance.now)
@@ -260,7 +260,7 @@ function nowMs() {
 function audioArm() {
   aT0 = nowMs(); aPos0 = null; aLastCur = 0;
   if (aPosTimer) { clearInterval(aPosTimer); aPosTimer = 0; }
-  aPosTimer = setInterval(pollAudioPos, 1000);
+  aPosTimer = setInterval(pollAudioPos, 3000);   // 3s 足够: 期间用本机时钟插值
   pollAudioPos();
 }
 
@@ -270,7 +270,7 @@ function audioDisarm() {
 }
 
 function pollAudioPos() {
-  fetch('/api/audio/pos', { cache: 'no-store' }).then((r) => r.json()).then((d) => {
+  fetch('/api/audio/pos?v=ad1', { cache: 'no-store' }).then((r) => r.json()).then((d) => {
     if (!d || !d.ok || !d.on) return;
     if (aGen !== d.gen) { aGen = d.gen; audioArm(); return; }   // 服务端换了采集, 重新对齐
     if (aPos0 == null) aPos0 = d.pos - (nowMs() - aT0) / 1000;
@@ -295,7 +295,8 @@ function audioNow() {
   if (!audioOn || !audioEl || typeof audioEl.buffered === 'undefined') return null;
   try {
     const actual = audioActualS();               // 优先: 真实端到端(含手机侧)
-    if (actual != null) return actual;
+    if (actual != null) { audioExact = true; return actual; }
+    audioExact = false;                          // 拿不到服务端位置 -> 退成"约"值
     // 兜底(刚开始那一两秒还没对齐上): 至少把播放器里积压的量报出来
     const b = audioEl.buffered;
     if (!b || !b.length) return null;
@@ -321,11 +322,14 @@ function renderAudio() {
     return;
   }
   audioEma = audioEma ? audioEma * 0.5 + raw * 0.5 : raw;   // 平滑, 免得数字乱跳
-  audioShownS = audioEma;
-  el.textContent = '音频 ' + audioEma.toFixed(1) + 's';
+  audioShownS = audioEma; audioShownExact = audioExact;
+  // 拿不到服务端流位置时(网络不通/刚开)只能给播放器积压量, 加 ~ 表示是"约"
+  el.textContent = '音频 ' + (audioExact ? '' : '~') + audioEma.toFixed(1) + 's';
   el.className = 'ping ' + (audioEma < 1.5 ? 'ok' : audioEma < 5 ? 'warn' : 'bad');
   const _cur = audioEl ? (audioEl.currentTime || 0) : 0;
-  el.title = '音频**实际**端到端延时: 服务端已发出到第 '
+  el.title = (audioExact ? '' : '⚠ 暂时拿不到服务端流位置(网络不通?), 下面这个带 ~ 的'
+    + '数只含手机播放器里积压的量, 不含链路上排队的部分。\n')
+    + '音频**实际**端到端延时: 服务端已发出到第 '
     + (aPos0 == null ? '?' : (_cur + raw - AUDIO_CHAIN_S).toFixed(1))
     + 's, 手机正在播第 ' + _cur.toFixed(1) + 's —— 差值就是"现在听到的声音是多久前'
     + '从电脑出来的", 手机侧的缓冲/排队/网络都已算进去, 再加电脑侧采集编码 '
@@ -362,7 +366,8 @@ function renderFsInfo() {
                                : lastKbs.toFixed(0) + 'KB/s');
   }
   const _ad = audioShownS || audioNow();
-  parts.push(_ad == null ? '音频 --' : '音频 ' + _ad.toFixed(1) + 's');
+  parts.push(_ad == null ? '音频 --'
+    : '音频 ' + (audioShownExact ? '' : '~') + _ad.toFixed(1) + 's');
   const pic = picLatency();
   if (pic != null) parts.push('画面 ' + pic + 'ms');
   el.textContent = parts.join(' · ');
