@@ -3267,14 +3267,24 @@ def audio_first_usable_mic():
 
 def _audio_cmd(kind, src):
     """按 kind 组出 ffmpeg 采集命令(固定编码成 MP3 单声道)。"""
+    # -fragment_size: pulse 采集每次读取的粒度。默认交给服务端决定, 在 PipeWire 上
+    # 实测是"每 ~2 秒给一大块(12KB)"—— 音频就一段一段地到手机, 听着一直卡。
+    # 压到 2048 字节(48k 单声道约 21ms)才能连续地取、连续地发。
+    frag = ["-fragment_size", "2048"] if kind == "pulse" else []
     return ["ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-f", kind, "-i", src,
+            "-f", kind, *frag, "-i", src,
             "-ac", "1", "-ar", str(AUDIO_RATE),
             "-c:a", "libmp3lame", "-b:a", AUDIO_BITRATE,
-            "-f", "mp3", "-"]
+            "-flush_packets", "1",   # 每编完一包立刻吐出来(否则 ffmpeg 攒 ~2s/12KB 才发一次, 手机听感就是一段一段)
+        "-f", "mp3", "-"]
 
 
 def _audio_start(src, first_timeout=4.0, kind="pulse"):
+    # 读 ffmpeg 的 stdout 一律用 read1() 而不是 read():
+    # read(n) 会**阻塞到攒满 n 字节**才返回 —— 48kbps 下 8192 字节约 1.4 秒,
+    # 于是音频变成"每 1~2 秒一整段"地推给手机, 听感就是一段一段的卡顿
+    # (实测: 回环 3.5s 才一次性给 8390 字节, 转发器那边每 2 秒一批)。
+    # read1(n) 是"有多少给多少", 立刻返回, 流才是连续的。
     """起 ffmpeg 采声音, 等到流出第一块数据。返回 (proc, queue, first, err)。"""
     last_err = ""
     for args in (_audio_cmd(kind, src),):
@@ -3289,7 +3299,7 @@ def _audio_start(src, first_timeout=4.0, kind="pulse"):
         def reader(p=p, q=q):
             try:
                 while True:
-                    d = p.stdout.read(4096)
+                    d = p.stdout.read1(4096)
                     if not d:
                         break
                     q.put(d)
