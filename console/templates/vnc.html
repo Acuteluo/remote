@@ -142,9 +142,9 @@
     border-bottom: 1px solid #5a3a22; color: var(--warn); font-size: 12px; line-height: 1.6; }
   #vnc-banner.show { display: block; }
   /* 右上角实时延迟: 绿 <80ms / 黄 <200ms / 红 >=200ms */
-  /* 网络 / 画面 合成**一个胶囊**: 手机顶栏太窄, 两个独立胶囊各自带边框+内边距
+  /* 音频 / 画面 合成**一个胶囊**: 手机顶栏太窄, 两个独立胶囊各自带边框+内边距
      要多占 ~20px, 正好把"返回/远程桌面"挤成竖排。合成一个框后显示
-     "网络 20ms │ 画面 45ms"。 */
+     "音频 2.3s │ 画面 45ms"。 */
   .pingbox { flex: none; display: inline-flex; align-items: center;
     border: 1px solid var(--line); border-radius: 999px;
     background: var(--card2); overflow: hidden; margin-left: auto; }
@@ -177,8 +177,8 @@
   <span class="logo">远程桌面</span>
   <span class="host" id="vnc-status">连接中…</span>
   <span class="pingbox">
-    <span id="vnc-ping" class="ping" title="网络延迟(HTTP 往返)。点一下立刻重测">网络 --</span>
-    <span id="vnc-rate" class="ping" title="画面延时估算(网络单程 + 25ms)。帧率/码率也在这里看">画面 --</span>
+    <span id="vnc-ping" class="ping" title="音频端到端延时估算(手机播放器积压 + 电脑侧采集编码)。点一下立刻重测网络, 只影响右边那栏画面的估算">音频 --</span>
+    <span id="vnc-rate" class="ping" title="画面延时估算(网络单程 + 25ms, 网络往返每 5s 实测)。帧率/码率也在这里看">画面 --</span>
   </span>
   <button id="vnc-audio" class="audiobtn" title="把电脑正在放的声音转发到手机">🔕</button>
 </div>

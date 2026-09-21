@@ -3496,7 +3496,7 @@ def _audio_cmd(kind, src):
 # 谁; 最后一个人走了还留 AUDIO_LINGER 秒宽限, 期间重连等于**零空档**。
 AUDIO_LINGER = 2.5
 _hub = {"key": None, "proc": None, "chunks": None, "stop": None,
-        "subs": [], "first": b""}
+        "subs": [], "first": b"", "bytes": 0, "gen": 0}
 _hub_lock = threading.Lock()
 
 
@@ -3514,6 +3514,7 @@ def _hub_fan(proc, chunks, stop):
                 if _hub["proc"] is not proc:
                     return
                 _hub["first"] = d
+                _hub["bytes"] += len(d)     # 已发出的音频秒数(给"实际延时"用)
                 for q in _hub["subs"]:
                     try:
                         q.put_nowait(d)
@@ -3564,6 +3565,22 @@ def _hub_detach(q):
         threading.Timer(AUDIO_LINGER, _hub_stop_if_idle).start()
 
 
+def _audio_bps():
+    """mp3 是固定码率, 所以"已发出的字节数 / 每秒字节数"就是"已发出的音频秒数"。"""
+    v = str(AUDIO_BITRATE).strip().lower()
+    try:
+        return int(float(v.rstrip("k")) * 1000) if v.endswith("k") else int(float(v))
+    except ValueError:
+        return 48000
+
+
+def _audio_pos():
+    """返回 (秒数, 世代号, 是否在采)。手机拿它减去自己的播放位置 = **实际**端到端延时。"""
+    with _hub_lock:
+        on = _hub["proc"] is not None and _hub["proc"].poll() is None
+        return (_hub["bytes"] * 8.0 / max(_audio_bps(), 1), _hub["gen"], on)
+
+
 def _hub_ensure(src, kind):
     """保证有一路 (src, kind) 采集在跑; 已在跑就直接复用。返回 (proc, err)。"""
     key = (src, kind)
@@ -3585,7 +3602,8 @@ def _hub_ensure(src, kind):
                 return None, err
             stop = threading.Event()
             _hub.update(key=key, proc=proc, chunks=chunks, stop=stop,
-                        first=first, subs=[])
+                        first=first, subs=[], bytes=0,
+                        gen=_hub["gen"] + 1)     # 换了一路采集 -> 世代号 +1
         threading.Thread(target=_hub_fan, args=(proc, chunks, stop),
                          daemon=True).start()
         return proc, ""
@@ -4311,6 +4329,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "picked": {"kind": kind, "src": src},
                         "default_sink": _default_sink_name(),
                         "sources": audio_sources(), "tried": tried})
+        elif path == "/api/audio/pos":
+            pos, gen, on = _audio_pos()
+            self._json({"ok": True, "on": on, "pos": round(pos, 3), "gen": gen})
         elif path == "/api/audio":
             # 声音**默认不采**: 只有用户主动点了「开启声音」才会来请求这里。
             # 断开(关页面/点停止)时 ffmpeg 立刻收工。

@@ -171,7 +171,7 @@ function connect() {
     $('pad-cursor').style.display = 'none';
     releaseOverlay();
     stopPing();
-    renderPing(null);
+    renderAudio();
     if (wantConnected && !document.hidden) scheduleReconnect();
   });
 
@@ -229,21 +229,109 @@ window.addEventListener('pagehide', () => {
 // 5s 一次 + 指数平滑(避免数字乱跳); 点一下立刻重测。
 let pingEma = 0, pingTimer = 0, pingBusy = false;
 
-function renderPing(ms) {
+// 2026-09-22: 这一栏原来是"网络延迟(HTTP 往返)" —— 换成**音频端到端延时**。
+// 理由: 网络往返只有几毫秒, 对听感/观感没有解释力; 真正决定体验的是"声音从电脑
+// 到耳朵、画面从电脑到眼睛"各要多久。画面那栏保留(见 picLatency), 网络 RTT 退到
+// 内部: 仍然每 5s 量一次, 只作为画面延时里"网络单程"那一项的输入, 不再单独显示。
+//
+// 音频延时的算法(客户端唯一能测到的口径):
+//   手机播放器里积压的量 = buffered.end(最后一块已收到的数据) - currentTime(正在播的位置)
+//   再加上电脑侧那一段 = 采集分片 85ms + 一帧 mp3 24ms + 转发(实测服务端不积压:
+//   9.00 秒音频正好对应 9.0 秒墙钟, 零丢包), 合计按 0.25s 计。
+// 所以这个数大 = 手机播放器为了不断流自己攒得多 —— 越稳越慢, 是个取舍, 不是故障。
+const AUDIO_CHAIN_S = 0.25;
+let audioEma = 0, audioShownS = 0;
+
+// ---- "实际延时"的测法: 把两边的时间轴对齐 --------------------------------
+// 服务端知道自己这一路流已经发出多少秒音频(/api/audio/pos, 与墙钟严格 1:1),
+// 手机知道自己正在播第几秒(audioEl.currentTime)。两者的差, 就是"现在耳朵里
+// 听到的这段声音, 是多久以前从电脑发出的" —— 也就是**真实端到端延时**,
+// 手机侧的缓冲、排队、网络全都在里面了。
+// 难点只在"起点对齐": 手机是**中途**挂上这条流的(采集是共享的, 不会为谁重开),
+// 所以元素时间轴的 0 点对应服务端流的第 aPos0 秒。aPos0 这样求: 第一次拿到
+// 服务端位置 pos 时, 往回推"从开始播到现在经过的时间"即得。
+let aPos0 = null, aT0 = 0, aGen = -1, aLastCur = 0, aPosTimer = 0;
+
+function nowMs() {
+  return (typeof performance !== 'undefined' && performance.now)
+    ? performance.now() : Date.now();
+}
+
+function audioArm() {
+  aT0 = nowMs(); aPos0 = null; aLastCur = 0;
+  if (aPosTimer) { clearInterval(aPosTimer); aPosTimer = 0; }
+  aPosTimer = setInterval(pollAudioPos, 1000);
+  pollAudioPos();
+}
+
+function audioDisarm() {
+  if (aPosTimer) { clearInterval(aPosTimer); aPosTimer = 0; }
+  aPos0 = null; aLastCur = 0; aGen = -1;
+}
+
+function pollAudioPos() {
+  fetch('/api/audio/pos', { cache: 'no-store' }).then((r) => r.json()).then((d) => {
+    if (!d || !d.ok || !d.on) return;
+    if (aGen !== d.gen) { aGen = d.gen; audioArm(); return; }   // 服务端换了采集, 重新对齐
+    if (aPos0 == null) aPos0 = d.pos - (nowMs() - aT0) / 1000;
+  }).catch(() => {});
+}
+
+function audioActualS() {
+  if (aPos0 == null) return null;
+  try {
+    const cur = audioEl.currentTime || 0;
+    if (cur + 0.5 < aLastCur) { audioArm(); return null; }   // 播放器时间轴被重置(重连)
+    aLastCur = cur;
+    const d = aPos0 + (nowMs() - aT0) / 1000 - cur + AUDIO_CHAIN_S;
+    if (!(d > -0.5 && d < 120)) { audioArm(); return null; } // 明显不合理 -> 重新对齐
+    return d;
+  } catch (e) {
+    return null;
+  }
+}
+
+function audioNow() {
+  if (!audioOn || !audioEl || typeof audioEl.buffered === 'undefined') return null;
+  try {
+    const actual = audioActualS();               // 优先: 真实端到端(含手机侧)
+    if (actual != null) return actual;
+    // 兜底(刚开始那一两秒还没对齐上): 至少把播放器里积压的量报出来
+    const b = audioEl.buffered;
+    if (!b || !b.length) return null;
+    const lead = b.end(b.length - 1) - (audioEl.currentTime || 0);
+    if (!isFinite(lead) || lead < 0 || lead > 30) return null;
+    return lead + AUDIO_CHAIN_S;
+  } catch (e) {
+    return null;
+  }
+}
+
+function renderAudio() {
   const el = $('vnc-ping');
   if (!el) return;
-  if (ms == null) {
-    el.textContent = '网络 --';
-    el.className = 'ping bad';
-  } else {
-    // 这一栏量的是 **HTTP 往返(网络延迟)**, 不是画面延时 —— 标签写清楚,
-    // 否则很容易以为"延迟 7ms"就等于画面延迟 7ms。
-    el.textContent = '网络 ' + Math.round(ms) + 'ms';
-    el.className = 'ping ' + (ms < 80 ? 'ok' : ms < 200 ? 'warn' : 'bad');
+  const raw = S.showPing ? audioNow() : null;
+  if (raw == null) {
+    audioEma = 0; audioShownS = 0;
+    el.textContent = '音频 --';
+    el.className = 'ping ' + (audioOn && S.showPing ? 'warn' : 'bad');
+    el.title = !S.showPing ? '已在设置里关掉了"右上角显示延迟"'
+      : audioOn ? '正在听电脑声音, 播放器还没攒够数据(等一两秒)'
+                : '没在听电脑声音 —— 右下角 🔊 开启后才会有这个数';
+    return;
   }
-  el.title = '网络延迟(HTTP 往返)。画面延时还要加上服务端变更检测和手机解码, '
-    + '看旁边那一栏';
-  renderFsInfo();
+  audioEma = audioEma ? audioEma * 0.5 + raw * 0.5 : raw;   // 平滑, 免得数字乱跳
+  audioShownS = audioEma;
+  el.textContent = '音频 ' + audioEma.toFixed(1) + 's';
+  el.className = 'ping ' + (audioEma < 1.5 ? 'ok' : audioEma < 5 ? 'warn' : 'bad');
+  const _cur = audioEl ? (audioEl.currentTime || 0) : 0;
+  el.title = '音频**实际**端到端延时: 服务端已发出到第 '
+    + (aPos0 == null ? '?' : (_cur + raw - AUDIO_CHAIN_S).toFixed(1))
+    + 's, 手机正在播第 ' + _cur.toFixed(1) + 's —— 差值就是"现在听到的声音是多久前'
+    + '从电脑出来的", 手机侧的缓冲/排队/网络都已算进去, 再加电脑侧采集编码 '
+    + AUDIO_CHAIN_S.toFixed(2) + 's。\n'
+    + '数大主要是手机播放器为自己留的抗抖动缓冲: 攒得越多越不容易断, 但延时越大。'
+    + '\n点一下立刻重测网络(只影响旁边那栏画面的估算)。';
 }
 
 // ---- 图传帧率 / 码率 / 画面延时 ----
@@ -273,7 +361,8 @@ function renderFsInfo() {
     parts.push(lastKbs >= 1024 ? (lastKbs / 1024).toFixed(1) + 'MB/s'
                                : lastKbs.toFixed(0) + 'KB/s');
   }
-  parts.push(pingEma ? '网络 ' + Math.round(pingEma) + 'ms' : '网络 --');
+  const _ad = audioShownS || audioNow();
+  parts.push(_ad == null ? '音频 --' : '音频 ' + _ad.toFixed(1) + 's');
   const pic = picLatency();
   if (pic != null) parts.push('画面 ' + pic + 'ms');
   el.textContent = parts.join(' · ');
@@ -302,6 +391,7 @@ function renderRate(fps, kbs) {
       el.className = 'ping ' + (f === 0 ? 'ok' : f === 1 ? 'warn' : 'bad');
     }
   }
+  renderAudio();
   renderFsInfo();
 }
 
@@ -324,9 +414,10 @@ async function pingOnce() {
     await fetch('/api/health?t=' + Date.now(), { cache: 'no-store' });
     const ms = performance.now() - t0;
     pingEma = pingEma ? pingEma * 0.6 + ms * 0.4 : ms;
-    renderPing(pingEma);
+    renderRate(lastFps, lastKbs);      // 网络值只喂给画面那栏的估算, 不再单独显示
   } catch (e) {
-    renderPing(null);
+    pingEma = 0;
+    renderRate(lastFps, lastKbs);
   } finally {
     pingBusy = false;
   }
@@ -334,7 +425,8 @@ async function pingOnce() {
 
 function startPing() {
   stopPing();
-  if (!S.showPing) { renderPing(null); return; }
+  renderAudio();
+  if (!S.showPing) return;             // 关掉就只显示 --, 也不再去请求
   pingOnce();
   pingTimer = setInterval(pingOnce, 5000);
 }
@@ -1788,6 +1880,7 @@ async function startMse() {
 function startPlainAudio() {
   audioEl.removeAttribute('src');
   audioEl.src = '/api/audio?src=sys&_=' + Date.now();   // src=sys -> 扬声器回环
+  audioArm();           // 元素时间轴的 0 点 = 现在, 用来和服务端流位置对齐
   const pr = audioEl.play();
   if (pr && pr.catch) {
     pr.catch((e) => {
@@ -1819,6 +1912,7 @@ function setAudio(on) {
     audioEl.pause();
     audioEl.removeAttribute('src');
     audioEl.load();          // 断开连接 -> 服务端检测到就停止采集
+    audioDisarm();
   }
   syncAudioUI();
 }
