@@ -133,8 +133,14 @@ function render(s) {
       // 网卡名不在这里重复: 下一行速率那个标签就是它(原来两行都写, 显得重复)
       '</span></div>'
     : '';
+  // 网卡名(尤其虚拟网卡)太机器味, 面板上给人话标签; 原名塞进 title 悬停可见
+  const ifLabel = (n) => /^wl/.test(n) ? 'WiFi 速率'
+    : n === 'Meta' ? 'Clash 代理'
+      : n === 'tailscale0' ? 'Tailscale'
+        : /^(en|eth)/.test(n) ? '有线速率' : n;
   $('net').innerHTML = wifiRow + ((s.net || []).slice(0, 6).map(n =>
-    `<div class="kv"><span class="d">${n.if}</span><span>↓${fmtRate(n.rx)} ↑${fmtRate(n.tx)}</span></div>`
+    `<div class="kv"><span class="d" title="${n.if}">${ifLabel(n.if)}</span>` +
+    `<span>↓${fmtRate(n.rx)} ↑${fmtRate(n.tx)}</span></div>`
   ).join('') || '<div class="kv d">无网卡数据</div>');
 
   // 磁盘
