@@ -529,15 +529,6 @@ let silentOnly = false;   // 本机不出声, 只发手机(服务端走虚拟输
   [btnAudio, btnAudioFs].forEach((b) => {
     b.addEventListener('click', () => setAudio(!audioOn));
   });
-  // 「仅手机」: 让服务端把正在播放的声音搬到虚拟输出(本机一点不出声),
-  // 这样电脑静音也照样能把声音发到手机。开着声音时切换会重连一次流。
-  if ($('cam-silent')) {
-    $('cam-silent').addEventListener('click', () => {
-      silentOnly = !silentOnly;
-      $('cam-silent').classList.toggle('on', silentOnly);
-      if (audioOn) { setAudio(false); setTimeout(() => setAudio(true), 150); }
-    });
-  }
   syncAudio();
 
   const snap = () => {

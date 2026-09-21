@@ -283,6 +283,14 @@
     <p class="setnote">调的是电脑本机的扬声器音量(不限于这次远程会话), 换手机打开也是同一个
       值 —— 所以它存在电脑上。<b>超过 100% 会变成红色</b>(对应 Linux 音量条从白色进入红色区,
       属于软件放大、可能失真); 拖到底 0% 即静音。</p>
+    <div class="setrow"><span>声音去向</span>
+      <div class="seg ao">
+        <button data-ao="pc">电脑也响</button><button data-ao="silent">只发手机</button>
+      </div>
+    </div>
+    <p class="setnote"><b>电脑也响</b> = 电脑扬声器正常出声, 手机同时能听。
+      <b>只发手机</b> = 把正在播放的声音搬到虚拟输出, <b>电脑完全静音</b>, 只发到手机 ——
+      深夜不想外放时用; 停止收听时自动把声音搬回电脑。改动在<b>下次开启声音</b>时生效。</p>
     <div class="setrow"><span>屏幕亮度</span>
       <input type="range" id="set-bri" min="5" max="100" step="1">
       <b id="set-bri-v" style="min-width:48px;text-align:right;font-size:12px"></b>

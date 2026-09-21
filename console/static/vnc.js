@@ -2093,3 +2093,26 @@ function fsSync() {
 }
 document.addEventListener('fullscreenchange', fsSync);
 document.addEventListener('webkitfullscreenchange', fsSync);
+
+// ---- 声音去向: 电脑也响 / 只发手机(虚拟输出, 电脑静音) ----
+// 放在设置面板的音量下面, 和「画质」那些用同一套 .seg 分段按钮。
+// 这是**电脑级设置**(存服务端 config.json), 两个页面都照它走, 不用各自加按钮。
+(function bindAudioOut() {
+  const seg = document.querySelector('.seg.ao');
+  if (!seg) return;
+  const btns = Array.prototype.slice.call(seg.querySelectorAll('button'));
+  function mark(mode) {
+    btns.forEach((b) => b.classList.toggle('on', b.dataset.ao === mode));
+  }
+  fetch('/api/audio/out', { cache: 'no-store' })
+    .then((r) => r.json())
+    .then((j) => { if (j && j.ok) mark(j.mode); })
+    .catch(() => {});
+  btns.forEach((b) => b.addEventListener('click', () => {
+    mark(b.dataset.ao);
+    fetch('/api/audio/out', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: b.dataset.ao }),
+    }).catch(() => {});
+  }));
+})();

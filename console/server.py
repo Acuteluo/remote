@@ -89,6 +89,8 @@ DEFAULT_CONFIG = {"typeMode": "auto", "typeBatch": 80, "typeDelayMs": 20,
                   "volume": 100, "brightness": 100, "themeAcc": "#4da3ff",
                   # 自定义背景: 面板透明度 / 底图暗化 / 模糊(见 render() 注入的 CSS)
                   "bgTrans": 35, "bgDim": 45, "bgBlur": 0,
+                  # 声音去向: pc=电脑也响(默认) / silent=只发手机(电脑静音, 走虚拟输出)
+                  "audioOut": "pc",
                   # 端口也归配置管(命令行 --port / 环境变量 MEOW_PORT 优先级更高):
                   # port = 控制台对外端口; vncPort = x11vnc 的内部 RFB 端口。
                   "port": DEFAULT_PORT, "vncPort": DEFAULT_VNC_PORT,
@@ -3321,6 +3323,12 @@ def _null_sink_module():
     return None
 
 
+def audio_out_mode():
+    """声音去向: pc(电脑也响) / silent(只发手机, 电脑静音)。"""
+    v = (load_config() or {}).get("audioOut")
+    return "silent" if v == "silent" else "pc"
+
+
 def silent_sink_ensure():
     """确保虚拟输出存在, 并把正在播放的流都搬过去。返回 (ok, 说明)。"""
     if _sink_idx(NULL_SINK) is None:
@@ -3713,7 +3721,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # 没播声音时是纯静音(实测 max_volume = -91dB)。必须逐个试过去,
         # 挑第一个真的有信号的源。
         # 只用手机听: 走虚拟输出, 本机一点声音都不出
-        use_null = src in ("silent", "quiet", "onlyphone")
+        # 走虚拟输出的两种情况: 显式请求(src=silent) 或 设置里选了"只发手机"
+        use_null = (src in ("silent", "quiet", "onlyphone")
+                    or audio_out_mode() == "silent")
         _null_forced = False
         if use_null:
             ok, msg = silent_sink_ensure()
@@ -4009,6 +4019,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/theme":
             self._json({"ok": True, "acc": get_theme_acc(),
                         "default": THEME_DEFAULT})
+        elif path == "/api/audio/out":
+            self._json({"ok": True, "mode": audio_out_mode()})
         elif path == "/api/bg":
             has, ver, trans, dim, blur = bg_state()
             try:
@@ -4286,6 +4298,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json({"ok": True, "acc": get_theme_acc()})
             else:
                 self._json({"ok": False, "err": msg})
+        elif path == "/api/audio/out":
+            mode = (data.get("mode") or "").strip()
+            if mode not in ("pc", "silent"):
+                self._json({"ok": False, "err": "mode 只能是 pc 或 silent"})
+                return
+            save_config({"audioOut": mode})
+            audit("audio", "声音去向 -> " + ("只发手机(电脑静音)" if mode == "silent" else "电脑也响"))
+            self._json({"ok": True, "mode": mode})
         elif path == "/api/bg":
             # 两种 body: 图片二进制(Content-Type: image/*) / JSON(参数或清除)
             # 两种 body, 都是 JSON: 图片(base64, 键 img) / 参数或清除。
