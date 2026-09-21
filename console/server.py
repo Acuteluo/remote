@@ -3445,6 +3445,25 @@ def silent_sink_release():
     audit("audio", "虚拟输出收工: 搬回 %d 路声音, 本机声音已恢复" % n)
 
 
+# ---- 音频"永不断流"的关键：给 ffmpeg 喂第二路无限静音 --------------------
+# 空闲时 PipeWire 会挂起 sink, monitor 就不再吐数据, ffmpeg 会干等到没输出,
+# 客户端等不到字节就判定"断了"并重连 —— 这就是"隔一阵卡一下"的来源。
+# 混一路无限静音后, 输出由静音源驱动, 无论电脑有没有声音都持续有数据。
+def _amix_opts():
+    """amix 默认会把每路音量除以路数, 混静音会让真实音量掉一半, 必须关掉归一化。"""
+    try:
+        h = subprocess.run(["ffmpeg", "-hide_banner", "-h", "filter=amix"],
+                           capture_output=True, text=True, timeout=8).stdout
+    except Exception:
+        h = ""
+    return ":normalize=0" if "normalize" in h else ",volume=2"   # 兼容老 ffmpeg
+
+
+SILENT_SRC = "anullsrc=channel_layout=mono:sample_rate=%d" % AUDIO_RATE
+AUDIO_FILTER = ("[0:a]aresample=async=1:first_pts=0,apad[p];"
+                "[p][1:a]amix=inputs=2:duration=longest" + _amix_opts() + "[aout]")
+
+
 def _audio_cmd(kind, src):
     """按 kind 组出 ffmpeg 采集命令(固定编码成 MP3 单声道)。"""
     # -fragment_size: pulse 采集每次读取的粒度。默认交给服务端决定, 在 PipeWire 上
@@ -3453,13 +3472,15 @@ def _audio_cmd(kind, src):
     frag = ["-fragment_size", "2048"] if kind == "pulse" else []
     return ["ffmpeg", "-hide_banner", "-loglevel", "error",
             "-f", kind, *frag, "-i", src,
+            # 第二路: 无限静音, 只为保证"永远有输出"(见 AUDIO_FILTER 注释)
+            "-f", "lavfi", "-i", SILENT_SRC,
             "-ac", "1", "-ar", str(AUDIO_RATE),
             # 两条都是为了"不断":
             #  aresample=async=1  补偿采集时钟/网络时钟的漂移 —— 不补的话浏览器缓冲
             #    会被慢慢抽干, 表现就是"播一会儿卡一下又好了"(隔一阵来一次)。
             #  apad               源一时没数据时补静音, 让流**永不结束**
             #    (否则客户端会以为流断了而重连)。
-            "-af", "aresample=async=1:first_pts=0,apad",
+            "-filter_complex", AUDIO_FILTER, "-map", "[aout]",
             "-c:a", "libmp3lame", "-b:a", AUDIO_BITRATE,
             "-flush_packets", "1",   # 每编完一包立刻吐出来(否则 ffmpeg 攒 ~2s/12KB 才发一次, 手机听感就是一段一段)
         "-f", "mp3", "-"]
