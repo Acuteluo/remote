@@ -2803,7 +2803,7 @@ def audio_level(kind="pulse", src="default", seconds=1.5, wait=2.5):
            "-t", str(seconds), "-af", "volumedetect", "-f", "null", "-"]
     try:
         p = subprocess.run(cmd, env=x_env(), capture_output=True,
-                           text=True, timeout=seconds + wait)
+                           text=True, timeout=seconds + wait + 6)   # 放宽: 这台机器光打开 pulse 源就要 2s+
     except (OSError, subprocess.SubprocessError) as e:
         return {"ok": False, "err": str(e), "kind": kind, "src": src}
     err = p.stderr or ""

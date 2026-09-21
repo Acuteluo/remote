@@ -1209,6 +1209,8 @@ $('vnc-clipbtn').addEventListener('click', () => {
   const p = $('clip-panel');
   const show = p.style.display === 'none';
   p.style.display = show ? 'block' : 'none';
+  // 面板开着就把按钮点亮(和键盘/触控板/设置按钮一致)
+  $('vnc-clipbtn').classList.toggle('on', p.style.display === 'block');
   if (show) clipStatus('可读取/写入远端剪贴板');
 });
 $('clip-close').addEventListener('click', () => { $('clip-panel').style.display = 'none'; });
