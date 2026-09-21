@@ -2896,13 +2896,24 @@ def _default_sink_name():
         return ""
 
 
+def _volume_target():
+    """音量该调哪个 sink。
+
+    "只发手机"模式下声音已经被搬到虚拟输出上, 这时候调硬件 sink 的音量对手机
+    **毫无影响**(滑块动了、手机不变) —— 必须跟着声音走, 调到它真正在的那个 sink。
+    """
+    if audio_out_mode() == "silent" and _sink_idx(NULL_SINK):
+        return NULL_SINK
+    return _default_sink_name()
+
+
 def get_pc_volume():
     """读默认输出设备的当前主音量。
 
     返回 {"vol": 0~150 整数(取声道最大值), "muted": bool, "sink": 名}；
     pactl 不可用 / 找不到默认设备时返回 None。
     """
-    sink = _default_sink_name()
+    sink = _volume_target()
     if not sink:
         return None
     try:
@@ -2929,7 +2940,7 @@ def get_pc_volume():
 
 def set_pc_volume(pct):
     """设默认输出设备主音量为 pct(0~150 整数)。返回 (ok, msg)。"""
-    sink = _default_sink_name()
+    sink = _volume_target()
     if not sink:
         return False, "找不到默认输出设备(pactl get-default-sink 无输出)"
     try:
@@ -3294,6 +3305,8 @@ def audio_first_usable_mic():
 # 所以想"电脑静音但手机能听"必须换条路: 建一个 null sink(数据没人播 -> 一点声音
 # 都不出), 把正在播放的流挪过去, 再采它的 monitor。
 NULL_SINK = "meow_silent"
+# 进"只发手机"前用户原本的默认输出, 收工时还回去
+_NULL_PREV_DEFAULT = {"sink": ""}
 
 
 def _pactl(*args, timeout=6):
@@ -3337,6 +3350,12 @@ def silent_sink_ensure():
                          "sink_properties=device.description=MEOW-Silent")
         if not ok:
             return False, "建虚拟输出失败: " + out
+    # 把**默认输出**也切到虚拟输出: 否则只对当时正在播的那几路生效, 之后新开的
+    # 声音还是从扬声器出来(而且手机听不到) —— 用户要的是"电脑彻底不出声"。
+    if not _NULL_PREV_DEFAULT["sink"]:
+        ok, cur = _pactl("get-default-sink")
+        _NULL_PREV_DEFAULT["sink"] = (cur or "").strip() or "@DEFAULT_SINK@"
+        _pactl("set-default-sink", NULL_SINK)
     idx = _sink_idx(NULL_SINK)
     n = 0
     ok, out = _pactl("list", "short", "sink-inputs")
@@ -3358,6 +3377,9 @@ def silent_sink_release():
         f = ln.split()
         if len(f) > 1 and f[1] == idx and _pactl("move-sink-input", f[0], "@DEFAULT_SINK@")[0]:
             n += 1
+    if _NULL_PREV_DEFAULT["sink"]:
+        _pactl("set-default-sink", _NULL_PREV_DEFAULT["sink"])
+        _NULL_PREV_DEFAULT["sink"] = ""
     mid = _null_sink_module()
     if mid:
         _pactl("unload-module", mid)
