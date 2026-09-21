@@ -64,6 +64,12 @@ function render(s) {
   }
   const wlan = (s.net || []).find(n => /wl|tailscale/.test(n.if));
   if (wlan) chips.push([wlan.if, `↓${fmtRate(wlan.rx)} ↑${fmtRate(wlan.tx)}`, '']);
+  // 当前 Wi-Fi: 和 CPU/温度那些一样, 给一眼能看懂的 SSID + 信号百分比
+  if (s.wifi) {
+    const wp = s.wifi.pct;
+    chips.push(['WiFi', `${s.wifi.ssid || s.wifi.iface}${wp == null ? '' : ' ' + wp + '%'}`,
+      wp == null ? '' : wp < 30 ? 'bad' : wp < 55 ? 'warn' : 'ok']);
+  }
   // 桌面连接数: x11vnc 是共享模式, 客户端越多共享更新循环越慢 ——
   // 放首页是为了"画面一卡就能一眼看到是不是有遗留连接"。
   if (typeof s.vnc_clients === 'number') {
@@ -110,10 +116,17 @@ function render(s) {
     return `<div class="kv"><span class="d">${n}</span><span style="color:var(--${c || 'fg'})">${v}°C</span></div>`;
   }).join('') || '<div class="kv d">无传感器数据</div>';
 
-  // 网络: 前 6 个
-  $('net').innerHTML = (s.net || []).slice(0, 6).map(n =>
+  // 网络: 当前 Wi-Fi 一行(SSID + 信号) + 各网卡速率前 6 个
+  const wifiRow = s.wifi
+    ? '<div class="kv"><span class="d">WiFi</span><span>' +
+      `${esc(s.wifi.ssid || '(未命名)')} · 信号 ` +
+      `${s.wifi.pct == null ? '--' : s.wifi.pct + '%'}` +
+      `${s.wifi.level == null ? '' : ` (${Number(s.wifi.level).toFixed(0)} dBm)`}` +
+      ` · ${esc(s.wifi.iface)}</span></div>`
+    : '';
+  $('net').innerHTML = wifiRow + ((s.net || []).slice(0, 6).map(n =>
     `<div class="kv"><span class="d">${n.if}</span><span>↓${fmtRate(n.rx)} ↑${fmtRate(n.tx)}</span></div>`
-  ).join('') || '<div class="kv d">无网卡数据</div>';
+  ).join('') || '<div class="kv d">无网卡数据</div>');
 
   // 磁盘
   $('disks').innerHTML = (s.disks || []).map(d => {

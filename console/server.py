@@ -79,10 +79,13 @@ AUDIT_FILE = os.path.join(DATA_DIR, "audit.log")
 #   - typeBatch  攒批间隔(服务端目前只作记录, 实际由前端执行)
 #   - typeDelayMs 逐字键入时每字符间隔, 仅终端路径生效
 #   - volume     电脑主音量(0~150, 百分比, 由设置面板滑块控制并持久化)
+#   - brightness 电脑屏幕亮度(5~100, 百分比, 同上; xrandr 软件调光)
 # 启动时读一次; 之后文件 mtime 变了就重读 —— 手改文件也能即时生效, 不用重启。
+# 注意: save_config 只认 DEFAULT_CONFIG 里有的键(防脏数据), 新设置**必须**加进来,
+# 否则 POST 会"看着成功"但什么都没存(2026-09-22 加 brightness 时就踩了这个)。
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 DEFAULT_CONFIG = {"typeMode": "auto", "typeBatch": 80, "typeDelayMs": 20,
-                  "volume": 100,
+                  "volume": 100, "brightness": 100,
                   # 端口也归配置管(命令行 --port / 环境变量 MEOW_PORT 优先级更高):
                   # port = 控制台对外端口; vncPort = x11vnc 的内部 RFB 端口。
                   "port": DEFAULT_PORT, "vncPort": DEFAULT_VNC_PORT,
@@ -1637,6 +1640,55 @@ class Collector:
         out.sort(key=lambda a: 0 if a["level"] == "crit" else 1)
         return out
 
+    def wifi(self):
+        """当前连着的 Wi-Fi: SSID + 信号强度(不是无线连接就返回 None)。
+
+        信号从 /proc/net/wireless 读 —— 纯标准库, 不需要装 iw/nmcli;
+        SSID 内核不给, 只能问外面: 依次试 iwgetid / nmcli, 都没有就退化成
+        "接口名 + 信号"(至少还剩信号强弱这一半信息)。
+        """
+        iface, link, level = None, None, None
+        try:
+            with open("/proc/net/wireless") as f:
+                for ln in f.readlines()[2:]:              # 前两行是表头
+                    if ":" not in ln:
+                        continue
+                    name, rest = ln.split(":", 1)
+                    fld = rest.split()
+                    if len(fld) >= 3:
+                        iface = name.strip()
+                        link = float(fld[1].rstrip("."))  # 习惯刻度 0~70
+                        level = float(fld[2].rstrip("."))  # dBm
+                        break
+        except (OSError, ValueError, IndexError):
+            pass
+        if not iface:
+            return None
+
+        ssid = ""
+        for cmd in (["iwgetid", "-r", iface],
+                    ["nmcli", "-t", "-f", "GENERAL.CONNECTION", "dev", "show", iface]):
+            try:
+                r = subprocess.run(cmd, env=x_env(), capture_output=True,
+                                   text=True, timeout=4)
+                out = (r.stdout or "").strip().splitlines()
+                if out:
+                    v = out[0].split(":", 1)[-1].strip()
+                    if v and v != "--":                   # nmcli 未连接时给 "--"
+                        ssid = v
+                        break
+            except (OSError, subprocess.SubprocessError):
+                continue
+
+        # 百分比: 优先按 dBm 换算(和系统托盘/手机那套一致), 没有 dBm 就用 link/70
+        pct = None
+        if isinstance(level, float) and -120 < level <= 0:
+            pct = int(max(0, min(100, 2 * (level + 100))))
+        elif isinstance(link, float):
+            pct = int(max(0, min(100, link / 70.0 * 100)))
+        return {"iface": iface, "ssid": ssid, "pct": pct,
+                "link": link, "level": level}
+
     def snapshot(self):
         top_cpu, top_mem = self.procs()
         lu = self.load_uptime()
@@ -1650,6 +1702,8 @@ class Collector:
             "temps": self.temps(),
             "battery": self.battery(),
             "net": self.net(),
+            # SSID 要起子进程问 iwgetid/nmcli, 慢字段 —— 5s 一次就够(面板 2s 推一次)
+            "wifi": self._cached("wifi", 5, self.wifi),
             "disks": self.disks(),
             "gpu": self.gpu(),
             "top_cpu": top_cpu,
@@ -2428,6 +2482,10 @@ def _cam_start(dev, size, fps, first_timeout=4.0):
 
 _cam_lock = threading.Lock()
 _cam_session = {"proc": None, "stop": None}      # 同一时刻只允许一个采集会话
+# "摄像头页还有人在看"的最近时刻(前端 JS 心跳刷新)。给 /api/audio 复用:
+# 麦克风只在摄像头页里开, 而那页走了之后 HTTP 流本身收不到任何信号 ——
+# 半个死的连接连 _peer_gone 都探不出来(写还写得进去, 对端早不处理了)。
+_viewer_seen = {"t": 0.0}
 
 
 def _cam_release_current(timeout=3.0):
@@ -2548,6 +2606,7 @@ def ws_cam_bridge(ws, dev=None, size=None, fps=None):
 
     # 前端最后一次心跳的时间 —— 判"还有没有人在看"就看它
     last_viewer = time.time()
+    _viewer_seen["t"] = last_viewer         # 供 /api/audio 复用(见 _serve_audio)
 
     def reader():
         """按 WS 协议读客户端消息, 只关心一件事: 前端 JS 还在不在发心跳。
@@ -2572,6 +2631,7 @@ def ws_cam_bridge(ws, dev=None, size=None, fps=None):
                     try:
                         if json.loads(data.decode("utf-8", "replace")).get("t") == "hb":
                             last_viewer = time.time()
+                            _viewer_seen["t"] = last_viewer   # 给 /api/audio 复用
                     except (ValueError, AttributeError, TypeError):
                         pass
         except socket.timeout:
@@ -2850,6 +2910,62 @@ def set_pc_volume(pct):
         return False, f"调用 pactl 失败: {e}"
     if r.returncode != 0:
         return False, (r.stderr or r.stdout or "pactl 返回非零").strip()
+    return True, "ok"
+
+
+# ---------------------------------------------------------------- 屏幕亮度
+# 走 xrandr 的软件调光(--brightness): 不需要任何权限, 外接屏也管用。
+# 这台机器的 /sys/class/backlight/... 对普通用户不可写(实测), 所以不指望它。
+def _xrandr_outputs():
+    """已连接的显示输出名, 标了 primary 的排最前。"""
+    try:
+        r = subprocess.run(["xrandr", "--query"], env=x_env(),
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if r.returncode != 0:
+        return []
+    primary, others = [], []
+    for ln in (r.stdout or "").splitlines():
+        m = re.match(r"^(\S+)\s+connected\b(.*)$", ln)
+        if not m:
+            continue
+        (primary if "primary" in m.group(2) else others).append(m.group(1))
+    return primary + others
+
+
+def get_pc_brightness():
+    """当前屏幕亮度(5~100 的整数)。
+
+    xrandr 的 --brightness 是"设了就完事", 回读不回来 —— 所以以 config.json 里
+    存的那份为准(滑块写进去的), 没存过就当 100。
+    """
+    try:
+        pct = int((load_config() or {}).get("brightness", 100))
+    except (TypeError, ValueError):
+        return 100
+    return max(5, min(100, pct))
+
+
+def set_pc_brightness(pct):
+    """设屏幕亮度(5~100), 返回 (ok, msg)。改完写进 config.json 持久化。"""
+    try:
+        pct = max(5, min(100, int(pct)))
+    except (TypeError, ValueError):
+        return False, "亮度必须是 5~100 的整数"
+    outs = _xrandr_outputs()
+    if not outs:
+        return False, "找不到可用的显示输出(xrandr 不可用, 或没接显示器)"
+    val = "%.2f" % (pct / 100.0)
+    for name in outs:
+        try:
+            r = subprocess.run(["xrandr", "--output", name, "--brightness", val],
+                               env=x_env(), capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, f"调用 xrandr 失败: {e}"
+        if r.returncode != 0:
+            return False, (r.stderr or r.stdout or "xrandr 返回非零").strip()
+    save_config({"brightness": pct})
     return True, "ok"
 
 
@@ -3405,10 +3521,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except OSError:
                 pass
             buf = first
+            # 麦克风跟着"摄像头页还在不在"走 —— 但只在**这个流是从活着的摄像头页
+            # 开起来的**时候才绑。否则像自检脚本、或者直接用 curl 拉流的场景,
+            # 会被一个陈旧的全局时间戳误杀(踩过: cam_check 的音频用例就是这么挂的)。
+            vt0 = _viewer_seen["t"]
+            tied = bool(vt0) and (time.time() - vt0) <= CAM_VIEWER_TIMEOUT
             while not stop.is_set():
                 # 主动探一下客户端还在不在。光靠"写失败"发现断开太慢 ——
                 # 内核缓冲区没满时 write 照样成功, 麦克风会被白占好几秒。
                 if _peer_gone(self.connection):
+                    break
+                # 半死连接上面那行探不出来: 手机锁屏/切网/webview 被挂起时写还写得
+                # 进去, 对端早就不处理了。所以再挂一道"摄像头页还在不在"的判据 ——
+                # 麦克风只在摄像头页里开, 那页的 JS 心跳停了就说明人走了。
+                # (_viewer_seen 从没被写过 = 压根没人开过摄像头页, 不做这个判断)
+                if tied and time.time() - _viewer_seen["t"] > CAM_VIEWER_TIMEOUT:
+                    audit("audio", "摄像头页心跳停了 %.0fs, 判定没人听, 停止收音"
+                                   % (time.time() - _viewer_seen["t"]))
                     break
                 if buf:
                     if not self._write_chunk(buf):
@@ -3611,6 +3740,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             "err": "读不到电脑音量(没有 pulseaudio 或 pactl)"})
             else:
                 self._json({"ok": True, **v})
+        elif path == "/api/brightness":
+            # 屏幕亮度: 值是滑块写的、存在 config.json(和音量一套做法)
+            self._json({"ok": True, "pct": get_pc_brightness()})
         elif path == "/api/screen":
             w, h = screen_size()
             self._json({"ok": bool(w), "w": w, "h": h})
@@ -3838,6 +3970,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 v = get_pc_volume() or {"vol": pct, "muted": False, "sink": ""}
                 audit("vol", f"电脑音量 → {pct}%")
                 self._json({"ok": True, **v})
+            else:
+                self._json({"ok": False, "err": msg})
+        elif path == "/api/brightness":
+            # 屏幕亮度: 和音量同一套 —— 滑块设, 写进 config.json 持久化。
+            # 用的是 xrandr 软件调光, 不需要 sudo/udev 规则。
+            raw = data.get("pct")
+            try:
+                pct = int(raw)
+            except (TypeError, ValueError):
+                self._json({"ok": False, "err": "pct 必须是 5~100 的整数"})
+                return
+            ok, msg = set_pc_brightness(pct)
+            if ok:
+                audit("bri", f"屏幕亮度 → {pct}%")
+                self._json({"ok": True, "pct": get_pc_brightness()})
             else:
                 self._json({"ok": False, "err": msg})
         elif path == "/api/password":

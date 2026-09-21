@@ -1298,7 +1298,9 @@ document.querySelectorAll('#set-panel .seg.q button').forEach((b) => {
 $('vnc-setbtn').addEventListener('click', () => {
   const p = $('set-panel');
   p.style.display = p.style.display === 'none' ? 'block' : 'none';
-  if (p.style.display === 'block') { refreshDockState(); refreshVncClients(); refreshVolume(); }
+  if (p.style.display === 'block') {
+    refreshDockState(); refreshVncClients(); refreshVolume(); refreshBrightness();
+  }
 });
 
 // ---- 连接维护: 看当前有几个客户端, 一键清理并重启 ----
@@ -1441,6 +1443,44 @@ if (elVol) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ vol: pct }),
+      }).catch(() => {});
+    }, 250);
+  });
+}
+// ---- 屏幕亮度滑块(紧跟在电脑音量下面, 一套做法) ----
+// 值经服务端 xrandr 软件调光落到**电脑那块屏幕**上: 不需要权限, 外接屏也管用。
+// 和音量一样存在服务端 config.json —— 换手机打开还是同一个值。
+const elBri = $('set-bri');
+const elBriV = $('set-bri-v');
+let briTimer = null;
+
+function briLabel(pct) {
+  if (elBriV) elBriV.textContent = pct + '%';
+}
+
+async function refreshBrightness() {
+  if (!elBri) return;
+  try {
+    const r = await fetch('/api/brightness', { cache: 'no-store' });
+    const j = await r.json();
+    if (j && j.ok && typeof j.pct === 'number') {
+      elBri.value = String(Math.max(5, Math.min(100, j.pct)));
+      briLabel(Number(elBri.value));
+    }
+  } catch (e) { /* 服务没起就不动滑块 */ }
+}
+
+if (elBri) {
+  elBri.addEventListener('input', (e) => {
+    const pct = Number(e.target.value);
+    briLabel(pct);
+    // 和音量一样攒 250ms 再发: 拖动过程中别把请求打满(每次都要起一个 xrandr)
+    if (briTimer) clearTimeout(briTimer);
+    briTimer = setTimeout(() => {
+      fetch('/api/brightness', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pct: pct }),
       }).catch(() => {});
     }, 250);
   });
