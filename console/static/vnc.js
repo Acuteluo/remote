@@ -270,7 +270,7 @@ function audioDisarm() {
 }
 
 function pollAudioPos() {
-  fetch('/api/audio/pos?v=ad1', { cache: 'no-store' }).then((r) => r.json()).then((d) => {
+  fetchAbort('/api/audio/pos?v=ad1', 5000).then((r) => r.json()).then((d) => {
     if (!d || !d.ok || !d.on) return;
     if (aGen !== d.gen) { aGen = d.gen; audioArm(); return; }   // 服务端换了采集, 重新对齐
     if (aPos0 == null) aPos0 = d.pos - (nowMs() - aT0) / 1000;
@@ -311,14 +311,16 @@ function audioNow() {
 function renderAudio() {
   const el = $('vnc-ping');
   if (!el) return;
-  const raw = S.showPing ? audioNow() : null;
+  // 注意: 和设置里那个「右上角显示延迟」开关**无关** —— 音频延时本来就要看,
+  // 而它只靠每 3s 一个小请求(+本机时钟插值), 开销可以忽略。
+  // (踩过: 之前一起挂在那个开关上, 开关一关就只剩 "--", 看着像坏了。)
+  const raw = audioNow();
   if (raw == null) {
-    audioEma = 0; audioShownS = 0;
+    audioEma = 0; audioShownS = 0; audioShownExact = false;
     el.textContent = '音频 --';
-    el.className = 'ping ' + (audioOn && S.showPing ? 'warn' : 'bad');
-    el.title = !S.showPing ? '已在设置里关掉了"右上角显示延迟"'
-      : audioOn ? '正在听电脑声音, 播放器还没攒够数据(等一两秒)'
-                : '没在听电脑声音 —— 右下角 🔊 开启后才会有这个数';
+    el.className = 'ping ' + (audioOn ? 'warn' : 'bad');
+    el.title = audioOn ? '正在听电脑声音, 播放器还没攒够数据(等一两秒)'
+                       : '没在听电脑声音 —— 右下角 🔊 开启后才会有这个数';
     return;
   }
   audioEma = audioEma ? audioEma * 0.5 + raw * 0.5 : raw;   // 平滑, 免得数字乱跳
@@ -388,7 +390,10 @@ function renderRate(fps, kbs) {
       // "41fps · 画面 33ms" 会把"返回/远程桌面"挤成**竖排单字**。
       // 帧率/码率不丢, 挪到 tooltip 和全屏信息栏里(那边一整行, 够宽)。
       el.textContent = pic == null ? '画面 --' : `画面 ${pic}ms`;
-      el.title = `图传帧率 ${fps.toFixed(1)} fps，码率 ${kbs >= 1024
+      el.title = (pic == null
+        ? '⚠ 还没有网络往返数据 —— 设置里「右上角显示延迟」关着时不会去测;\n'
+          + '打开那个开关(每 5 秒一个小请求)这一栏才有数。\n' : '')
+        + `图传帧率 ${fps.toFixed(1)} fps，码率 ${kbs >= 1024
         ? (kbs / 1024).toFixed(2) + ' MB/s' : kbs.toFixed(0) + ' KB/s'}\n`
         + `画面延时估算 ≈ 网络单程 + ${PIC_FIXED_MS}ms`
         + `（服务端变更检测≤${PIC_SERVER_MS}ms + 编码/手机解码约${PIC_CLIENT_MS}ms，`
@@ -411,12 +416,21 @@ setInterval(() => {
   renderRate(fps, kbs);
 }, 1000);
 
+function fetchAbort(url, ms) {
+  // 校园网/Tailscale 抖动时请求可能一直挂着 —— 挂住一次, pingBusy 就永远是 true,
+  // 之后再也测不了(表现就是"画面 --"再也不恢复)。宁可这次算失败也别卡死。
+  const ac = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  const tm = ac ? setTimeout(() => ac.abort(), ms) : 0;
+  return fetch(url, { cache: 'no-store', signal: ac ? ac.signal : undefined })
+    .finally(() => { if (tm) clearTimeout(tm); });
+}
+
 async function pingOnce() {
   if (pingBusy) return;
   pingBusy = true;
   const t0 = performance.now();
   try {
-    await fetch('/api/health?t=' + Date.now(), { cache: 'no-store' });
+    await fetchAbort('/api/health?t=' + Date.now(), 5000);
     const ms = performance.now() - t0;
     pingEma = pingEma ? pingEma * 0.6 + ms * 0.4 : ms;
     renderRate(lastFps, lastKbs);      // 网络值只喂给画面那栏的估算, 不再单独显示
