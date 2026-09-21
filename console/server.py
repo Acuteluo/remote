@@ -3361,7 +3361,8 @@ def audio_first_usable_mic():
 # 直接采硬件 sink 的 monitor 时, **本机一静音 monitor 就没声了**(用户实测确认),
 # 所以想"电脑静音但手机能听"必须换条路: 建一个 null sink(数据没人播 -> 一点声音
 # 都不出), 把正在播放的流挪过去, 再采它的 monitor。
-SILENT_VOL = 2        # "模拟输出"钉住的电脑音量(%, 听不见但有信号)
+SILENT_VOL = 1        # "模拟输出"钉住的电脑音量(%): 1% 听不见, 但 monitor 仍有满幅信号
+                      # (实测这块 HDA 上 1% 读回就是 1%; 只有 0%/静音会让 monitor 一起静音)
 NULL_SINK = "meow_silent"
 # 进"只发手机"前用户原本的默认输出, 收工时还回去
 _NULL_PREV_DEFAULT = {"sink": ""}
@@ -4408,8 +4409,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # 用户实测发现的巧办法: 1% 已经听不见, 而 monitor **仍有满幅信号**;
                 # 只有 0%/静音才会让 monitor 一起静音(那手机就没声了)。所以根本不需要
                 # 虚拟输出那套搬流 —— 简单、且没有副作用。
-                # 注意用 2% 而不是 1%: 实测这块 HDA 上 1% 会被 ALSA 混合器舍入成 0%,
-                # 而 0% 会让 monitor 一起静音(手机就没声了)。2% 听不见但一定有信号。
                 set_pc_volume(SILENT_VOL)   # 必须在存 mode 之前(下面会按 mode 拦)
             else:
                 silent_sink_release()     # 顺手清掉以前遗留的 meow_silent
