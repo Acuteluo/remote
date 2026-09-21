@@ -3454,6 +3454,12 @@ def _audio_cmd(kind, src):
     return ["ffmpeg", "-hide_banner", "-loglevel", "error",
             "-f", kind, *frag, "-i", src,
             "-ac", "1", "-ar", str(AUDIO_RATE),
+            # 两条都是为了"不断":
+            #  aresample=async=1  补偿采集时钟/网络时钟的漂移 —— 不补的话浏览器缓冲
+            #    会被慢慢抽干, 表现就是"播一会儿卡一下又好了"(隔一阵来一次)。
+            #  apad               源一时没数据时补静音, 让流**永不结束**
+            #    (否则客户端会以为流断了而重连)。
+            "-af", "aresample=async=1:first_pts=0,apad",
             "-c:a", "libmp3lame", "-b:a", AUDIO_BITRATE,
             "-flush_packets", "1",   # 每编完一包立刻吐出来(否则 ffmpeg 攒 ~2s/12KB 才发一次, 手机听感就是一段一段)
         "-f", "mp3", "-"]
