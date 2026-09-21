@@ -135,8 +135,11 @@
     }
     recent.push(s);
     if (recent.length > 8) recent.shift();
+    // 淡一下再显示, 换句不突兀
+    sayEl.style.opacity = '0.2';
     sayEl.textContent = s;
     fitOneLine();
+    setTimeout(() => { sayEl.style.opacity = '1'; }, 40);
   }
 
   // 一行放不下就把字号往下调(最多缩到 13px)。手机上句子长短 + 屏宽都不一样,
@@ -239,6 +242,14 @@
   });
 
   layout();
+  // ★ 一进页面就随机挑一句。之前漏了这一步 —— 只有拖动/点按钮才换, 于是每次
+  //   进来看到的都是 HTML 里那句写死的默认文字, 看着就像"固定不变"。
+  newSentence();
+  // 闲着也换: 每 8 秒来一句新的, 不打扰正在拖动的人, 切后台也不换。
+  setInterval(() => {
+    if (!dragging && !document.hidden) newSentence();
+  }, 8000);
+
   fetch('/api/theme', { cache: 'no-store' })
     .then((r) => r.json())
     .then((j) => {
