@@ -184,6 +184,22 @@ MAX_TERMINALS = 4
 
 # ---------------------------------------------------------------- 基础设施
 
+def _who(handler):
+    """日志里想看到"谁连的": 客户端 IP + 截断的 User-Agent。
+
+    只记 IP 的话, 同一台手机上分不出是哪个浏览器/是不是微信内置; 整串 UA 又太长,
+    把日志刷得没法看 —— 所以头 44 个字符 + 省略号。
+    """
+    try:
+        ip = handler.client_address[0]
+    except (AttributeError, IndexError):
+        ip = "?"
+    ua = (handler.headers.get("User-Agent") or "").strip() if hasattr(handler, "headers") else ""
+    if len(ua) > 46:
+        ua = ua[:44] + "..."
+    return "%s%s" % (ip, (" · " + ua) if ua else "")
+
+
 def audit(action, detail=""):
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {action} {detail}".rstrip()
     try:
@@ -2566,6 +2582,7 @@ def _cam_stop(proc):
 
 def ws_cam_bridge(ws, dev=None, size=None, fps=None):
     """摄像头 -> 浏览器。单向推 MJPEG 帧。"""
+    t0 = time.time()          # 记时长, 停止时写进日志
     dev = dev or CAM_DEFAULT_DEV
     size = size if size in _CAM_SIZES else CAM_DEFAULT_SIZE
     try:
@@ -2696,7 +2713,7 @@ def ws_cam_bridge(ws, dev=None, size=None, fps=None):
             ws.close()
         except OSError:
             pass
-    audit("cam", f"摄像头停止 {dev} (pid={proc.pid})")
+    audit("cam", "摄像头停止 %s (pid=%d, 共 %.0fs)" % (dev, proc.pid, time.time() - t0))
 
 
 def _cam_send_err(ws, msg):
@@ -3909,12 +3926,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/ws/term":
             ws = self._ws()
             if ws:
-                audit("term", "终端会话打开")
+                audit("term", "终端会话打开 from " + _who(self))
                 ws_term_bridge(ws)
         elif path == "/ws/vnc":
             ws = self._ws(protocols=["binary"])
             if ws:
-                audit("vnc", "远程桌面连接")
+                audit("vnc", "远程桌面连接 from " + _who(self))
                 ws_vnc_bridge(ws)
         elif path == "/api/vnc/clients":
             # 诊断用: x11vnc 上当前几个客户端(正常 1)。数字偏大 = 有遗留连接。
@@ -3987,12 +4004,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ok = check_login(user, pw)
             record_login(ip, ok)
             if ok:
-                audit("login", f"登录成功")
+                audit("login", "登录成功 from " + _who(self))
                 self._redirect("/home", extra={
                     "Set-Cookie": (f"{COOKIE_NAME}={make_token()}; Path=/; "
                                    f"HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}")})
             else:
-                audit("login", f"登录失败 user={user!r}")
+                audit("login", "登录失败 user=%r from %s" % (user, ip))
                 time.sleep(0.6)
                 self._login_page("用户名或密码错误")
             return
@@ -4116,11 +4133,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 self._json({"ok": False, "err": "vol 必须是 0~150 的整数"})
                 return
+            old = (get_pc_volume() or {}).get("vol")
             ok, msg = set_pc_volume(pct)
             if ok:
                 save_config({"volume": pct})
                 v = get_pc_volume() or {"vol": pct, "muted": False, "sink": ""}
-                audit("vol", f"电脑音量 → {pct}%")
+                audit("vol", "电脑音量 %s%% → %d%% (输出 %s)"
+                      % (old if old is not None else "?", pct, v.get("sink") or "?"))
                 self._json({"ok": True, **v})
             else:
                 self._json({"ok": False, "err": msg})
@@ -4133,17 +4152,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 self._json({"ok": False, "err": "pct 必须是 5~100 的整数"})
                 return
+            old = get_pc_brightness()
             ok, msg = set_pc_brightness(pct)
             if ok:
-                audit("bri", f"屏幕亮度 → {pct}%")
+                audit("bri", "屏幕亮度 %d%% → %d%% (输出 %s)"
+                      % (old, pct, ",".join(_xrandr_outputs()) or "?"))
                 self._json({"ok": True, "pct": get_pc_brightness()})
             else:
                 self._json({"ok": False, "err": msg})
         elif path == "/api/theme":
             # 主题色: 太暗的会被 set_theme_acc 拒掉(暗底上没法当文字色用)
+            old = get_theme_acc()
             ok, msg = set_theme_acc(data.get("acc"))
             if ok:
-                audit("theme", f"主题色 → {get_theme_acc()}")
+                audit("theme", "主题色 %s → %s" % (old, get_theme_acc()))
                 self._json({"ok": True, "acc": get_theme_acc()})
             else:
                 self._json({"ok": False, "err": msg})
