@@ -3753,6 +3753,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # 走虚拟输出的两种情况: 显式请求(src=silent) 或 设置里选了"只发手机"
         use_null = (src in ("silent", "quiet", "onlyphone")
                     or audio_out_mode() == "silent")
+        if not use_null:
+            # 兜底: 曾经进过模拟输出、但模式已经切回电脑输出(或有别的残留)时, 顺手收工
+            silent_sink_release()
         _null_forced = False
         if use_null:
             ok, msg = silent_sink_ensure()
@@ -4333,7 +4336,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json({"ok": False, "err": "mode 只能是 pc 或 silent"})
                 return
             save_config({"audioOut": mode})
-            audit("audio", "声音去向 -> " + ("只发手机(电脑静音)" if mode == "silent" else "电脑也响"))
+            if mode == "pc":
+                # ★ 立刻把声音搬回来。否则: 正在跑的那路流还占着虚拟输出, 默认输出
+                #   也还指着它 —— 表现就是"设置切回电脑输出了, 电脑却没声音"(用户报的 bug)。
+                silent_sink_release()
+            audit("audio", "声音去向 -> " + ("模拟输出(电脑静音, 只发手机)"
+                                            if mode == "silent" else "电脑输出"))
             self._json({"ok": True, "mode": mode})
         elif path == "/api/bg":
             # 两种 body: 图片二进制(Content-Type: image/*) / JSON(参数或清除)
