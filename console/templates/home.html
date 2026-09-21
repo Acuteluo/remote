@@ -107,16 +107,10 @@
     <div class="kv" style="margin-top:8px"><span class="d" id="pw-msg"></span></div>
   </div>
 
-  <!-- 自定义背景: 按需求不做成快捷模块, 而是放在修改密码下面 -->
-  <div class="card" style="margin-top:10px">
-    <h3>自定义背景</h3>
-    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-      <a href="/bg" style="display:inline-block;padding:9px 15px;border-radius:10px;
-         border:1px solid var(--line);background:var(--card2);color:var(--fg);font-size:13px">
-        🖼️ 更换背景</a>
-      <span class="d" style="color:var(--dim);font-size:12px">
-        传一张图 · 调透明度和亮度 · 实时预览 · 全站生效(含远程桌面)</span>
-    </div>
+  <!-- 更换背景: 就做一个按钮(和上面"修改"同一套观感), 不做成卡片模块 -->
+  <a href="/bg" style="display:block;margin-top:10px;padding:11px;border-radius:10px;
+     border:0;background:var(--card2);color:var(--fg);text-align:center;font-size:14px;
+     font-weight:600">🖼️ 更换背景</a>
   </div>
 
   <div class="foot">MEOW Console · 数据每 1s 推送<br>
