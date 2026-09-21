@@ -87,6 +87,8 @@ AUDIT_FILE = os.path.join(DATA_DIR, "audit.log")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 DEFAULT_CONFIG = {"typeMode": "auto", "typeBatch": 80, "typeDelayMs": 20,
                   "volume": 100, "brightness": 100, "themeAcc": "#4da3ff",
+                  # 自定义背景: 面板透明度 / 底图暗化 / 模糊(见 render() 注入的 CSS)
+                  "bgTrans": 35, "bgDim": 45, "bgBlur": 0,
                   # 端口也归配置管(命令行 --port / 环境变量 MEOW_PORT 优先级更高):
                   # port = 控制台对外端口; vncPort = x11vnc 的内部 RFB 端口。
                   "port": DEFAULT_PORT, "vncPort": DEFAULT_VNC_PORT,
@@ -1207,7 +1209,7 @@ class Collector:
         self._proc_lock = threading.Lock()
         self._cpu_hot = 0              # CPU 连续超标次数(告警要"持续"才算, 见 alerts)
         self.hostname = socket.gethostname()
-        # 慢字段(wmctrl / tailscale 都要起子进程)做 TTL 缓存: 状态面板每 2s 推一次,
+        # 慢字段(wmctrl / tailscale 都要起子进程)做 TTL 缓存: 状态面板每 1s 推一次,
         # 不加缓存就等于每 2s 起两个进程, 和远程桌面的更新循环抢 CPU。
         self._cache = {}
         self._cache_lock = threading.Lock()
@@ -1552,7 +1554,7 @@ class Collector:
                 return False
             finally:
                 s.close()
-        # 10s 缓存: 状态面板 2s 推一次, 不加缓存等于每 2s 连一次端口
+        # 10s 缓存: 状态面板 1s 推一次, 不加缓存等于每 2s 连一次端口
         return self._cached(f"port{port}", 10, probe)
 
     def alerts(self, snap):
@@ -1703,7 +1705,7 @@ class Collector:
             "temps": self.temps(),
             "battery": self.battery(),
             "net": self.net(),
-            # SSID 要起子进程问 iwgetid/nmcli, 慢字段 —— 5s 一次就够(面板 2s 推一次)
+            # SSID 要起子进程问 iwgetid/nmcli, 慢字段 —— 5s 一次就够(面板 1s 推一次)
             "wifi": self._cached("wifi", 5, self.wifi),
             "disks": self.disks(),
             "gpu": self.gpu(),
@@ -1712,7 +1714,7 @@ class Collector:
             "windows": self.windows(),
             "peers": self.tailscale(),
         }
-        # 桌面连接数: 每 5s 才数一次(面板 2s 推一次, 没必要那么勤)
+        # 桌面连接数: 每 5s 才数一次(面板 1s 推一次, 没必要那么勤)
         snap["vnc_clients"] = self._cached("vncc", 5, vnc_client_count)
         snap["alerts"] = self.alerts(snap)
         return snap
@@ -3013,6 +3015,60 @@ def set_theme_acc(hexv):
     return True, "ok"
 
 
+# ---------------------------------------------------------------- 自定义背景
+# 图片存 data/bg.img(运行时目录, 不进仓库), 参数存 config.json。
+# CSS 全在 render() 里注入 —— app.css 一行都不用改。
+BG_FILE = os.path.join(DATA_DIR, "bg.img")
+BG_MAX = 8 * 1024 * 1024            # 8 MB
+
+
+def bg_state():
+    """返回 (有图吗, 版本号, 透明, 暗化, 模糊)。版本号用 mtime, 兼做 cache buster。"""
+    try:
+        has = os.path.getsize(BG_FILE) > 0
+        ver = int(os.path.getmtime(BG_FILE)) if has else 0
+    except OSError:
+        has, ver = False, 0
+    c = load_config() or {}
+
+    def gi(k, d, lo, hi):
+        try:
+            return max(lo, min(hi, int(c.get(k, d))))
+        except (TypeError, ValueError):
+            return d
+
+    return (has, ver, gi("bgTrans", 35, 0, 90), gi("bgDim", 45, 0, 80),
+            gi("bgBlur", 0, 0, 20))
+
+
+def bg_css():
+    """注入到 </head> 前的全局样式(主题色 + 背景)。"""
+    has, ver, trans, dim, blur = bg_state()
+    alpha = "%.2f" % (1 - trans / 100.0)
+    out = [
+        ":root{--acc:%s;--panel-a:%s}" % (get_theme_acc(), alpha),
+        # 面板底色拆成"RGB + 单独的不透明度": 半透明就是手机 QQ 空间动态页那种
+        # 卡片浮在图上; 透明度调到 0 时卡片完全不透明, 图片只从卡片缝隙里露出来,
+        # 滑动页面看到的就是图片的不同部分。app.css 里 12 处 var(--card) 一起生效。
+        ":root{--card:rgb(19 26 35 / var(--panel-a));"
+        "--card2:rgb(15 21 29 / var(--panel-a))}",
+        ".topbar{background:rgb(11 15 20 / calc(var(--panel-a) * .97))}",
+    ]
+    if has:
+        # 底图用两个 position:fixed 的层(图 + 暗化)放在最底下, 而不是
+        # background-attachment:fixed —— 后者在 iOS Safari 上很不可靠。
+        out += [
+            "html{background:#0b0f14}body{background:transparent}",
+            "body::before{content:'';position:fixed;inset:0;z-index:-1;"
+            "background:#0b0f14 url('/bg/img?v=%d') center/cover no-repeat;"
+            "pointer-events:none%s}"
+            % (ver, (";filter:blur(%dpx)" % blur) if blur else ""),
+            "body::after{content:'';position:fixed;inset:0;z-index:-1;"
+            "background:rgba(11,15,20,%.2f);pointer-events:none}" % (dim / 100.0),
+        ]
+    return "<style>%s</style>\n" % "".join(out)
+
+
 def audio_default_monitor():
     """默认输出设备对应的 monitor —— 采它就能拿到"电脑正在放的声音"。
 
@@ -3398,13 +3454,11 @@ def render(name, **kw):
         html = f.read()
     for k, v in kw.items():
         html = html.replace("{{" + k + "}}", str(v))
-    # 主题色统一在这里注入: 所有页面都过 render(), 所以一处管全部 ——
+    # 主题色 + 自定义背景: 统一在这里注入。所有页面都过 render(), 所以一处管全部 ——
     # 不用挨个改模板, 将来新增模板也自动带上。
-    # 放在 </head> 前 = 排在 app.css 之后; 同优先级后者生效, 正好盖住默认 --acc。
+    # 放在 </head> 前 = 排在 app.css 之后; 同优先级后者生效, 正好盖住默认值。
     if "</head>" in html:
-        html = html.replace(
-            "</head>",
-            "<style>:root{--acc:%s}</style>\n</head>" % get_theme_acc(), 1)
+        html = html.replace("</head>", bg_css() + "</head>", 1)
     return html
 
 
@@ -3781,6 +3835,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # 主题色: 圆盘取色页。颜色本身走 /api/theme, 这里只给页面和默认值。
             self._html(200, render("theme.html", user=user,
                                    host=COLLECTOR.hostname, default=THEME_DEFAULT))
+        elif path == "/bg":
+            # 自定义背景页(图片本体走 /bg/img)
+            self._html(200, render("bg.html", user=user, host=COLLECTOR.hostname))
         elif path == "/log":
             self._html(200, render("log.html", user=user,
                                    host=COLLECTOR.hostname))
@@ -3801,6 +3858,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/theme":
             self._json({"ok": True, "acc": get_theme_acc(),
                         "default": THEME_DEFAULT})
+        elif path == "/api/bg":
+            has, ver, trans, dim, blur = bg_state()
+            try:
+                n = os.path.getsize(BG_FILE) if has else 0
+            except OSError:
+                n = 0
+            self._json({"ok": True, "has": has, "ver": ver, "bytes": n,
+                        "trans": trans, "dim": dim, "blur": blur})
+        elif path == "/bg/img":
+            # 背景图本体(要登录才取得到; 没图就 404)
+            try:
+                with open(BG_FILE, "rb") as fh:
+                    blob = fh.read()
+            except OSError:
+                self._html(404, "<h1>没有背景图</h1>")
+            else:
+                ct = ("image/png" if blob[:8] == b"\x89PNG\r\n\x1a\n"
+                      else "image/webp" if blob[8:12] == b"WEBP"
+                      else "image/gif" if blob[:3] == b"GIF" else "image/jpeg")
+                self._reply(200, blob, ct, {"Cache-Control": "no-cache"})
         elif path == "/api/screen":
             w, h = screen_size()
             self._json({"ok": bool(w), "w": w, "h": h})
@@ -4053,6 +4130,58 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json({"ok": True, "acc": get_theme_acc()})
             else:
                 self._json({"ok": False, "err": msg})
+        elif path == "/api/bg":
+            # 两种 body: 图片二进制(Content-Type: image/*) / JSON(参数或清除)
+            # 两种 body, 都是 JSON: 图片(base64, 键 img) / 参数或清除。
+            # 不用二进制 body: do_POST 前面已经按 JSON 解过一遍 body 了, 分支里再
+            # read(Content-Length) 会一直等下去(实测卡死过一次)。
+            b64 = data.get("img")
+            if b64:
+                import base64 as _b64
+                try:
+                    blob = _b64.b64decode(b64, validate=False)
+                except Exception:
+                    self._json({"ok": False, "err": "图片解码失败"})
+                    return
+                if not blob or len(blob) > BG_MAX:
+                    self._json({"ok": False, "err": "图片大小不对(最多 8 MB)"})
+                    return
+                try:
+                    with open(BG_FILE, "wb") as fh:
+                        fh.write(blob)
+                except OSError as e:
+                    self._json({"ok": False, "err": "存不下: %s" % e})
+                    return
+                audit("bg", "背景图已更新(%d KB)" % (len(blob) // 1024))
+                self._json({"ok": True, "ver": bg_state()[1]})
+                return
+            if data.get("clear"):
+                try:
+                    os.remove(BG_FILE)
+                except OSError:
+                    pass
+                if data.get("reset"):
+                    save_config({"bgTrans": 35, "bgDim": 45, "bgBlur": 0})
+                audit("bg", "背景图已清除" + ("并恢复默认参数" if data.get("reset") else ""))
+                self._json({"ok": True})
+                return
+            params = data.get("params") or {}
+            patch = {}
+            # 前端发的是短键(trans/dim/blur), 存的是长键(bgTrans/...), 两个都认
+            for sk, k, lo, hi in (("trans", "bgTrans", 0, 90),
+                                  ("dim", "bgDim", 0, 80),
+                                  ("blur", "bgBlur", 0, 20)):
+                v = params.get(k, params.get(sk))
+                if v is not None:
+                    try:
+                        patch[k] = max(lo, min(hi, int(v)))
+                    except (TypeError, ValueError):
+                        pass
+            if patch:
+                save_config(patch)
+            audit("bg", "背景参数 " + (", ".join("%s=%s" % kv for kv in patch.items())
+                                      or "无变化"))
+            self._json({"ok": True})
         elif path == "/api/password":
             # 设置面板改密码: 必须输对原密码。用户名不可改(单机单用户)。
             old = data.get("old")
