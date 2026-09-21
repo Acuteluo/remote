@@ -64,6 +64,10 @@ m._audio_cmd = lambda kind, src: [
     '-f', 'mp3', '-',
 ]
 m.PORT = {port}
+
+# 4) 把"前端心跳超时"压到几秒, 自检里就能快速验完(生产是 20s)
+m.CAM_PING_EVERY = 1.0
+m.CAM_VIEWER_TIMEOUT = 4.0
 m.main()
 """
 
@@ -228,6 +232,48 @@ try:
             sock2.close()
         except OSError:
             pass
+
+    # ---- 3.5) 不发心跳、也不断开: 服务端必须自己把摄像头停掉 ----
+    # 就是用户报的那个场景 —— 页面切到后台 / 手机锁屏 / 离开后 webview 没发 FIN,
+    # 连接还在(甚至还在收画面), 但前端 JS 早被挂起、不再发心跳。
+    # 2026-09-22 修之前这里**永远不会停**: 服务端拿 WebSocket 的 pong 当"还有人在看"
+    # 的判据, 而浏览器/系统网络栈在 JS 挂起后照样会自动回 pong, 于是永远判不出
+    # "人已经走了", 摄像头指示灯一直亮着, 和页面上"没人观看立即停止"的承诺不符。
+    s3, jpgs3, _t3 = connect(CK, seconds=2.0)
+    if s3 is None:
+        print("  ✗ 心跳用例: 握手失败")
+        ok = False
+    else:
+        ff_live = count_ffmpeg("testsrc=size=320x240")
+        s3.settimeout(1.0)
+        t0, dropped = time.time(), False
+        while time.time() - t0 < 20:          # 服务端那个超时已压到 4s
+            try:
+                if not s3.recv(65536):        # 还在收画面 == TCP 活着且可写
+                    dropped = True
+                    break
+            except socket.timeout:
+                continue
+            except OSError:
+                dropped = True
+                break
+        waited = time.time() - t0
+        ff_idle = count_ffmpeg("testsrc=size=320x240")
+        print(f"  不发心跳也不断开: {waited:.1f}s 后 "
+              f"{'服务端已断开' if dropped else '连接仍在'}, "
+              f"ffmpeg {ff_live} -> {ff_idle}")
+        if not ff_live:
+            print("  ⚠ 采集期间没看到 ffmpeg 进程(pgrep 不可用?), 跳过该项")
+        elif dropped and not ff_idle:
+            print("  ✓ 前端心跳一停就自己停采(切后台/锁屏不会白开着摄像头)")
+        else:
+            print("  ✗ 没人看了还在采 —— 摄像头会一直亮着")
+            ok = False
+        try:
+            s3.close()
+        except OSError:
+            pass
+        time.sleep(1.0)
 
     # ---- 4) 声音: HTTP 流式 MP3 ----
     ac = http.client.HTTPConnection("127.0.0.1", PORT, timeout=12)

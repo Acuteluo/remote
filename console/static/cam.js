@@ -112,6 +112,7 @@
           curDev = j.dev; curSize = j.size; curSetFps = String(j.fps);
           startedAt = Date.now(); frames = 0; bytes = 0; tickAt = Date.now();
           st.textContent = `${j.dev} · ${j.size} @ ${j.fps}fps`;
+          hb();          // 立刻报一次"有人在看", 别让服务端白等一个心跳周期
         } else if (j.t === 'err') {
           lastBusy = /占用|busy/i.test(j.d || '');
           errEl.textContent = '⚠ ' + j.d;
@@ -126,6 +127,20 @@
     ws.onclose = schedule;
     ws.onerror = () => { /* onclose 会接手 */ };
   }
+
+  // 心跳: 告诉服务端"我还看着呢"。服务端**只认这个**, 不认 WebSocket 的 pong ——
+  // 浏览器/系统的网络栈在页面切到后台、JS 已经被挂起时照样会自动回 pong, 拿 pong
+  // 判活等于永远判不出"人已经走了"。
+  // 切后台/锁屏后浏览器会把定时器节流到几乎不跑 -> 心跳停 -> 服务端 20s 内把摄像头
+  // 关掉。这样"按返回退出"和"切后台一直不回"两条路都能自己停, 不用指望
+  // visibilitychange 一定会触发(有的 webview 不触发)。
+  function hb() {
+    if (stopped || document.hidden) return;
+    if (ws && ws.readyState === 1) {
+      try { ws.send(JSON.stringify({ t: 'hb' })); } catch (e) { /* ignore */ }
+    }
+  }
+  setInterval(hb, 5000);
 
   // 每 1s 刷新 OSD: 实测帧率 / 实测码率 / 已连时长 / 本地时间
   setInterval(() => {

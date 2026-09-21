@@ -2248,6 +2248,14 @@ CAM_DEFAULT_SIZE = "640x480"
 CAM_DEFAULT_FPS = 12
 CAM_MAX_FPS = 30
 _CAM_SIZES = ("320x240", "640x480", "1280x720")
+# 「还有人在看吗」的**唯一判据是前端 JS 主动发来的心跳**, 不是 WebSocket 的 pong:
+# 浏览器/系统的网络栈会自动回 pong, 哪怕页面早就切到后台、JS 已经被挂起。
+# 所以 JS 心跳一停(切后台/锁屏/离开), 就当没人看, 关掉摄像头。
+CAM_IO_TIMEOUT = 10         # socket 读写超时: 卡死的客户端要在 10s 内被断掉
+# 下面两个允许用环境变量压小 —— 好让 console/tests/cam_check.py 几秒内就能
+# 把"心跳停了会不会自己停采"验完(生产环境保持默认)。
+CAM_PING_EVERY = float(os.environ.get("MEOW_CAM_PING_EVERY") or 5)
+CAM_VIEWER_TIMEOUT = float(os.environ.get("MEOW_CAM_VIEWER_TIMEOUT") or 20)
 
 
 V4L2_CAP_VIDEO_CAPTURE = 0x00000001
@@ -2538,34 +2546,67 @@ def ws_cam_bridge(ws, dev=None, size=None, fps=None):
         finally:
             stop.set()
 
-    def watch():
-        """盯着浏览器: 关页面/断网时 recv 立刻返回空, 马上停采集。
+    # 前端最后一次心跳的时间 —— 判"还有没有人在看"就看它
+    last_viewer = time.time()
 
-        光靠 ping 是不够的 —— 间隔内摄像头会白开好几秒。这里阻塞读, 客户端一关
-        socket 就 EOF, 立即收工(隐私: 没人看就不该继续开着摄像头)。
-        顺带每 5s 的超时用来 ping 一次, 兼做 NAT 保活。
+    def reader():
+        """按 WS 协议读客户端消息, 只关心一件事: 前端 JS 还在不在发心跳。
+
+        2026-09-22 修: 原来这里是 `ws.sock.recv()` 直接读原始字节, 后果有三 ——
+          (a) 浏览器回的 pong 被当成普通数据, WSConn.last_pong 永远停在连上那一刻,
+              于是"看 pong 判活"这套机制对摄像头完全失效;
+          (b) 浏览器发来的 close 帧同样被当成"有数据", 服务端既不回应也不停采集;
+          (c) 于是"按返回/切后台"之后, 只要 TCP 没有立刻 FIN(webview 在等服务端的
+              close 回应、手机锁屏/切网造成的半死连接, 这些都很常见), 采集就永远
+              不停, 摄像头指示灯一直亮 —— 和页面上"没人观看立即停止"的承诺不符。
+
+        现在按协议读: close 帧会抛 WSClosed -> 立刻停; 同时只把前端 JS 的
+        {"t":"hb"} 当作"有人在看"。切到后台时 JS 定时器被节流到几乎不跑, 心跳一停
+        就停采集 —— 哪怕浏览器还在自动回 pong。
         """
+        nonlocal last_viewer
         try:
-            ws.sock.settimeout(5)
             while not stop.is_set():
-                try:
-                    d = ws.sock.recv(4096)
-                except socket.timeout:
-                    ws.ping()
-                    if not ws.alive:
-                        break
-                    continue
-                if not d:
-                    break
-        except OSError:
+                op, data = ws.recv_message()
+                if op == 0x1:                       # 前端心跳 {"t":"hb"}
+                    try:
+                        if json.loads(data.decode("utf-8", "replace")).get("t") == "hb":
+                            last_viewer = time.time()
+                    except (ValueError, AttributeError, TypeError):
+                        pass
+        except socket.timeout:
+            pass
+        except (OSError, WSClosed):
             pass
         finally:
             stop.set()
 
+    def watch():
+        """看门狗: 定期 ping(NAT 保活), 并盯着"前端多久没来心跳了"。"""
+        while not stop.is_set():
+            if stop.wait(CAM_PING_EVERY):
+                return
+            if not ws.alive:
+                break
+            idle = time.time() - last_viewer
+            if idle > CAM_VIEWER_TIMEOUT:
+                audit("cam", "%.0fs 没收到前端心跳, 判定没人看, 停采集" % idle)
+                break
+        stop.set()
+
+    try:
+        # 10s 这个值两头都要顾: 客户端不再收数据时 sendall 要尽快超时(别白开着
+        # 摄像头), 同时又不会把浏览器的控制帧读成半截(心跳/close 都是几字节, 一次到)。
+        ws.sock.settimeout(CAM_IO_TIMEOUT)
+    except OSError:
+        pass
+
     t = threading.Thread(target=pump, daemon=True)
     t.start()
-    t2 = threading.Thread(target=watch, daemon=True)
+    t2 = threading.Thread(target=reader, daemon=True)
     t2.start()
+    t3 = threading.Thread(target=watch, daemon=True)
+    t3.start()
     try:
         stop.wait()                       # pump 或 watch 谁先发现问题都一样
     finally:
