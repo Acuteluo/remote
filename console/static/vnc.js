@@ -2129,3 +2129,23 @@ document.addEventListener('webkitfullscreenchange', fsSync);
     }).catch(() => {});
   }));
 })();
+
+// ---- 分辨率: 手机上画面卡时最有效的一档 ----
+(function bindScreenMode() {
+  const sel = document.getElementById('set-mode');
+  if (!sel) return;
+  fetch('/api/screen/modes', { cache: 'no-store' }).then((r) => r.json()).then((j) => {
+    if (!j || !j.ok || !j.modes) return;
+    sel.innerHTML = j.modes.map((m) =>
+      '<option value="' + m.name + '"' + (m.name === j.current ? ' selected' : '') + '>'
+      + m.name + ' @' + m.hz + 'Hz</option>').join('');
+  }).catch(() => {});
+  sel.addEventListener('change', () => {
+    fetch('/api/screen/mode', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: sel.value }),
+    }).then((r) => r.json()).then((j) => {
+      if (j && !j.ok) alert('切换失败: ' + (j.err || ''));
+    }).catch(() => {});
+  });
+})();

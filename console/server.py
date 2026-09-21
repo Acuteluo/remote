@@ -2896,6 +2896,52 @@ def _default_sink_name():
         return ""
 
 
+def screen_modes():
+    """当前输出支持的分辨率列表(给设置面板用)。"""
+    outs = _xrandr_outputs()
+    if not outs:
+        return None
+    out = outs[0]
+    try:
+        r = subprocess.run(["xrandr", "--query"], env=x_env(),
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    modes, cur, in_out = [], "", False
+    for ln in (r.stdout or "").splitlines():
+        if not ln.startswith((" ", "\t")):
+            in_out = ln.startswith(out + " ")
+            continue
+        if not in_out:
+            continue
+        m = re.match(r"\s+(\d+x\d+)\s+([\d.]+)(\*?)", ln)
+        if not m:
+            continue
+        name, hz, star = m.group(1), m.group(2), m.group(3)
+        if star:
+            cur = name
+        if not any(x["name"] == name for x in modes):
+            modes.append({"name": name, "hz": hz, "current": bool(star)})
+    return {"output": out, "current": cur, "modes": modes}
+
+
+def set_screen_mode(name):
+    """切分辨率。只认列表里的值 —— 手滑传个不存在的模式会把屏搞黑。"""
+    info = screen_modes()
+    if not info:
+        return False, "拿不到显示器信息(xrandr 不可用)"
+    if not any(m["name"] == name for m in info["modes"]):
+        return False, "不支持的模式: %s" % name
+    try:
+        r = subprocess.run(["xrandr", "--output", info["output"], "--mode", name],
+                           env=x_env(), capture_output=True, text=True, timeout=8)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+    if r.returncode != 0:
+        return False, (r.stderr or r.stdout or "xrandr 返回非零").strip()
+    return True, "ok"
+
+
 def _volume_target():
     """音量滑块该调哪个 sink。
 
@@ -4051,6 +4097,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/theme":
             self._json({"ok": True, "acc": get_theme_acc(),
                         "default": THEME_DEFAULT})
+        elif path == "/api/screen/modes":
+            info = screen_modes()
+            if not info:
+                self._json({"ok": False, "err": "拿不到显示器信息"})
+            else:
+                self._json({"ok": True, **info})
         elif path == "/api/audio/out":
             self._json({"ok": True, "mode": audio_out_mode()})
         elif path == "/api/bg":
@@ -4328,6 +4380,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if ok:
                 audit("theme", "主题色 %s → %s" % (old, get_theme_acc()))
                 self._json({"ok": True, "acc": get_theme_acc()})
+            else:
+                self._json({"ok": False, "err": msg})
+        elif path == "/api/screen/mode":
+            ok, msg = set_screen_mode((data.get("mode") or "").strip())
+            if ok:
+                audit("screen", "分辨率 -> " + (data.get("mode") or ""))
+                self._json({"ok": True})
             else:
                 self._json({"ok": False, "err": msg})
         elif path == "/api/audio/out":
