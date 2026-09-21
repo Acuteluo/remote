@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>自定义背景 · {{host}}</title>
+<link rel="icon" href="/static/vendor/favicon.svg">
+<link rel="stylesheet" href="/static/app.css">
+<style>
+  .bg-wrap { max-width: min(100%, 560px); margin: 8px auto; padding: 0 12px 34px; }
+
+  /* 实时预览: 一小块"假页面" —— 底图 + 暗化层 + 一张示例面板,
+     三个滑块的改动立刻在这里体现, 不用等应用。 */
+  .pv { position: relative; height: 190px; border-radius: var(--r); overflow: hidden;
+    border: 1px solid var(--line); background: #0b0f14; margin-bottom: 14px; }
+  .pv-img { position: absolute; inset: 0; background: center/cover no-repeat;
+    background-color: #16202b; }
+  .pv-dim { position: absolute; inset: 0; background: rgba(11,15,20,.45); }
+  .pv-card { position: absolute; left: 12px; right: 12px; bottom: 12px;
+    border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+    background: rgb(19 26 35 / 1); backdrop-filter: none; }
+  .pv-card b { display: block; font-size: 13px; color: var(--acc); }
+  .pv-card span { font-size: 11.5px; color: var(--dim); }
+  .pv-tag { position: absolute; right: 10px; top: 10px; font-size: 11px; color: #cfe3f5;
+    background: rgba(0,0,0,.45); border-radius: 999px; padding: 3px 9px; }
+
+  .row { display: flex; align-items: center; gap: 10px; padding: 9px 0;
+    border-bottom: 1px solid var(--line); font-size: 13px; }
+  .row:last-of-type { border-bottom: 0; }
+  .row > span:first-child { flex: 0 0 5.5em; color: var(--dim); }
+  .row input[type=range] { flex: 1; accent-color: var(--acc); }
+  .row b { min-width: 52px; text-align: right; font: 12px/1 ui-monospace, Menlo, monospace; }
+  .btns { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
+  .btns button, .btns label { padding: 10px 16px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--card2); color: var(--fg); font-size: 13px; }
+  .btns button.pri { background: var(--acc); color: #04121f; border-color: transparent;
+    font-weight: 700; }
+  .btns button:disabled { opacity: .5; }
+  .btns label { display: inline-block; cursor: pointer; }
+  .note { margin-top: 18px; font-size: 12.5px; color: var(--dim); line-height: 1.95;
+    border-top: 1px solid var(--line); padding-top: 14px; }
+  .note b { color: var(--fg); }
+  .note code { background: var(--card2); border-radius: 4px; padding: 1px 5px; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <a class="back" href="/home" title="返回" aria-label="返回">‹</a>
+  <span class="logo">自定义背景</span>
+  <span class="host" id="bg-status">选一张图试试</span>
+</div>
+
+<div class="bg-wrap">
+  <div class="pv" id="pv">
+    <div class="pv-img" id="pv-img"></div>
+    <div class="pv-dim" id="pv-dim"></div>
+    <div class="pv-tag" id="pv-tag">实时预览</div>
+    <div class="pv-card" id="pv-card">
+      <b>示例面板</b><span>卡片透明度 / 底图亮度就长这样</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>图片</h3>
+    <div class="btns" style="margin-top:0">
+      <label for="f">📁 选一张图</label>
+      <input id="f" type="file" accept="image/*" hidden>
+      <button id="clear">清除图片</button>
+    </div>
+    <div class="row" style="border-bottom:0">
+      <span>当前</span><span class="d" id="cur" style="color:var(--dim);flex:1">
+        还没有自定义背景</span>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:10px">
+    <h3>参数</h3>
+    <div class="row"><span>面板透明</span>
+      <input type="range" id="s-trans" min="0" max="90" step="1">
+      <b id="v-trans"></b></div>
+    <div class="row"><span>底图亮度</span>
+      <input type="range" id="s-dim" min="0" max="80" step="1">
+      <b id="v-dim"></b></div>
+    <div class="row"><span>模糊</span>
+      <input type="range" id="s-blur" min="0" max="20" step="1">
+      <b id="v-blur"></b></div>
+  </div>
+
+  <div class="btns">
+    <button id="apply" class="pri">应用</button>
+    <button id="reset">恢复默认</button>
+  </div>
+
+  <div class="note">
+    <b>怎么用</b>：先选一张图（本地立刻在预览里看到），拖三根滑块调到满意，再点
+    <b>应用</b> —— 应用后整个控制台都换背景，包括远程桌面页。<br>
+    <b>面板透明</b>：调高就是手机 QQ 空间动态页那种"卡片半透明浮在图上"的效果；
+    调到 0 时卡片完全不透明，图片只从卡片之间的缝隙露出来，滑动页面看到的就是
+    图片的不同部分。<br>
+    <b>底图亮度</b>：把图压暗一点，文字更好读（图太亮时很有用）。<br>
+    <b>模糊</b>：想要"能看出是照片但不抢戏"的观感就加一点。<br>
+    <b>存在哪</b>：图片存 <code>console/data/bg.img</code>，参数存在同一目录的
+    <code>config.json</code> 里；换手机/换浏览器打开都是同一张。点"恢复默认"即
+    清除图片并回到纯色底。
+  </div>
+</div>
+
+<script src="/static/bg.js"></script>
+</body>
+</html>

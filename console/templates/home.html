@@ -22,6 +22,11 @@
     <a href="/vnc"><span class="ic">🖥️</span><span class="ti">远程桌面</span><span class="de">实时图传 · 可操控</span></a>
     <a href="/cam"><span class="ic">📷</span><span class="ti">摄像头</span><span class="de">后台采集 · 电脑不弹窗</span></a>
     {{extras}}
+    <!-- 主题色固定排在**最后一个**: 放在上面那个私有入口占位符之后, 所以本机
+         (文件管理/DSH 在它前面)它是第 6 个, 从仓库拉取的纯净版它是第 4 个。
+         注意: 模板引擎是朴素的字符串替换, 注释里**不能**写占位符字面量,
+         否则连注释里的那处也会被替换掉(踩过一次)。 -->
+    <a href="/theme"><span class="ic">🎨</span><span class="ti">主题色</span><span class="de">换个颜色 · 换个心情</span></a>
   </div>
 
   <div class="alerts" id="alerts"></div>
@@ -102,7 +107,13 @@
     <div class="kv" style="margin-top:8px"><span class="d" id="pw-msg"></span></div>
   </div>
 
-  <div class="foot">MEOW Console · 数据每 2s 推送<br>
+  <!-- 更换背景: 就做一个按钮(和上面"修改"同一套观感), 不做成卡片模块 -->
+  <a href="/bg" style="display:block;margin-top:10px;padding:11px;border-radius:10px;
+     border:0;background:var(--card2);color:var(--fg);text-align:center;font-size:14px;
+     font-weight:600">🖼️ 更换背景</a>
+  </div>
+
+  <div class="foot">MEOW Console · 数据每 1s 推送<br>
     <a href="/log">审计日志</a> · 谁在什么时候连过、做了什么</div>
 </div>
 <script src="/static/home.js"></script>

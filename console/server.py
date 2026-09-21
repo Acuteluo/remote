@@ -79,10 +79,18 @@ AUDIT_FILE = os.path.join(DATA_DIR, "audit.log")
 #   - typeBatch  攒批间隔(服务端目前只作记录, 实际由前端执行)
 #   - typeDelayMs 逐字键入时每字符间隔, 仅终端路径生效
 #   - volume     电脑主音量(0~150, 百分比, 由设置面板滑块控制并持久化)
+#   - brightness 电脑屏幕亮度(5~100, 百分比, 同上; xrandr 软件调光)
+#   - themeAcc   主题色(#RRGGBB)。所有 var(--acc) 渲染的地方都跟着它走
 # 启动时读一次; 之后文件 mtime 变了就重读 —— 手改文件也能即时生效, 不用重启。
+# 注意: save_config 只认 DEFAULT_CONFIG 里有的键(防脏数据), 新设置**必须**加进来,
+# 否则 POST 会"看着成功"但什么都没存(2026-09-22 加 brightness 时就踩了这个)。
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 DEFAULT_CONFIG = {"typeMode": "auto", "typeBatch": 80, "typeDelayMs": 20,
-                  "volume": 100,
+                  "volume": 100, "brightness": 100, "themeAcc": "#4da3ff",
+                  # 自定义背景: 面板透明度 / 底图暗化 / 模糊(见 render() 注入的 CSS)
+                  "bgTrans": 35, "bgDim": 45, "bgBlur": 0,
+                  # 声音去向: pc=电脑也响(默认) / silent=只发手机(电脑静音, 走虚拟输出)
+                  "audioOut": "pc",
                   # 端口也归配置管(命令行 --port / 环境变量 MEOW_PORT 优先级更高):
                   # port = 控制台对外端口; vncPort = x11vnc 的内部 RFB 端口。
                   "port": DEFAULT_PORT, "vncPort": DEFAULT_VNC_PORT,
@@ -177,6 +185,22 @@ PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 MAX_TERMINALS = 4
 
 # ---------------------------------------------------------------- 基础设施
+
+def _who(handler):
+    """日志里想看到"谁连的": 客户端 IP + 截断的 User-Agent。
+
+    只记 IP 的话, 同一台手机上分不出是哪个浏览器/是不是微信内置; 整串 UA 又太长,
+    把日志刷得没法看 —— 所以头 44 个字符 + 省略号。
+    """
+    try:
+        ip = handler.client_address[0]
+    except (AttributeError, IndexError):
+        ip = "?"
+    ua = (handler.headers.get("User-Agent") or "").strip() if hasattr(handler, "headers") else ""
+    if len(ua) > 46:
+        ua = ua[:44] + "..."
+    return "%s%s" % (ip, (" · " + ua) if ua else "")
+
 
 def audit(action, detail=""):
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {action} {detail}".rstrip()
@@ -1203,7 +1227,7 @@ class Collector:
         self._proc_lock = threading.Lock()
         self._cpu_hot = 0              # CPU 连续超标次数(告警要"持续"才算, 见 alerts)
         self.hostname = socket.gethostname()
-        # 慢字段(wmctrl / tailscale 都要起子进程)做 TTL 缓存: 状态面板每 2s 推一次,
+        # 慢字段(wmctrl / tailscale 都要起子进程)做 TTL 缓存: 状态面板每 1s 推一次,
         # 不加缓存就等于每 2s 起两个进程, 和远程桌面的更新循环抢 CPU。
         self._cache = {}
         self._cache_lock = threading.Lock()
@@ -1496,13 +1520,21 @@ class Collector:
         if not env or not shutil.which("wmctrl"):
             return []
         try:
-            r = subprocess.run(["wmctrl", "-l"], env={**os.environ, **env},
+            # 用 -lx 带上 WM_CLASS: 光靠标题分不出"GNOME Shell 自己的隐形窗口"。
+            r = subprocess.run(["wmctrl", "-lx"], env={**os.environ, **env},
                                capture_output=True, text=True, timeout=4)
             out = []
             for ln in r.stdout.splitlines():
-                parts = ln.split(None, 3)
-                if len(parts) >= 4:
-                    out.append({"id": parts[0], "title": parts[3]})
+                parts = ln.split(None, 4)          # ID 桌面 WM_CLASS 主机 标题
+                if len(parts) < 5:
+                    continue
+                wid, desk, cls, _host, title = parts
+                # 滤掉 GNOME Shell / 扩展的内部窗口: WM_CLASS 是 gjs.Gjs,
+                # 或者标题是 GTK 的占位串(@!<x>,<y>;<随机>) —— 它们不可见,
+                # 列在面板里就是纯噪音(用户反馈过 "0x04200003 @!0,0;BDHF 是什么")。
+                if cls == "gjs.Gjs" or re.match(r"^@!\d+,\d+;", title):
+                    continue
+                out.append({"id": wid, "title": title, "cls": cls})
             return out
         except (OSError, subprocess.SubprocessError):
             return []
@@ -1548,7 +1580,7 @@ class Collector:
                 return False
             finally:
                 s.close()
-        # 10s 缓存: 状态面板 2s 推一次, 不加缓存等于每 2s 连一次端口
+        # 10s 缓存: 状态面板 1s 推一次, 不加缓存等于每 2s 连一次端口
         return self._cached(f"port{port}", 10, probe)
 
     def alerts(self, snap):
@@ -1637,6 +1669,55 @@ class Collector:
         out.sort(key=lambda a: 0 if a["level"] == "crit" else 1)
         return out
 
+    def wifi(self):
+        """当前连着的 Wi-Fi: SSID + 信号强度(不是无线连接就返回 None)。
+
+        信号从 /proc/net/wireless 读 —— 纯标准库, 不需要装 iw/nmcli;
+        SSID 内核不给, 只能问外面: 依次试 iwgetid / nmcli, 都没有就退化成
+        "接口名 + 信号"(至少还剩信号强弱这一半信息)。
+        """
+        iface, link, level = None, None, None
+        try:
+            with open("/proc/net/wireless") as f:
+                for ln in f.readlines()[2:]:              # 前两行是表头
+                    if ":" not in ln:
+                        continue
+                    name, rest = ln.split(":", 1)
+                    fld = rest.split()
+                    if len(fld) >= 3:
+                        iface = name.strip()
+                        link = float(fld[1].rstrip("."))  # 习惯刻度 0~70
+                        level = float(fld[2].rstrip("."))  # dBm
+                        break
+        except (OSError, ValueError, IndexError):
+            pass
+        if not iface:
+            return None
+
+        ssid = ""
+        for cmd in (["iwgetid", "-r", iface],
+                    ["nmcli", "-t", "-f", "GENERAL.CONNECTION", "dev", "show", iface]):
+            try:
+                r = subprocess.run(cmd, env=x_env(), capture_output=True,
+                                   text=True, timeout=4)
+                out = (r.stdout or "").strip().splitlines()
+                if out:
+                    v = out[0].split(":", 1)[-1].strip()
+                    if v and v != "--":                   # nmcli 未连接时给 "--"
+                        ssid = v
+                        break
+            except (OSError, subprocess.SubprocessError):
+                continue
+
+        # 百分比: 优先按 dBm 换算(和系统托盘/手机那套一致), 没有 dBm 就用 link/70
+        pct = None
+        if isinstance(level, float) and -120 < level <= 0:
+            pct = int(max(0, min(100, 2 * (level + 100))))
+        elif isinstance(link, float):
+            pct = int(max(0, min(100, link / 70.0 * 100)))
+        return {"iface": iface, "ssid": ssid, "pct": pct,
+                "link": link, "level": level}
+
     def snapshot(self):
         top_cpu, top_mem = self.procs()
         lu = self.load_uptime()
@@ -1650,6 +1731,8 @@ class Collector:
             "temps": self.temps(),
             "battery": self.battery(),
             "net": self.net(),
+            # SSID 要起子进程问 iwgetid/nmcli, 慢字段 —— 5s 一次就够(面板 1s 推一次)
+            "wifi": self._cached("wifi", 5, self.wifi),
             "disks": self.disks(),
             "gpu": self.gpu(),
             "top_cpu": top_cpu,
@@ -1657,12 +1740,16 @@ class Collector:
             "windows": self.windows(),
             "peers": self.tailscale(),
         }
-        # 桌面连接数: 每 5s 才数一次(面板 2s 推一次, 没必要那么勤)
+        # 桌面连接数: 每 5s 才数一次(面板 1s 推一次, 没必要那么勤)
         snap["vnc_clients"] = self._cached("vncc", 5, vnc_client_count)
         snap["alerts"] = self.alerts(snap)
         return snap
 
 
+try:
+    silent_sink_release()      # 启动清理: 以前版本可能留下 meow_silent, 别再影响系统
+except Exception:
+    pass
 COLLECTOR = Collector()
 COLLECTOR.cpu()          # 预热采样, 让首屏就有 CPU 数据
 COLLECTOR.procs()
@@ -2199,7 +2286,10 @@ def read_audit(n=400):
         p = ln.split(" ", 3)
         if len(p) < 3:
             continue
-        out.append({"d": p[0], "t": p[1], "c": p[2],
+        # 详细一丢丢: 只给**非今天**的行带上日期(月-日), 今天的仍只显示时分秒 ——
+        # 翻旧记录时不用猜是哪天的, 又不至于每行都堆一串日期显得吵。
+        t = p[1] if p[0] == time.strftime("%Y-%m-%d") else p[0][5:] + " " + p[1]
+        out.append({"d": p[0], "t": t, "c": p[2],
                     "m": p[3] if len(p) > 3 else ""})
     out.reverse()
     return out
@@ -2248,6 +2338,14 @@ CAM_DEFAULT_SIZE = "640x480"
 CAM_DEFAULT_FPS = 12
 CAM_MAX_FPS = 30
 _CAM_SIZES = ("320x240", "640x480", "1280x720")
+# 「还有人在看吗」的**唯一判据是前端 JS 主动发来的心跳**, 不是 WebSocket 的 pong:
+# 浏览器/系统的网络栈会自动回 pong, 哪怕页面早就切到后台、JS 已经被挂起。
+# 所以 JS 心跳一停(切后台/锁屏/离开), 就当没人看, 关掉摄像头。
+CAM_IO_TIMEOUT = 10         # socket 读写超时: 卡死的客户端要在 10s 内被断掉
+# 下面两个允许用环境变量压小 —— 好让 console/tests/cam_check.py 几秒内就能
+# 把"心跳停了会不会自己停采"验完(生产环境保持默认)。
+CAM_PING_EVERY = float(os.environ.get("MEOW_CAM_PING_EVERY") or 5)
+CAM_VIEWER_TIMEOUT = float(os.environ.get("MEOW_CAM_VIEWER_TIMEOUT") or 20)
 
 
 V4L2_CAP_VIDEO_CAPTURE = 0x00000001
@@ -2420,6 +2518,10 @@ def _cam_start(dev, size, fps, first_timeout=4.0):
 
 _cam_lock = threading.Lock()
 _cam_session = {"proc": None, "stop": None}      # 同一时刻只允许一个采集会话
+# "摄像头页还有人在看"的最近时刻(前端 JS 心跳刷新)。给 /api/audio 复用:
+# 麦克风只在摄像头页里开, 而那页走了之后 HTTP 流本身收不到任何信号 ——
+# 半个死的连接连 _peer_gone 都探不出来(写还写得进去, 对端早不处理了)。
+_viewer_seen = {"t": 0.0}
 
 
 def _cam_release_current(timeout=3.0):
@@ -2486,6 +2588,7 @@ def _cam_stop(proc):
 
 def ws_cam_bridge(ws, dev=None, size=None, fps=None):
     """摄像头 -> 浏览器。单向推 MJPEG 帧。"""
+    t0 = time.time()          # 记时长, 停止时写进日志
     dev = dev or CAM_DEFAULT_DEV
     size = size if size in _CAM_SIZES else CAM_DEFAULT_SIZE
     try:
@@ -2538,34 +2641,69 @@ def ws_cam_bridge(ws, dev=None, size=None, fps=None):
         finally:
             stop.set()
 
-    def watch():
-        """盯着浏览器: 关页面/断网时 recv 立刻返回空, 马上停采集。
+    # 前端最后一次心跳的时间 —— 判"还有没有人在看"就看它
+    last_viewer = time.time()
+    _viewer_seen["t"] = last_viewer         # 供 /api/audio 复用(见 _serve_audio)
 
-        光靠 ping 是不够的 —— 间隔内摄像头会白开好几秒。这里阻塞读, 客户端一关
-        socket 就 EOF, 立即收工(隐私: 没人看就不该继续开着摄像头)。
-        顺带每 5s 的超时用来 ping 一次, 兼做 NAT 保活。
+    def reader():
+        """按 WS 协议读客户端消息, 只关心一件事: 前端 JS 还在不在发心跳。
+
+        2026-09-22 修: 原来这里是 `ws.sock.recv()` 直接读原始字节, 后果有三 ——
+          (a) 浏览器回的 pong 被当成普通数据, WSConn.last_pong 永远停在连上那一刻,
+              于是"看 pong 判活"这套机制对摄像头完全失效;
+          (b) 浏览器发来的 close 帧同样被当成"有数据", 服务端既不回应也不停采集;
+          (c) 于是"按返回/切后台"之后, 只要 TCP 没有立刻 FIN(webview 在等服务端的
+              close 回应、手机锁屏/切网造成的半死连接, 这些都很常见), 采集就永远
+              不停, 摄像头指示灯一直亮 —— 和页面上"没人观看立即停止"的承诺不符。
+
+        现在按协议读: close 帧会抛 WSClosed -> 立刻停; 同时只把前端 JS 的
+        {"t":"hb"} 当作"有人在看"。切到后台时 JS 定时器被节流到几乎不跑, 心跳一停
+        就停采集 —— 哪怕浏览器还在自动回 pong。
         """
+        nonlocal last_viewer
         try:
-            ws.sock.settimeout(5)
             while not stop.is_set():
-                try:
-                    d = ws.sock.recv(4096)
-                except socket.timeout:
-                    ws.ping()
-                    if not ws.alive:
-                        break
-                    continue
-                if not d:
-                    break
-        except OSError:
+                op, data = ws.recv_message()
+                if op == 0x1:                       # 前端心跳 {"t":"hb"}
+                    try:
+                        if json.loads(data.decode("utf-8", "replace")).get("t") == "hb":
+                            last_viewer = time.time()
+                            _viewer_seen["t"] = last_viewer   # 给 /api/audio 复用
+                    except (ValueError, AttributeError, TypeError):
+                        pass
+        except socket.timeout:
+            pass
+        except (OSError, WSClosed):
             pass
         finally:
             stop.set()
 
+    def watch():
+        """看门狗: 定期 ping(NAT 保活), 并盯着"前端多久没来心跳了"。"""
+        while not stop.is_set():
+            if stop.wait(CAM_PING_EVERY):
+                return
+            if not ws.alive:
+                break
+            idle = time.time() - last_viewer
+            if idle > CAM_VIEWER_TIMEOUT:
+                audit("cam", "%.0fs 没收到前端心跳, 判定没人看, 停采集" % idle)
+                break
+        stop.set()
+
+    try:
+        # 10s 这个值两头都要顾: 客户端不再收数据时 sendall 要尽快超时(别白开着
+        # 摄像头), 同时又不会把浏览器的控制帧读成半截(心跳/close 都是几字节, 一次到)。
+        ws.sock.settimeout(CAM_IO_TIMEOUT)
+    except OSError:
+        pass
+
     t = threading.Thread(target=pump, daemon=True)
     t.start()
-    t2 = threading.Thread(target=watch, daemon=True)
+    t2 = threading.Thread(target=reader, daemon=True)
     t2.start()
+    t3 = threading.Thread(target=watch, daemon=True)
+    t3.start()
     try:
         stop.wait()                       # pump 或 watch 谁先发现问题都一样
     finally:
@@ -2581,7 +2719,7 @@ def ws_cam_bridge(ws, dev=None, size=None, fps=None):
             ws.close()
         except OSError:
             pass
-    audit("cam", f"摄像头停止 {dev} (pid={proc.pid})")
+    audit("cam", "摄像头停止 %s (pid=%d, 共 %.0fs)" % (dev, proc.pid, time.time() - t0))
 
 
 def _cam_send_err(ws, msg):
@@ -2671,7 +2809,7 @@ def audio_level(kind="pulse", src="default", seconds=1.5, wait=2.5):
            "-t", str(seconds), "-af", "volumedetect", "-f", "null", "-"]
     try:
         p = subprocess.run(cmd, env=x_env(), capture_output=True,
-                           text=True, timeout=seconds + wait)
+                           text=True, timeout=seconds + wait + 6)   # 放宽: 这台机器光打开 pulse 源就要 2s+
     except (OSError, subprocess.SubprocessError) as e:
         return {"ok": False, "err": str(e), "kind": kind, "src": src}
     err = p.stderr or ""
@@ -2762,13 +2900,73 @@ def _default_sink_name():
         return ""
 
 
+def screen_modes():
+    """当前输出支持的分辨率列表(给设置面板用)。"""
+    outs = _xrandr_outputs()
+    if not outs:
+        return None
+    out = outs[0]
+    try:
+        r = subprocess.run(["xrandr", "--query"], env=x_env(),
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    modes, cur, in_out = [], "", False
+    for ln in (r.stdout or "").splitlines():
+        if not ln.startswith((" ", "\t")):
+            in_out = ln.startswith(out + " ")
+            continue
+        if not in_out:
+            continue
+        m = re.match(r"\s+(\d+x\d+)\s+([\d.]+)(\*?)", ln)
+        if not m:
+            continue
+        name, hz, star = m.group(1), m.group(2), m.group(3)
+        if star:
+            cur = name
+        if not any(x["name"] == name for x in modes):
+            modes.append({"name": name, "hz": hz, "current": bool(star)})
+    return {"output": out, "current": cur, "modes": modes}
+
+
+def set_screen_mode(name):
+    """切分辨率。只认列表里的值 —— 手滑传个不存在的模式会把屏搞黑。"""
+    info = screen_modes()
+    if not info:
+        return False, "拿不到显示器信息(xrandr 不可用)"
+    if not any(m["name"] == name for m in info["modes"]):
+        return False, "不支持的模式: %s" % name
+    try:
+        r = subprocess.run(["xrandr", "--output", info["output"], "--mode", name],
+                           env=x_env(), capture_output=True, text=True, timeout=8)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+    if r.returncode != 0:
+        return False, (r.stderr or r.stdout or "xrandr 返回非零").strip()
+    return True, "ok"
+
+
+def _volume_target():
+    """音量滑块该调哪个 sink。
+
+    这是**故意的**二级控制(用户明确要的语义):
+      - 电脑输出: 调硬件默认输出 —— 就是电脑扬声器的音量
+      - 模拟输出: 调**虚拟输出** —— 声音已经在那儿了, 于是滑块成了"发给手机的音量",
+        手机上还能用自己的音量键再调一次, 两级互不冲突
+    (原来靠"默认输出恰好被切成虚拟输出"间接实现, 太脆; 现在写死。)
+    """
+    if audio_out_mode() == "silent" and _sink_idx(NULL_SINK):
+        return NULL_SINK
+    return _default_sink_name()
+
+
 def get_pc_volume():
     """读默认输出设备的当前主音量。
 
     返回 {"vol": 0~150 整数(取声道最大值), "muted": bool, "sink": 名}；
     pactl 不可用 / 找不到默认设备时返回 None。
     """
-    sink = _default_sink_name()
+    sink = _volume_target()
     if not sink:
         return None
     try:
@@ -2795,7 +2993,7 @@ def get_pc_volume():
 
 def set_pc_volume(pct):
     """设默认输出设备主音量为 pct(0~150 整数)。返回 (ok, msg)。"""
-    sink = _default_sink_name()
+    sink = _volume_target()
     if not sink:
         return False, "找不到默认输出设备(pactl get-default-sink 无输出)"
     try:
@@ -2810,6 +3008,165 @@ def set_pc_volume(pct):
     if r.returncode != 0:
         return False, (r.stderr or r.stdout or "pactl 返回非零").strip()
     return True, "ok"
+
+
+# ---------------------------------------------------------------- 屏幕亮度
+# 走 xrandr 的软件调光(--brightness): 不需要任何权限, 外接屏也管用。
+# 这台机器的 /sys/class/backlight/... 对普通用户不可写(实测), 所以不指望它。
+def _xrandr_outputs():
+    """已连接的显示输出名, 标了 primary 的排最前。"""
+    try:
+        r = subprocess.run(["xrandr", "--query"], env=x_env(),
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if r.returncode != 0:
+        return []
+    primary, others = [], []
+    for ln in (r.stdout or "").splitlines():
+        m = re.match(r"^(\S+)\s+connected\b(.*)$", ln)
+        if not m:
+            continue
+        (primary if "primary" in m.group(2) else others).append(m.group(1))
+    return primary + others
+
+
+def get_pc_brightness():
+    """当前屏幕亮度(5~100 的整数)。
+
+    xrandr 的 --brightness 是"设了就完事", 回读不回来 —— 所以以 config.json 里
+    存的那份为准(滑块写进去的), 没存过就当 100。
+    """
+    try:
+        pct = int((load_config() or {}).get("brightness", 100))
+    except (TypeError, ValueError):
+        return 100
+    return max(5, min(100, pct))
+
+
+def set_pc_brightness(pct):
+    """设屏幕亮度(5~100), 返回 (ok, msg)。改完写进 config.json 持久化。"""
+    try:
+        pct = max(5, min(100, int(pct)))
+    except (TypeError, ValueError):
+        return False, "亮度必须是 5~100 的整数"
+    outs = _xrandr_outputs()
+    if not outs:
+        return False, "找不到可用的显示输出(xrandr 不可用, 或没接显示器)"
+    val = "%.2f" % (pct / 100.0)
+    for name in outs:
+        try:
+            r = subprocess.run(["xrandr", "--output", name, "--brightness", val],
+                               env=x_env(), capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, f"调用 xrandr 失败: {e}"
+        if r.returncode != 0:
+            return False, (r.stderr or r.stdout or "xrandr 返回非零").strip()
+    save_config({"brightness": pct})
+    return True, "ok"
+
+
+# ---------------------------------------------------------------- 主题色
+# 影响所有用 var(--acc) 渲染的地方(文字/按钮底/选中态/边框...)。
+# 页面侧不用改模板: 所有页面都过 render(), 在那里统一注入一个 :root{--acc:...},
+# 排在 app.css 之后所以能盖住默认蓝。
+THEME_DEFAULT = "#4da3ff"          # 就是原来那抹蓝
+# 太暗的不给用: 控制台是暗底, 主题色还要当**文字颜色**用, 深色在上面看不清。
+# 前端那个圆盘本身只画浅色范围, 这里再兜一道(接口也能被直接调用)。
+THEME_MIN_LUM = 0.30
+
+
+def _hex_rgb(s):
+    m = re.fullmatch(r"#?([0-9a-fA-F]{6})", (s or "").strip())
+    if not m:
+        return None
+    v = m.group(1)
+    return tuple(int(v[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def theme_luminance(rgb):
+    """WCAG 相对亮度(0~1)。"""
+    def f(c):
+        c /= 255.0
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = (f(c) for c in rgb)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def get_theme_acc():
+    v = (load_config() or {}).get("themeAcc") or THEME_DEFAULT
+    return v if _hex_rgb(v) else THEME_DEFAULT
+
+
+def set_theme_acc(hexv):
+    """设主题色, 返回 (ok, msg)。太暗的直接拒绝。"""
+    rgb = _hex_rgb(hexv)
+    if rgb is None:
+        return False, "颜色要写成 #RRGGBB"
+    if theme_luminance(rgb) < THEME_MIN_LUM:
+        return False, "这个颜色太暗了, 暗底上看不清 —— 挑个亮一点的"
+    save_config({"themeAcc": "#%02x%02x%02x" % rgb})
+    return True, "ok"
+
+
+# ---------------------------------------------------------------- 自定义背景
+# 图片存 data/bg.img(运行时目录, 不进仓库), 参数存 config.json。
+# CSS 全在 render() 里注入 —— app.css 一行都不用改。
+BG_FILE = os.path.join(DATA_DIR, "bg.img")
+BG_MAX = 8 * 1024 * 1024            # 8 MB
+
+
+def bg_state():
+    """返回 (有图吗, 版本号, 透明, 暗化, 模糊)。版本号用 mtime, 兼做 cache buster。"""
+    try:
+        has = os.path.getsize(BG_FILE) > 0
+        ver = int(os.path.getmtime(BG_FILE)) if has else 0
+    except OSError:
+        has, ver = False, 0
+    c = load_config() or {}
+
+    def gi(k, d, lo, hi):
+        try:
+            return max(lo, min(hi, int(c.get(k, d))))
+        except (TypeError, ValueError):
+            return d
+
+    return (has, ver, gi("bgTrans", 35, 0, 90), gi("bgDim", 45, 0, 80),
+            gi("bgBlur", 0, 0, 20))
+
+
+def bg_css():
+    """注入到 </head> 前的全局样式(主题色 + 背景)。"""
+    has, ver, trans, dim, blur = bg_state()
+    alpha = "%.2f" % (1 - trans / 100.0)
+    out = [
+        ":root{--acc:%s;--panel-a:%s}" % (get_theme_acc(), alpha),
+        # 面板底色拆成"RGB + 单独的不透明度": 半透明就是手机 QQ 空间动态页那种
+        # 卡片浮在图上; 透明度调到 0 时卡片完全不透明, 图片只从卡片缝隙里露出来,
+        # 滑动页面看到的就是图片的不同部分。app.css 里 12 处 var(--card) 一起生效。
+        ":root{--card:rgb(19 26 35 / var(--panel-a));"
+        "--card2:rgb(15 21 29 / var(--panel-a))}",
+        ".topbar{background:rgb(11 15 20 / calc(var(--panel-a) * .97))}",
+    ]
+    if has:
+        # 底图层的高度用 100lvh(large viewport height)而不是 inset:0:
+        # 手机上地址栏收起/展开会改变 100vh/100dvh, cover 跟着重算, 背景就会
+        # 跟着"放大/缩小"(实测反馈)。lvh 是恒定值, 图片就不会再被缩放。
+        # 另外: 用两个 position:fixed 的层(图 + 暗化)放在最底下, 而不是
+        # background-attachment:fixed —— 后者在 iOS Safari 上很不可靠。
+        out += [
+            "html{background:#0b0f14}body{background:transparent}"
+            # 远程桌面页 body 是 body.vnc-page{background:#000}(见 app.css),
+            # 类选择器比光秃秃的 body 优先级高, 会把底图整个盖住 —— 显式盖回去。
+            "body.vnc-page{background:transparent}",
+            "body::before{content:'';position:fixed;left:0;right:0;top:0;height:100lvh;z-index:-1;"
+            "background:#0b0f14 url('/bg/img?v=%d') center/cover no-repeat;"
+            "pointer-events:none%s}"
+            % (ver, (";filter:blur(%dpx)" % blur) if blur else ""),
+            "body::after{content:'';position:fixed;left:0;right:0;top:0;height:100lvh;z-index:-1;"
+            "background:rgba(11,15,20,%.2f);pointer-events:none}" % (dim / 100.0),
+        ]
+    return "<style>%s</style>\n" % "".join(out)
 
 
 def audio_default_monitor():
@@ -2854,6 +3211,28 @@ def audio_candidates(mode="auto"):
     cands.append(("alsa", "default"))
     cands.append(("pulse", "default"))    # 最后才用 default(很可能是空回环)
     return cands
+
+
+# 选源探测很慢(要真去开设备试采), 而这台机器光开一个 pulse 源就要 2s+ ——
+# 每次点 🔊 都等 2~3 秒才出声不值得, 而结果短时间内是稳定的。缓存它。
+_audio_pick_cache = {}
+_audio_pick_lock = threading.Lock()
+
+
+def audio_pick_source_cached(mode="auto", ttl=120):
+    """audio_pick_source 的缓存版(给正常播放路径用)。
+
+    诊断接口 /api/audio/check 一律走**不缓存**的原函数 —— 排查时就是要看实时的。
+    """
+    now = time.time()
+    with _audio_pick_lock:
+        hit = _audio_pick_cache.get(mode)
+        if hit and hit[0] > now:
+            return hit[1]
+    val = audio_pick_source(mode)
+    with _audio_pick_lock:
+        _audio_pick_cache[mode] = (now + ttl, val)
+    return val
 
 
 def audio_pick_source(mode="auto", seconds=0.9):
@@ -2974,16 +3353,252 @@ def audio_first_usable_mic():
     return None
 
 
+# ---- "本机不出声, 声音只发手机" 用的虚拟输出 ----
+# 直接采硬件 sink 的 monitor 时, **本机一静音 monitor 就没声了**(用户实测确认),
+# 所以想"电脑静音但手机能听"必须换条路: 建一个 null sink(数据没人播 -> 一点声音
+# 都不出), 把正在播放的流挪过去, 再采它的 monitor。
+SILENT_VOL = 1        # "模拟输出"钉住的电脑音量(%): 1% 听不见, 但 monitor 仍有满幅信号
+                      # (实测这块 HDA 上 1% 读回就是 1%; 只有 0%/静音会让 monitor 一起静音)
+NULL_SINK = "meow_silent"
+# 进"只发手机"前用户原本的默认输出, 收工时还回去
+_NULL_PREV_DEFAULT = {"sink": ""}
+
+
+def _pactl(*args, timeout=6):
+    """跑一条 pactl, 返回 (ok, 输出)。"""
+    try:
+        r = subprocess.run(["pactl", *args], env=x_env(),
+                           capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0, (r.stdout or r.stderr or "").strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+
+
+def _sink_idx(name):
+    ok, out = _pactl("list", "short", "sinks")
+    for ln in out.splitlines():
+        f = ln.split()
+        if len(f) >= 2 and f[1] == name:
+            return f[0]
+    return None
+
+
+def _null_sink_module():
+    ok, out = _pactl("list", "short", "modules")
+    for ln in out.splitlines():
+        if NULL_SINK in ln:
+            return ln.split()[0]
+    return None
+
+
+def audio_out_mode():
+    """声音去向: pc(电脑也响) / silent(只发手机, 电脑静音)。"""
+    v = (load_config() or {}).get("audioOut")
+    return "silent" if v == "silent" else "pc"
+
+
+def silent_sink_ensure():
+    """确保虚拟输出存在, 并把正在播放的流都搬过去。返回 (ok, 说明)。"""
+    if _sink_idx(NULL_SINK) is None:
+        ok, out = _pactl("load-module", "module-null-sink",
+                         "sink_name=" + NULL_SINK,
+                         "sink_properties=device.description=MEOW-Silent")
+        if not ok:
+            return False, "建虚拟输出失败: " + out
+    # 把**默认输出**也切到虚拟输出: 否则只对当时正在播的那几路生效, 之后新开的
+    # 声音还是从扬声器出来(而且手机听不到) —— 用户要的是"电脑彻底不出声"。
+    # 虚拟输出固定 100% 且不静音: 这样"转发给手机的是 100% 信号", 手机自己调音量。
+    # 用户的要求: 电脑侧不要再参与音量调节, 只负责把满幅声音送出去。
+    _pactl("set-sink-mute", NULL_SINK, "0")
+    _pactl("set-sink-volume", NULL_SINK, "100%")
+    if not _NULL_PREV_DEFAULT["sink"]:
+        ok, cur = _pactl("get-default-sink")
+        _NULL_PREV_DEFAULT["sink"] = (cur or "").strip() or "@DEFAULT_SINK@"
+        _pactl("set-default-sink", NULL_SINK)
+    idx = _sink_idx(NULL_SINK)
+    n = 0
+    ok, out = _pactl("list", "short", "sink-inputs")
+    for ln in out.splitlines():
+        f = ln.split()
+        if len(f) > 1 and f[1] != idx and _pactl("move-sink-input", f[0], NULL_SINK)[0]:
+            n += 1
+    return True, "搬到虚拟输出 %d 路声音(本机不再出声)" % n
+
+
+def silent_sink_release():
+    """把流搬回默认输出并卸掉虚拟输出 —— 不做的话电脑会一直没声音。"""
+    idx = _sink_idx(NULL_SINK)
+    if idx is None:
+        return
+    n = 0
+    ok, out = _pactl("list", "short", "sink-inputs")
+    for ln in out.splitlines():
+        f = ln.split()
+        if len(f) > 1 and f[1] == idx and _pactl("move-sink-input", f[0], "@DEFAULT_SINK@")[0]:
+            n += 1
+    if _NULL_PREV_DEFAULT["sink"]:
+        _pactl("set-default-sink", _NULL_PREV_DEFAULT["sink"])
+        _NULL_PREV_DEFAULT["sink"] = ""
+    mid = _null_sink_module()
+    if mid:
+        _pactl("unload-module", mid)
+    audit("audio", "虚拟输出收工: 搬回 %d 路声音, 本机声音已恢复" % n)
+
+
+# ---- 音频"永不断流"的关键：给 ffmpeg 喂第二路无限静音 --------------------
+# 空闲时 PipeWire 会挂起 sink, monitor 就不再吐数据, ffmpeg 会干等到没输出,
+# 客户端等不到字节就判定"断了"并重连 —— 这就是"隔一阵卡一下"的来源。
+# 混一路无限静音后, 输出由静音源驱动, 无论电脑有没有声音都持续有数据。
+def _amix_opts():
+    """amix 默认会把每路音量除以路数, 混静音会让真实音量掉一半, 必须关掉归一化。"""
+    try:
+        h = subprocess.run(["ffmpeg", "-hide_banner", "-h", "filter=amix"],
+                           capture_output=True, text=True, timeout=8).stdout
+    except Exception:
+        h = ""
+    return ":normalize=0" if "normalize" in h else ",volume=2"   # 兼容老 ffmpeg
+
+
+SILENT_SRC = "anullsrc=channel_layout=mono:sample_rate=%d" % AUDIO_RATE
+AUDIO_FILTER = ("[0:a]aresample=async=1:first_pts=0,apad[p];"
+                "[p][1:a]amix=inputs=2:duration=longest" + _amix_opts() + "[aout]")
+
+
 def _audio_cmd(kind, src):
     """按 kind 组出 ffmpeg 采集命令(固定编码成 MP3 单声道)。"""
+    # -fragment_size: pulse 采集每次读取的粒度。默认交给服务端决定, 在 PipeWire 上
+    # 实测是"每 ~2 秒给一大块(12KB)"—— 音频就一段一段地到手机, 听着一直卡。
+    # 压到 2048 字节(48k 单声道约 21ms)才能连续地取、连续地发。
+    frag = ["-fragment_size", "2048"] if kind == "pulse" else []
     return ["ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-f", kind, "-i", src,
+            "-f", kind, *frag, "-i", src,
+            # 第二路: 无限静音, 只为保证"永远有输出"(见 AUDIO_FILTER 注释)
+            "-f", "lavfi", "-i", SILENT_SRC,
             "-ac", "1", "-ar", str(AUDIO_RATE),
+            # 兜底, 不是主力:
+            #  aresample=async=1  补偿采集时钟与网络时钟的漂移(不补的话客户端缓冲
+            #    会被慢慢抽干)。
+            #  apad               源端一旦不出数据就补静音, 让流**永不结束**,
+            #    客户端不会看到 EOF 而重连。
+            # (2026-09-22 更正: "隔一阵卡一下"的真凶不是采集断流, 而是每来一个新
+            #  请求就掐掉上一路采集 —— 见下面 _hub_* 共享采集那一段。)
+            "-filter_complex", AUDIO_FILTER, "-map", "[aout]",
             "-c:a", "libmp3lame", "-b:a", AUDIO_BITRATE,
-            "-f", "mp3", "-"]
+            "-flush_packets", "1",   # 每编完一包立刻吐出来(否则 ffmpeg 攒 ~2s/12KB 才发一次, 手机听感就是一段一段)
+        "-f", "mp3", "-"]
+
+
+# ---- 采集共享(hub) ---------------------------------------------------------
+# 手机上 <audio> 的播放器会时不时**重新请求同一个 URL**(浏览器出错后自己重试),
+# 而旧逻辑是"每来一个请求就掐掉上一路采集再重起" —— 每次重试都要重新选源 +
+# 启动 ffmpeg, 那 0.3~1 秒的空档就是听感上的"隔一阵卡一下"。
+# 现在: 同一个 (src, kind) 只保留一路采集, 后来的人**挂到同一路**上, 谁也不打断
+# 谁; 最后一个人走了还留 AUDIO_LINGER 秒宽限, 期间重连等于**零空档**。
+AUDIO_LINGER = 2.5
+_hub = {"key": None, "proc": None, "chunks": None, "stop": None,
+        "subs": [], "first": b"", "bytes": 0, "gen": 0}
+_hub_lock = threading.Lock()
+
+
+def _hub_fan(proc, chunks, stop):
+    """把采集队列的数据分发给所有订阅者(慢的客户端丢包但不踢)。"""
+    try:
+        while not stop.is_set():
+            try:
+                d = chunks.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if d is None:
+                break
+            with _hub_lock:
+                if _hub["proc"] is not proc:
+                    return
+                _hub["first"] = d
+                _hub["bytes"] += len(d)     # 已发出的音频秒数(给"实际延时"用)
+                for q in _hub["subs"]:
+                    try:
+                        q.put_nowait(d)
+                    except queue.Full:
+                        pass
+    except Exception:
+        pass
+    finally:
+        with _hub_lock:
+            if _hub["proc"] is proc:
+                _hub.update(key=None, proc=None, chunks=None, first=b"")
+                for q in _hub["subs"]:
+                    try:
+                        q.put_nowait(None)
+                    except queue.Full:
+                        pass
+                _hub["subs"] = []
+        stop.set()
+
+
+def _hub_stop_locked():
+    """(调用方需持 _hub_lock) 收掉当前那路采集。"""
+    p, st, subs = _hub["proc"], _hub["stop"], list(_hub["subs"])
+    _hub.update(key=None, proc=None, chunks=None, first=b"", subs=[])
+    if st is not None:
+        st.set()
+    if p is not None and p.poll() is None:
+        _cam_stop(p)
+    for q in subs:
+        try:
+            q.put_nowait(None)
+        except queue.Full:
+            pass
+
+
+def _hub_stop_if_idle():
+    with _hub_lock:
+        if not _hub["subs"]:
+            _hub_stop_locked()
+
+
+def _hub_detach(q):
+    with _hub_lock:
+        if q in _hub["subs"]:
+            _hub["subs"].remove(q)
+        idle = not _hub["subs"]
+    if idle:
+        threading.Timer(AUDIO_LINGER, _hub_stop_if_idle).start()
+
+
+def _hub_ensure(src, kind):
+    """保证有一路 (src, kind) 采集在跑; 已在跑就直接复用。返回 (proc, err)。"""
+    key = (src, kind)
+
+    def usable():
+        p = _hub["proc"]
+        return _hub["key"] == key and p is not None and p.poll() is None
+
+    with _hub_lock:
+        if usable():
+            return _hub["proc"], ""
+    with _audio_lock:
+        with _hub_lock:
+            if usable():
+                return _hub["proc"], ""
+            _hub_stop_locked()
+            proc, chunks, first, err = _audio_start(src, kind=kind)
+            if proc is None:
+                return None, err
+            stop = threading.Event()
+            _hub.update(key=key, proc=proc, chunks=chunks, stop=stop,
+                        first=first, subs=[], bytes=0,
+                        gen=_hub["gen"] + 1)     # 换了一路采集 -> 世代号 +1
+        threading.Thread(target=_hub_fan, args=(proc, chunks, stop),
+                         daemon=True).start()
+        return proc, ""
 
 
 def _audio_start(src, first_timeout=4.0, kind="pulse"):
+    # 读 ffmpeg 的 stdout 一律用 read1() 而不是 read():
+    # read(n) 会**阻塞到攒满 n 字节**才返回 —— 48kbps 下 8192 字节约 1.4 秒,
+    # 于是音频变成"每 1~2 秒一整段"地推给手机, 听感就是一段一段的卡顿
+    # (实测: 回环 3.5s 才一次性给 8390 字节, 转发器那边每 2 秒一批)。
+    # read1(n) 是"有多少给多少", 立刻返回, 流才是连续的。
     """起 ffmpeg 采声音, 等到流出第一块数据。返回 (proc, queue, first, err)。"""
     last_err = ""
     for args in (_audio_cmd(kind, src),):
@@ -2998,7 +3613,7 @@ def _audio_start(src, first_timeout=4.0, kind="pulse"):
         def reader(p=p, q=q):
             try:
                 while True:
-                    d = p.stdout.read(4096)
+                    d = p.stdout.read1(4096)
                     if not d:
                         break
                     q.put(d)
@@ -3071,6 +3686,7 @@ def _kill_children():
     **孤儿进程**继续占着摄像头/麦克风 —— 表现就是"明明退出了, 摄像头灯还亮着",
     而且下次再开还会因为设备被占而报 busy。
     """
+    _audio_release_current()          # 收掉共享采集, 别把 ffmpeg 留成孤儿
     for sess in (_cam_session, _audio_session):
         p = sess.get("proc")
         if p is not None and p.poll() is None:
@@ -3084,14 +3700,9 @@ atexit.register(_kill_children)
 
 
 def _audio_release_current(timeout=3.0):
-    stop = _audio_session.get("stop")
-    proc = _audio_session.get("proc")
-    if stop is not None:
-        stop.set()
-    if proc is not None and proc.poll() is None:
-        _cam_stop(proc)                  # 同样的"先礼后兵"收尾
-    _audio_session["proc"] = None
-    _audio_session["stop"] = None
+    """收掉当前那路共享采集(退出/换源时用)。"""
+    with _hub_lock:
+        _hub_stop_locked()
 
 
 # ---------------------------------------------------------------- 电源控制
@@ -3192,11 +3803,36 @@ def vnc_module_preloads():
     return _vnc_preload["html"]
 
 
+_ASSET_V_RE = re.compile(r'''(/static/(?!vendor/)[^"\'\s?]+\.(?:js|css))(?:\?v=\d+)?''')
+
+
+def _asset_v(m):
+    """给自家的 js/css 挂上"文件修改时间"当版本号。
+
+    为什么要: 手机上那个网络里有一台锐捷设备会拦 TLS(还能缓存静态文件), 页面刷新
+    之后有时仍旧拿到**旧的 JS** —— 之前出现过"改了却不生效"就是这个。带上
+    ?v=mtime 以后文件一变 URL 就变, 任何中间缓存都绕过去了。vendor 下的第三方库
+    内容永不变, 保持长期缓存不动。
+    """
+    rel = m.group(1)
+    try:
+        return "%s?v=%d" % (rel, int(os.path.getmtime(
+            os.path.join(STATIC_DIR, rel[len("/static/"):]))))
+    except OSError:
+        return rel
+
+
 def render(name, **kw):
     with open(os.path.join(TEMPLATE_DIR, name)) as f:
         html = f.read()
     for k, v in kw.items():
         html = html.replace("{{" + k + "}}", str(v))
+    # 主题色 + 自定义背景: 统一在这里注入。所有页面都过 render(), 所以一处管全部 ——
+    # 不用挨个改模板, 将来新增模板也自动带上。
+    # 放在 </head> 前 = 排在 app.css 之后; 同优先级后者生效, 正好盖住默认值。
+    if "</head>" in html:
+        html = html.replace("</head>", bg_css() + "</head>", 1)
+    html = _ASSET_V_RE.sub(_asset_v, html)      # 静态文件防中间缓存(见 _asset_v)
     return html
 
 
@@ -3315,6 +3951,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # 关键: 不能"能打开就用" —— PulseAudio 的 default 常是扬声器回环,
         # 没播声音时是纯静音(实测 max_volume = -91dB)。必须逐个试过去,
         # 挑第一个真的有信号的源。
+        # 只用手机听: 走虚拟输出, 本机一点声音都不出
+        # 走虚拟输出的两种情况: 显式请求(src=silent) 或 设置里选了"只发手机"
+        # 2026-09-22: 虚拟输出那套**弃用**了。改成"模拟输出 = 电脑音量钉在 1%",
+        # 简单得多也没有搬流的副作用。这里固定 False, 并顺手清理历史残留。
+        use_null = False
+        silent_sink_release()
+        _null_forced = False
+        if use_null:
+            ok, msg = silent_sink_ensure()
+            if not ok:
+                self._json({"ok": False, "err": msg})
+                return
+            audit("audio", "只用手机听: " + msg)
+            _null_forced = True
+
         mode = "auto"
         if src in ("sys", "system", "monitor", "sound"):
             mode = "sys"          # 电脑正在放的声音(扬声器回环)
@@ -3335,21 +3986,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
             kind, src = mic["kind"], mic["src"]
             audit("audio", f"选源(mic): {kind}:{src}")
         elif mode != "auto" or src in (None, "", "default"):
-            kind, src, _tried = audio_pick_source(mode)
+            if _null_forced:
+                kind, src = "pulse", NULL_SINK + ".monitor"
+            else:
+                kind, src, _tried = audio_pick_source_cached(mode)
             audit("audio", f"选源({mode}): {kind}:{src} "
                            f"(试过 {len(_tried)} 个候选)")
         if kind == "pulse" and src != "default":
             audio_unmute(src)          # 内置麦克风常被默认静音
-        stop = threading.Event()
-        with _audio_lock:
-            _audio_release_current()          # 同时只保留一路采集
-            proc, chunks, first, err = _audio_start(src, kind=kind)
-            if proc is None:
-                self._json({"ok": False,
-                            "err": "采集声音失败: " + _audio_hint(err)})
-                return
-            _audio_session["proc"] = proc
-            _audio_session["stop"] = stop
+        proc, err = _hub_ensure(src, kind)
+        if proc is None:
+            self._json({"ok": False,
+                        "err": "采集声音失败: " + _audio_hint(err)})
+            return
+        q = queue.Queue(maxsize=64)
+        with _hub_lock:
+            if _hub["first"]:              # 让新来的立刻有数据, 不用干等第一包
+                try:
+                    q.put_nowait(_hub["first"])
+                except queue.Full:
+                    pass
+            _hub["subs"].append(q)
+            stop = _hub["stop"]
 
         audit("audio", f"开始采集声音 {src} (pid={proc.pid})")
         try:
@@ -3363,11 +4021,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.connection.settimeout(15)
             except OSError:
                 pass
-            buf = first
+            buf = None
+            # 麦克风跟着"摄像头页还在不在"走 —— 但只在**这个流是从活着的摄像头页
+            # 开起来的**时候才绑。否则像自检脚本、或者直接用 curl 拉流的场景,
+            # 会被一个陈旧的全局时间戳误杀(踩过: cam_check 的音频用例就是这么挂的)。
+            vt0 = _viewer_seen["t"]
+            tied = bool(vt0) and (time.time() - vt0) <= CAM_VIEWER_TIMEOUT
             while not stop.is_set():
                 # 主动探一下客户端还在不在。光靠"写失败"发现断开太慢 ——
                 # 内核缓冲区没满时 write 照样成功, 麦克风会被白占好几秒。
                 if _peer_gone(self.connection):
+                    break
+                # 半死连接上面那行探不出来: 手机锁屏/切网/webview 被挂起时写还写得
+                # 进去, 对端早就不处理了。所以再挂一道"摄像头页还在不在"的判据 ——
+                # 麦克风只在摄像头页里开, 那页的 JS 心跳停了就说明人走了。
+                # (_viewer_seen 从没被写过 = 压根没人开过摄像头页, 不做这个判断)
+                if tied and time.time() - _viewer_seen["t"] > CAM_VIEWER_TIMEOUT:
+                    audit("audio", "摄像头页心跳停了 %.0fs, 判定没人听, 停止收音"
+                                   % (time.time() - _viewer_seen["t"]))
                     break
                 if buf:
                     if not self._write_chunk(buf):
@@ -3375,7 +4046,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     buf = None
                     continue
                 try:
-                    buf = chunks.get(timeout=1.0)
+                    buf = q.get(timeout=1.0)
                 except queue.Empty:
                     continue
                 if buf is None:
@@ -3383,12 +4054,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (OSError, BrokenPipeError, ConnectionResetError):
             pass
         finally:
-            stop.set()
-            _cam_stop(proc)
-            with _audio_lock:
-                if _audio_session.get("proc") is proc:
-                    _audio_session["proc"] = None
-                    _audio_session["stop"] = None
+            q_ = locals().get("q")
+            if q_ is not None:
+                _hub_detach(q_)            # 退订; 最后一个人走了才延迟收工
+            if use_null:
+                silent_sink_release()      # 必须收工: 否则电脑一直没声音
             self.close_connection = True
         audit("audio", f"停止采集声音 {src} (pid={proc.pid})")
 
@@ -3556,6 +4226,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 devs_json=json.dumps(pairs),
                 # 只有一个摄像头就别显示切换按钮了, 没什么可切的
                 sw_hidden="display:none" if len(devs) <= 1 else ""))
+        elif path == "/theme":
+            # 主题色: 圆盘取色页。颜色本身走 /api/theme, 这里只给页面和默认值。
+            self._html(200, render("theme.html", user=user,
+                                   host=COLLECTOR.hostname, default=THEME_DEFAULT))
+        elif path == "/bg":
+            # 自定义背景页(图片本体走 /bg/img)
+            self._html(200, render("bg.html", user=user, host=COLLECTOR.hostname))
         elif path == "/log":
             self._html(200, render("log.html", user=user,
                                    host=COLLECTOR.hostname))
@@ -3570,6 +4247,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             "err": "读不到电脑音量(没有 pulseaudio 或 pactl)"})
             else:
                 self._json({"ok": True, **v})
+        elif path == "/api/brightness":
+            # 屏幕亮度: 值是滑块写的、存在 config.json(和音量一套做法)
+            self._json({"ok": True, "pct": get_pc_brightness()})
+        elif path == "/api/theme":
+            self._json({"ok": True, "acc": get_theme_acc(),
+                        "default": THEME_DEFAULT})
+        elif path == "/api/screen/modes":
+            info = screen_modes()
+            if not info:
+                self._json({"ok": False, "err": "拿不到显示器信息"})
+            else:
+                self._json({"ok": True, **info})
+        elif path == "/api/audio/out":
+            self._json({"ok": True, "mode": audio_out_mode()})
+        elif path == "/api/bg":
+            has, ver, trans, dim, blur = bg_state()
+            try:
+                n = os.path.getsize(BG_FILE) if has else 0
+            except OSError:
+                n = 0
+            self._json({"ok": True, "has": has, "ver": ver, "bytes": n,
+                        "trans": trans, "dim": dim, "blur": blur})
+        elif path == "/bg/img":
+            # 背景图本体(要登录才取得到; 没图就 404)
+            try:
+                with open(BG_FILE, "rb") as fh:
+                    blob = fh.read()
+            except OSError:
+                self._html(404, "<h1>没有背景图</h1>")
+            else:
+                ct = ("image/png" if blob[:8] == b"\x89PNG\r\n\x1a\n"
+                      else "image/webp" if blob[8:12] == b"WEBP"
+                      else "image/gif" if blob[:3] == b"GIF" else "image/jpeg")
+                self._reply(200, blob, ct, {"Cache-Control": "no-cache"})
         elif path == "/api/screen":
             w, h = screen_size()
             self._json({"ok": bool(w), "w": w, "h": h})
@@ -3584,12 +4295,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/ws/term":
             ws = self._ws()
             if ws:
-                audit("term", "终端会话打开")
+                audit("term", "终端会话打开 from " + _who(self))
                 ws_term_bridge(ws)
         elif path == "/ws/vnc":
             ws = self._ws(protocols=["binary"])
             if ws:
-                audit("vnc", "远程桌面连接")
+                audit("vnc", "远程桌面连接 from " + _who(self))
                 ws_vnc_bridge(ws)
         elif path == "/api/vnc/clients":
             # 诊断用: x11vnc 上当前几个客户端(正常 1)。数字偏大 = 有遗留连接。
@@ -3662,12 +4373,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ok = check_login(user, pw)
             record_login(ip, ok)
             if ok:
-                audit("login", f"登录成功")
+                audit("login", "登录成功 from " + _who(self))
                 self._redirect("/home", extra={
                     "Set-Cookie": (f"{COOKIE_NAME}={make_token()}; Path=/; "
                                    f"HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}")})
             else:
-                audit("login", f"登录失败 user={user!r}")
+                audit("login", "登录失败 user=%r from %s" % (user, ip))
                 time.sleep(0.6)
                 self._login_page("用户名或密码错误")
             return
@@ -3791,14 +4502,118 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 self._json({"ok": False, "err": "vol 必须是 0~150 的整数"})
                 return
+            old = (get_pc_volume() or {}).get("vol")
             ok, msg = set_pc_volume(pct)
             if ok:
                 save_config({"volume": pct})
                 v = get_pc_volume() or {"vol": pct, "muted": False, "sink": ""}
-                audit("vol", f"电脑音量 → {pct}%")
+                audit("vol", "电脑音量 %s%% → %d%% (输出 %s)"
+                      % (old if old is not None else "?", pct, v.get("sink") or "?"))
                 self._json({"ok": True, **v})
             else:
                 self._json({"ok": False, "err": msg})
+        elif path == "/api/brightness":
+            # 屏幕亮度: 和音量同一套 —— 滑块设, 写进 config.json 持久化。
+            # 用的是 xrandr 软件调光, 不需要 sudo/udev 规则。
+            raw = data.get("pct")
+            try:
+                pct = int(raw)
+            except (TypeError, ValueError):
+                self._json({"ok": False, "err": "pct 必须是 5~100 的整数"})
+                return
+            old = get_pc_brightness()
+            ok, msg = set_pc_brightness(pct)
+            if ok:
+                audit("bri", "屏幕亮度 %d%% → %d%% (输出 %s)"
+                      % (old, pct, ",".join(_xrandr_outputs()) or "?"))
+                self._json({"ok": True, "pct": get_pc_brightness()})
+            else:
+                self._json({"ok": False, "err": msg})
+        elif path == "/api/theme":
+            # 主题色: 太暗的会被 set_theme_acc 拒掉(暗底上没法当文字色用)
+            old = get_theme_acc()
+            ok, msg = set_theme_acc(data.get("acc"))
+            if ok:
+                audit("theme", "主题色 %s → %s" % (old, get_theme_acc()))
+                self._json({"ok": True, "acc": get_theme_acc()})
+            else:
+                self._json({"ok": False, "err": msg})
+        elif path == "/api/screen/mode":
+            ok, msg = set_screen_mode((data.get("mode") or "").strip())
+            if ok:
+                audit("screen", "分辨率 -> " + (data.get("mode") or ""))
+                self._json({"ok": True})
+            else:
+                self._json({"ok": False, "err": msg})
+        elif path == "/api/audio/out":
+            mode = (data.get("mode") or "").strip()
+            if mode not in ("pc", "silent"):
+                self._json({"ok": False, "err": "mode 只能是 pc 或 silent"})
+                return
+            if mode == "silent":
+                # 「模拟输出」= 把电脑音量钉在 1% + 锁定。
+                # 用户实测发现的巧办法: 1% 已经听不见, 而 monitor **仍有满幅信号**;
+                # 只有 0%/静音才会让 monitor 一起静音(那手机就没声了)。所以根本不需要
+                # 虚拟输出那套搬流 —— 简单、且没有副作用。
+                set_pc_volume(SILENT_VOL)   # 必须在存 mode 之前(下面会按 mode 拦)
+            else:
+                silent_sink_release()     # 顺手清掉以前遗留的 meow_silent
+            save_config({"audioOut": mode})
+            audit("audio", "声音去向 -> " + ("模拟输出(电脑音量一键设为 %d%%)" % SILENT_VOL
+                                            if mode == "silent" else "电脑输出"))
+            self._json({"ok": True, "mode": mode})
+        elif path == "/api/bg":
+            # 两种 body: 图片二进制(Content-Type: image/*) / JSON(参数或清除)
+            # 两种 body, 都是 JSON: 图片(base64, 键 img) / 参数或清除。
+            # 不用二进制 body: do_POST 前面已经按 JSON 解过一遍 body 了, 分支里再
+            # read(Content-Length) 会一直等下去(实测卡死过一次)。
+            b64 = data.get("img")
+            if b64:
+                import base64 as _b64
+                try:
+                    blob = _b64.b64decode(b64, validate=False)
+                except Exception:
+                    self._json({"ok": False, "err": "图片解码失败"})
+                    return
+                if not blob or len(blob) > BG_MAX:
+                    self._json({"ok": False, "err": "图片大小不对(最多 8 MB)"})
+                    return
+                try:
+                    with open(BG_FILE, "wb") as fh:
+                        fh.write(blob)
+                except OSError as e:
+                    self._json({"ok": False, "err": "存不下: %s" % e})
+                    return
+                audit("bg", "背景图已更新(%d KB)" % (len(blob) // 1024))
+                self._json({"ok": True, "ver": bg_state()[1]})
+                return
+            if data.get("clear"):
+                try:
+                    os.remove(BG_FILE)
+                except OSError:
+                    pass
+                if data.get("reset"):
+                    save_config({"bgTrans": 35, "bgDim": 45, "bgBlur": 0})
+                audit("bg", "背景图已清除" + ("并恢复默认参数" if data.get("reset") else ""))
+                self._json({"ok": True})
+                return
+            params = data.get("params") or {}
+            patch = {}
+            # 前端发的是短键(trans/dim/blur), 存的是长键(bgTrans/...), 两个都认
+            for sk, k, lo, hi in (("trans", "bgTrans", 0, 90),
+                                  ("dim", "bgDim", 0, 80),
+                                  ("blur", "bgBlur", 0, 20)):
+                v = params.get(k, params.get(sk))
+                if v is not None:
+                    try:
+                        patch[k] = max(lo, min(hi, int(v)))
+                    except (TypeError, ValueError):
+                        pass
+            if patch:
+                save_config(patch)
+            audit("bg", "背景参数 " + (", ".join("%s=%s" % kv for kv in patch.items())
+                                      or "无变化"))
+            self._json({"ok": True})
         elif path == "/api/password":
             # 设置面板改密码: 必须输对原密码。用户名不可改(单机单用户)。
             old = data.get("old")

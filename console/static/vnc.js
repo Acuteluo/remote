@@ -316,12 +316,21 @@ setInterval(() => {
   renderRate(fps, kbs);
 }, 1000);
 
+function fetchAbort(url, ms) {
+  // 校园网/Tailscale 抖动时请求可能一直挂着 —— 挂住一次, pingBusy 就永远是 true,
+  // 之后再也测不了(表现就是"画面 --"再也不恢复)。宁可这次算失败也别卡死。
+  const ac = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  const tm = ac ? setTimeout(() => ac.abort(), ms) : 0;
+  return fetch(url, { cache: 'no-store', signal: ac ? ac.signal : undefined })
+    .finally(() => { if (tm) clearTimeout(tm); });
+}
+
 async function pingOnce() {
   if (pingBusy) return;
   pingBusy = true;
   const t0 = performance.now();
   try {
-    await fetch('/api/health?t=' + Date.now(), { cache: 'no-store' });
+    await fetchAbort('/api/health?t=' + Date.now(), 5000);
     const ms = performance.now() - t0;
     pingEma = pingEma ? pingEma * 0.6 + ms * 0.4 : ms;
     renderPing(pingEma);
@@ -1209,6 +1218,8 @@ $('vnc-clipbtn').addEventListener('click', () => {
   const p = $('clip-panel');
   const show = p.style.display === 'none';
   p.style.display = show ? 'block' : 'none';
+  // 面板开着就把按钮点亮(和键盘/触控板/设置按钮一致)
+  $('vnc-clipbtn').classList.toggle('on', p.style.display === 'block');
   if (show) clipStatus('可读取/写入远端剪贴板');
 });
 $('clip-close').addEventListener('click', () => { $('clip-panel').style.display = 'none'; });
@@ -1298,7 +1309,11 @@ document.querySelectorAll('#set-panel .seg.q button').forEach((b) => {
 $('vnc-setbtn').addEventListener('click', () => {
   const p = $('set-panel');
   p.style.display = p.style.display === 'none' ? 'block' : 'none';
-  if (p.style.display === 'block') { refreshDockState(); refreshVncClients(); refreshVolume(); }
+  // 持久性的开关要能看出"现在是开着的": 和剪贴板/键盘那些一样点亮(主题色铺满)
+  $('vnc-setbtn').classList.toggle('on', p.style.display === 'block');
+  if (p.style.display === 'block') {
+    refreshDockState(); refreshVncClients(); refreshVolume(); refreshBrightness();
+  }
 });
 
 // ---- 连接维护: 看当前有几个客户端, 一键清理并重启 ----
@@ -1441,6 +1456,44 @@ if (elVol) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ vol: pct }),
+      }).catch(() => {});
+    }, 250);
+  });
+}
+// ---- 屏幕亮度滑块(紧跟在电脑音量下面, 一套做法) ----
+// 值经服务端 xrandr 软件调光落到**电脑那块屏幕**上: 不需要权限, 外接屏也管用。
+// 和音量一样存在服务端 config.json —— 换手机打开还是同一个值。
+const elBri = $('set-bri');
+const elBriV = $('set-bri-v');
+let briTimer = null;
+
+function briLabel(pct) {
+  if (elBriV) elBriV.textContent = pct + '%';
+}
+
+async function refreshBrightness() {
+  if (!elBri) return;
+  try {
+    const r = await fetch('/api/brightness', { cache: 'no-store' });
+    const j = await r.json();
+    if (j && j.ok && typeof j.pct === 'number') {
+      elBri.value = String(Math.max(5, Math.min(100, j.pct)));
+      briLabel(Number(elBri.value));
+    }
+  } catch (e) { /* 服务没起就不动滑块 */ }
+}
+
+if (elBri) {
+  elBri.addEventListener('input', (e) => {
+    const pct = Number(e.target.value);
+    briLabel(pct);
+    // 和音量一样攒 250ms 再发: 拖动过程中别把请求打满(每次都要起一个 xrandr)
+    if (briTimer) clearTimeout(briTimer);
+    briTimer = setTimeout(() => {
+      fetch('/api/brightness', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pct: pct }),
       }).catch(() => {});
     }, 250);
   });
@@ -1652,12 +1705,14 @@ const MSE_TARGET = 0.35;        // 目标缓冲(秒)。太小会卡顿, 太大�
 let mse = null;
 
 function mseSupported() {
-  try {
-    return !!(window.MediaSource && window.MediaSource.isTypeSupported
-              && window.MediaSource.isTypeSupported('audio/mpeg'));
-  } catch (e) {
-    return false;
-  }
+  // ★ 2026-09-22 停用 MSE, 走原生 <audio> 流(src=/api/audio)。
+  // 原因: MSE 那条路的 appendBuffer 一旦抛异常就置 pumping=false 静默停摆,
+  // 只能靠前端重连恢复 —— 表现就是"播几秒后没声音, 要反复开关"。
+  // 而服务端把采集粒度压到 21ms/包(fragment_size, 修卡顿用的)之后, 碎包更频繁地
+  // 命中它的缓冲/裁剪逻辑, 这个停摆就变成必然。原生流由浏览器自己缓冲, 稳得多
+  // (代价是 1~3 秒延迟, iOS 一直这么用)。要低延迟再单独优化 MSE, 别拿稳定性换。
+  return false;
+
 }
 
 function stopMse() {
@@ -2049,3 +2104,58 @@ function fsSync() {
 }
 document.addEventListener('fullscreenchange', fsSync);
 document.addEventListener('webkitfullscreenchange', fsSync);
+
+// ---- 声音去向: 电脑也响 / 只发手机(虚拟输出, 电脑静音) ----
+// 放在设置面板的音量下面, 和「画质」那些用同一套 .seg 分段按钮。
+// 这是**电脑级设置**(存服务端 config.json), 两个页面都照它走, 不用各自加按钮。
+(function bindAudioOut() {
+  const seg = document.querySelector('.seg.ao');
+  if (!seg) return;
+  const btns = Array.prototype.slice.call(seg.querySelectorAll('button'));
+  // 标签跟着模式走: 模拟输出时它调的是"发给手机的音量"(二级控制), 不再是电脑音量
+  function labels(mode) {
+    const silent = mode === 'silent';
+    const l = document.getElementById('vol-label');
+    const n = document.getElementById('vol-note');
+    if (l) l.textContent = silent ? '输出音量' : '电脑音量';
+    if (n) n.textContent = silent
+      ? '模拟输出: 电脑音量被钉在 1%, 听不见但转发仍是满幅信号; 锁定不可调以免拖到 0。手机上用你自己的音量键调, 切回电脑输出即可解锁。'
+      : '调的是电脑本机的扬声器音量(不限于这次远程会话), 换手机打开也是同一个值; 超过 100% 会变红(软件放大, 可能失真), 拖到 0 即静音。';
+  }
+  function mark(mode) {
+    btns.forEach((b) => b.classList.toggle('on', b.dataset.ao === mode));
+    labels(mode);
+  }
+  fetch('/api/audio/out', { cache: 'no-store' })
+    .then((r) => r.json())
+    .then((j) => { if (j && j.ok) mark(j.mode); })
+    .catch(() => {});
+  btns.forEach((b) => b.addEventListener('click', () => {
+    mark(b.dataset.ao);
+    fetch('/api/audio/out', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: b.dataset.ao }),
+    }).catch(() => {});
+    if (typeof refreshVolume === 'function') setTimeout(refreshVolume, 400);
+  }));
+})();
+
+// ---- 分辨率: 手机上画面卡时最有效的一档 ----
+(function bindScreenMode() {
+  const sel = document.getElementById('set-mode');
+  if (!sel) return;
+  fetch('/api/screen/modes', { cache: 'no-store' }).then((r) => r.json()).then((j) => {
+    if (!j || !j.ok || !j.modes) return;
+    sel.innerHTML = j.modes.map((m) =>
+      '<option value="' + m.name + '"' + (m.name === j.current ? ' selected' : '') + '>'
+      + m.name + ' @' + m.hz + 'Hz</option>').join('');
+  }).catch(() => {});
+  sel.addEventListener('change', () => {
+    fetch('/api/screen/mode', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: sel.value }),
+    }).then((r) => r.json()).then((j) => {
+      if (j && !j.ok) alert('切换失败: ' + (j.err || ''));
+    }).catch(() => {});
+  });
+})();

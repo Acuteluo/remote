@@ -49,7 +49,8 @@
     font-variant-numeric: tabular-nums; text-shadow: 0 1px 3px #000; white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis; }
   /* 全屏里可点亮的开关(「滚轮」)与声音按钮并排, 亮起 = 右侧滚轮钮挂在画面上 */
-  #vnc-fs-ui button.on { background: rgba(77, 163, 255, .88); color: #04121f;
+  #vnc-fs-ui button.on { background: var(--acc);
+    background: color-mix(in srgb, var(--acc) 88%, transparent); color: #04121f;
     border-color: rgba(255, 255, 255, .4); font-weight: 600; }
 
   /* ---- 全屏滚轮按钮(2026-09-16 加) ----
@@ -103,11 +104,12 @@
   .padbtn.mini { flex: 1; padding: 9px 4px; font-size: 12px; color: var(--dim); }
   .padbtn:active { border-color: var(--acc); background: #1a2735; }
   .padbtn.on { background: var(--warn); color: #241a04; font-weight: 700; border-color: var(--warn); }
+  /* 代表鼠标的那个小圆圈: 颜色跟着主题色走(原来是写死的默认蓝) */
   #pad-cursor { position: fixed; z-index: 65; width: 26px; height: 26px; margin: -13px 0 0 -13px;
-    border: 2px solid rgba(77,163,255,.9); border-radius: 50%; pointer-events: none;
+    border: 2px solid var(--acc); border-radius: 50%; pointer-events: none;
     box-shadow: 0 0 6px rgba(0,0,0,.6); }
   #pad-cursor::after { content: ''; position: absolute; left: 50%; top: 50%; width: 4px; height: 4px;
-    margin: -2px 0 0 -2px; border-radius: 50%; background: rgba(77,163,255,.95); }
+    margin: -2px 0 0 -2px; border-radius: 50%; background: var(--acc); }
   .setrow { display: flex; align-items: center; justify-content: space-between; gap: 10px;
     padding: 7px 0; font-size: 13px; border-bottom: 1px solid #1b2531; }
   .setrow:last-of-type { border-bottom: 0; }
@@ -274,13 +276,35 @@
         <button data-q="3">低</button><button data-q="6">中</button><button data-q="9">高</button>
       </div>
     </div>
-    <div class="setrow"><span>电脑音量</span>
+    <div class="setrow"><span>声音去向</span>
+      <div class="seg ao">
+        <button data-ao="pc">电脑输出</button><button data-ao="silent">模拟输出</button>
+      </div>
+    </div>
+    <p class="setnote"><b>电脑输出</b> = 电脑扬声器正常出声, 手机同时能听。
+      <b>模拟输出</b> = 一键把电脑音量按到 1%(电脑几乎听不见), 手机照常收到完整音量 ——
+      深夜不想外放时用。它只是替你按一下, 之后<b>上面的音量滑块仍可随意调</b>,
+      不会被锁住; 按到 0% 或静音才会真的没声音。</p>
+    <div class="setrow"><span id="vol-label">电脑音量</span>
       <input type="range" id="set-vol" min="0" max="150" step="1">
       <b id="set-vol-v" style="min-width:48px;text-align:right;font-size:12px"></b>
     </div>
-    <p class="setnote">调的是电脑本机的扬声器音量(不限于这次远程会话), 换手机打开也是同一个
+    <p class="setnote" id="vol-note">调的是电脑本机的扬声器音量(不限于这次远程会话), 换手机打开也是同一个
       值 —— 所以它存在电脑上。<b>超过 100% 会变成红色</b>(对应 Linux 音量条从白色进入红色区,
       属于软件放大、可能失真); 拖到底 0% 即静音。</p>
+    <div class="setrow"><span>分辨率</span>
+      <select id="set-mode" style="flex:1;background:var(--card2);color:var(--fg);
+        border:1px solid var(--line);border-radius:8px;padding:5px 8px;font-size:12px"></select>
+    </div>
+    <p class="setnote">手机上看画面卡时, <b>换小一点的分辨率通常最有效</b> ——
+      这台屏默认 2880x1920@120Hz, 图传和手机渲染都很吃力。切换后桌面窗口会重排。</p>
+    <div class="setrow"><span>屏幕亮度</span>
+      <input type="range" id="set-bri" min="5" max="100" step="1">
+      <b id="set-bri-v" style="min-width:48px;text-align:right;font-size:12px"></b>
+    </div>
+    <p class="setnote">调的是<b>电脑那块屏幕</b>, 不是手机。走 xrandr 软件调光 —— 不需要
+      权限、外接屏也管用(所以笔记本的背光指示灯/耗电不变, 只是画面变暗)。拖动即时生效,
+      值同样存在电脑上。</p>
     <div class="setrow"><span>触控板高度</span>
       <input type="range" id="set-padh" min="120" max="300" step="5">
       <b id="set-padh-v" style="min-width:44px;text-align:right;font-size:12px"></b>

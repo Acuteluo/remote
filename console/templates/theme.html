@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>主题色 · {{host}}</title>
+<link rel="icon" href="/static/vendor/favicon.svg">
+<link rel="stylesheet" href="/static/app.css">
+<style>
+  .th-wrap { max-width: min(100%, 560px); margin: 8px auto; padding: 0 12px 34px; }
+  .th-stage { display: flex; justify-content: center; margin: 10px 0 4px; }
+  .th-holder { position: relative; }
+  /* 圆盘: 圆心近白, 越靠边越鲜艳; 全程都在浅~亮范围里, 取不到黑色 */
+  #th-disc { display: block; border-radius: 50%; touch-action: none;
+    box-shadow: 0 0 0 1px var(--line), 0 12px 34px rgba(0,0,0,.45); }
+  /* 当前选中的指示器: 小圆圈(不是十字准心)。白描边 + 暗投影,
+     所以无论落在什么底色上都看得见; 圈里填的就是当前选中的颜色。 */
+  #th-pick { position: absolute; width: 22px; height: 22px; margin: -11px 0 0 -11px;
+    border: 2.5px solid #fff; border-radius: 50%; pointer-events: none;
+    box-shadow: 0 0 0 1.5px rgba(0,0,0,.5), 0 1px 7px rgba(0,0,0,.55); }
+  .th-hex { text-align: center; font: 13px/1.9 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--dim); margin-top: 12px; }
+  .th-hex b { color: var(--acc); font-size: 15px; letter-spacing: .6px; }
+  /* 这句话用主题色实时渲染 —— 取色一变, 字色和句子一起换 */
+  /* 保证一行: 不换行, 太长由 JS 把字号往下缩(theme.js 的 fitOneLine) */
+  .th-say { margin: 16px auto 2px; max-width: 100%; text-align: center;
+    font-size: 19px; line-height: 1.65; font-weight: 600; color: var(--acc);
+    white-space: nowrap; transition: color .1s linear, opacity .22s ease; }
+  .th-bar { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-top: 18px; }
+  .th-bar button { padding: 9px 16px; border-radius: 10px; border: 1px solid var(--line);
+    background: var(--card2); color: var(--fg); font-size: 13px; }
+  .th-bar button.pri { background: var(--acc); color: #04121f; border-color: transparent;
+    font-weight: 700; }
+  .th-note { margin-top: 20px; font-size: 12.5px; color: var(--dim); line-height: 1.95;
+    border-top: 1px solid var(--line); padding-top: 14px; }
+  .th-note b { color: var(--fg); }
+  .th-note code { background: var(--card2); border-radius: 4px; padding: 1px 5px; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <a class="back" href="/home" title="返回" aria-label="返回">‹</a>
+  <span class="logo">主题色</span>
+  <span class="host" id="th-status">拖动圆盘试试</span>
+</div>
+
+<div class="th-wrap">
+  <div class="th-stage">
+    <div class="th-holder" id="th-holder">
+      <canvas id="th-disc"></canvas>
+      <div id="th-pick"></div>
+    </div>
+  </div>
+
+  <div class="th-hex">当前 <b id="th-hex">{{default}}</b>
+    · 默认 <span id="th-def">{{default}}</span></div>
+
+  <div class="th-say" id="th-say">今天要不吃汉堡？</div>
+
+  <div class="th-bar">
+    <button id="th-random">随便挑一个</button>
+    <button id="th-reset" class="pri">恢复默认蓝色</button>
+  </div>
+
+  <div class="th-note">
+    <b>怎么用</b>：点圆盘上任意一点，或者按住那个小圆圈拖动 —— 松手即生效。<br>
+    <b>影响哪些地方</b>：所有用主题色渲染的界面 —— 链接文字、按钮底色、选中态、
+    远程桌面里代表鼠标的那个小圆圈、状态面板的 CPU 曲线、终端光标。<br>
+    <b>为什么取不到黑色</b>：主题色还要当文字颜色用，暗底上深色看不清，所以圆盘只画
+    浅到亮的范围（圆心最浅近白，越靠边越鲜艳）。服务端也再拦一道，直接调接口塞深色会被拒。<br>
+    <b>存在哪</b>：电脑上的 <code>console/data/config.json</code> 里的
+    <code>themeAcc</code> —— 换手机、换浏览器打开都是同一个颜色。
+  </div>
+</div>
+
+<script src="/static/theme-color.js"></script>
+<script src="/static/theme.js"></script>
+</body>
+</html>
