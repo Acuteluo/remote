@@ -100,10 +100,14 @@ Description=MEOW Console - 状态面板 / 终端 / 远程桌面网关
 After=default.target
 
 [Service]
+# 同上: 先静态预检再启动。控制台是整个入口, 起不来比崩溃循环更难排查。
+ExecStartPre=/usr/bin/python3 $CONSOLE_DIR/tests/preflight.py --quiet $CONSOLE_DIR/server.py
 ExecStart=/usr/bin/python3 $CONSOLE_DIR/server.py$PORT_ARGS$VNC_ARGS
 WorkingDirectory=$REAL_HOME
 Restart=on-failure
 RestartSec=3
+StartLimitIntervalSec=60
+StartLimitBurst=6
 
 [Install]
 WantedBy=default.target
@@ -138,9 +142,19 @@ Description=MEOW forward - 把各网卡 IP 的控制台端口镜像到回环
 After=default.target
 
 [Service]
+# 起来之前先静态预检: 语法 + "用了却没导入的名字"。
+# 2026-09-22 那次事故就出在这个文件: 少了 import os, 语法完全合法, 但模块级
+# 代码一执行就 NameError -> 开机崩溃循环空转 255 次, 转发器不再镜像任何端口,
+# 而 systemd 那侧只看到它在不停 auto-restart, 没有任何一处说"整体是坏的"。
+# 宁可起不来(一眼可见), 也不要静默空转。
+ExecStartPre=/usr/bin/python3 $CONSOLE_DIR/tests/preflight.py --quiet $REPO_DIR/lan_forward.py
 ExecStart=/usr/bin/python3 $REPO_DIR/lan_forward.py
 Restart=on-failure
 RestartSec=3
+# 真出问题时 60 秒内最多重试 6 次, 之后进 failed(一眼可见), 不再无休止空转。
+# meow-guard.timer 会定期巡检并把它拉起来。
+StartLimitIntervalSec=60
+StartLimitBurst=6
 
 [Install]
 WantedBy=default.target
@@ -153,6 +167,35 @@ if [ -f "$USER_UNIT_DIR/dsh-lan-forward.service" ]; then
   systemctl --user disable --now dsh-lan-forward.service >/dev/null 2>&1 || true
   rm -f "$USER_UNIT_DIR/dsh-lan-forward.service"
 fi
+
+# 守护: 开机自检 + 每 5 分钟巡检 + 一次自愈。
+# 为什么要有它: enabled 不等于能用。2026-09-22 那次"手机进不来", systemd 那边
+# 每个单元看着都正常(要么 active, 要么在不停 auto-restart), 但转发器其实已经
+# 崩溃循环 255 次、Tailscale 掉线、控制台读着过期的 token 文件 —— 没有任何一处
+# 告诉你"整体是坏的"。它只看"从外面连过去到底通不通", 不通就报 failed。
+write_unit "meow-guard.service" "[Unit]
+Description=MEOW guard - remote 全套服务的开机自检 / 巡检自愈
+After=default.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 $CONSOLE_DIR/tests/stack_guard.py --quiet
+
+[Install]
+WantedBy=default.target
+"
+
+write_unit "meow-guard.timer" "[Unit]
+Description=MEOW guard timer - 开机后自检一次, 之后每 5 分钟巡检
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+"
 
 # ---------- 4. linger(开机即连的关键) ----------
 info "配置 linger(让服务在开机/未登录桌面时也能跑)..."
@@ -183,6 +226,12 @@ for s in "${SERVICES[@]}"; do
     warn "启动 $s 失败"
   fi
 done
+
+# 守护定时器: 开机后自检一次, 之后每 5 分钟巡检。oneshot 失败会在 systemd 里
+# 显示成 failed —— 这正是我们要的"坏了一眼可见"。
+systemctl --user enable --now meow-guard.timer >/dev/null 2>&1 \
+  && info "  守护定时器 meow-guard.timer 已启用 ✓" \
+  || warn "启用 meow-guard.timer 失败(手动: systemctl --user enable --now meow-guard.timer)"
 
 sleep 2
 
@@ -260,6 +309,15 @@ cat <<'EOF'
   常用命令:
     systemctl --user status meow-console meow-vnc meow-forward
     journalctl --user -u meow-console -f
+
+  改完代码之后(务必先跑, 否则可能"重启即崩溃循环"):
+    python3 console/tests/preflight.py      # 静态预检: 语法 + 用了没导入的名字
+    python3 console/tests/stack_guard.py    # 整体巡检一次(真连一遍, 带一次自愈)
+
+  守护(meow-guard.timer): 开机 60 秒后自检一次, 之后每 5 分钟巡检;
+    有问题先尝试自愈, 还不行就把这次运行标成 failed —— 坏了一眼可见。
+    systemctl --user list-timers meow-guard.timer
+    cat console/data/guard.log
 
   没起来先查:
     1) 有没有登录桌面(x11vnc 需要 X 会话: echo $DISPLAY)

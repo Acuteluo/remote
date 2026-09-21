@@ -25,10 +25,12 @@ console/.dsh-web.url
 # 这两个项目(文件管理 / DSH 助手)不随本仓库发布, 只是本机在用:
 #   console/extras_local.py  面板入口 + 私有路由(没有它就是纯远程桌面)
 #   ports.local.txt          转发器额外要暴露的端口(8330 / 3080)
+#   units.local.txt          本机私有的、也要一起盯着的 systemd 用户单元
 # 留在本机即可, 不进仓库; 删掉它们本仓库功能不受任何影响。
 console/extras_local.py
 console/extras_local.pyc
 ports.local.txt
+units.local.txt
 
 # 上面两个模块自带的东西(二进制 / 数据库 / 明文凭据 / 定制皮肤)
 bin/
