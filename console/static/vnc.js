@@ -1696,12 +1696,14 @@ const MSE_TARGET = 0.35;        // 目标缓冲(秒)。太小会卡顿, 太大�
 let mse = null;
 
 function mseSupported() {
-  try {
-    return !!(window.MediaSource && window.MediaSource.isTypeSupported
-              && window.MediaSource.isTypeSupported('audio/mpeg'));
-  } catch (e) {
-    return false;
-  }
+  // ★ 2026-09-22 停用 MSE, 走原生 <audio> 流(src=/api/audio)。
+  // 原因: MSE 那条路的 appendBuffer 一旦抛异常就置 pumping=false 静默停摆,
+  // 只能靠前端重连恢复 —— 表现就是"播几秒后没声音, 要反复开关"。
+  // 而服务端把采集粒度压到 21ms/包(fragment_size, 修卡顿用的)之后, 碎包更频繁地
+  // 命中它的缓冲/裁剪逻辑, 这个停摆就变成必然。原生流由浏览器自己缓冲, 稳得多
+  // (代价是 1~3 秒延迟, iOS 一直这么用)。要低延迟再单独优化 MSE, 别拿稳定性换。
+  return false;
+
 }
 
 function stopMse() {
