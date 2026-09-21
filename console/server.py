@@ -3475,15 +3475,120 @@ def _audio_cmd(kind, src):
             # 第二路: 无限静音, 只为保证"永远有输出"(见 AUDIO_FILTER 注释)
             "-f", "lavfi", "-i", SILENT_SRC,
             "-ac", "1", "-ar", str(AUDIO_RATE),
-            # 两条都是为了"不断":
-            #  aresample=async=1  补偿采集时钟/网络时钟的漂移 —— 不补的话浏览器缓冲
-            #    会被慢慢抽干, 表现就是"播一会儿卡一下又好了"(隔一阵来一次)。
-            #  apad               源一时没数据时补静音, 让流**永不结束**
-            #    (否则客户端会以为流断了而重连)。
+            # 兜底, 不是主力:
+            #  aresample=async=1  补偿采集时钟与网络时钟的漂移(不补的话客户端缓冲
+            #    会被慢慢抽干)。
+            #  apad               源端一旦不出数据就补静音, 让流**永不结束**,
+            #    客户端不会看到 EOF 而重连。
+            # (2026-09-22 更正: "隔一阵卡一下"的真凶不是采集断流, 而是每来一个新
+            #  请求就掐掉上一路采集 —— 见下面 _hub_* 共享采集那一段。)
             "-filter_complex", AUDIO_FILTER, "-map", "[aout]",
             "-c:a", "libmp3lame", "-b:a", AUDIO_BITRATE,
             "-flush_packets", "1",   # 每编完一包立刻吐出来(否则 ffmpeg 攒 ~2s/12KB 才发一次, 手机听感就是一段一段)
         "-f", "mp3", "-"]
+
+
+# ---- 采集共享(hub) ---------------------------------------------------------
+# 手机上 <audio> 的播放器会时不时**重新请求同一个 URL**(浏览器出错后自己重试),
+# 而旧逻辑是"每来一个请求就掐掉上一路采集再重起" —— 每次重试都要重新选源 +
+# 启动 ffmpeg, 那 0.3~1 秒的空档就是听感上的"隔一阵卡一下"。
+# 现在: 同一个 (src, kind) 只保留一路采集, 后来的人**挂到同一路**上, 谁也不打断
+# 谁; 最后一个人走了还留 AUDIO_LINGER 秒宽限, 期间重连等于**零空档**。
+AUDIO_LINGER = 2.5
+_hub = {"key": None, "proc": None, "chunks": None, "stop": None,
+        "subs": [], "first": b""}
+_hub_lock = threading.Lock()
+
+
+def _hub_fan(proc, chunks, stop):
+    """把采集队列的数据分发给所有订阅者(慢的客户端丢包但不踢)。"""
+    try:
+        while not stop.is_set():
+            try:
+                d = chunks.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if d is None:
+                break
+            with _hub_lock:
+                if _hub["proc"] is not proc:
+                    return
+                _hub["first"] = d
+                for q in _hub["subs"]:
+                    try:
+                        q.put_nowait(d)
+                    except queue.Full:
+                        pass
+    except Exception:
+        pass
+    finally:
+        with _hub_lock:
+            if _hub["proc"] is proc:
+                _hub.update(key=None, proc=None, chunks=None, first=b"")
+                for q in _hub["subs"]:
+                    try:
+                        q.put_nowait(None)
+                    except queue.Full:
+                        pass
+                _hub["subs"] = []
+        stop.set()
+
+
+def _hub_stop_locked():
+    """(调用方需持 _hub_lock) 收掉当前那路采集。"""
+    p, st, subs = _hub["proc"], _hub["stop"], list(_hub["subs"])
+    _hub.update(key=None, proc=None, chunks=None, first=b"", subs=[])
+    if st is not None:
+        st.set()
+    if p is not None and p.poll() is None:
+        _cam_stop(p)
+    for q in subs:
+        try:
+            q.put_nowait(None)
+        except queue.Full:
+            pass
+
+
+def _hub_stop_if_idle():
+    with _hub_lock:
+        if not _hub["subs"]:
+            _hub_stop_locked()
+
+
+def _hub_detach(q):
+    with _hub_lock:
+        if q in _hub["subs"]:
+            _hub["subs"].remove(q)
+        idle = not _hub["subs"]
+    if idle:
+        threading.Timer(AUDIO_LINGER, _hub_stop_if_idle).start()
+
+
+def _hub_ensure(src, kind):
+    """保证有一路 (src, kind) 采集在跑; 已在跑就直接复用。返回 (proc, err)。"""
+    key = (src, kind)
+
+    def usable():
+        p = _hub["proc"]
+        return _hub["key"] == key and p is not None and p.poll() is None
+
+    with _hub_lock:
+        if usable():
+            return _hub["proc"], ""
+    with _audio_lock:
+        with _hub_lock:
+            if usable():
+                return _hub["proc"], ""
+            _hub_stop_locked()
+            proc, chunks, first, err = _audio_start(src, kind=kind)
+            if proc is None:
+                return None, err
+            stop = threading.Event()
+            _hub.update(key=key, proc=proc, chunks=chunks, stop=stop,
+                        first=first, subs=[])
+        threading.Thread(target=_hub_fan, args=(proc, chunks, stop),
+                         daemon=True).start()
+        return proc, ""
 
 
 def _audio_start(src, first_timeout=4.0, kind="pulse"):
@@ -3579,6 +3684,7 @@ def _kill_children():
     **孤儿进程**继续占着摄像头/麦克风 —— 表现就是"明明退出了, 摄像头灯还亮着",
     而且下次再开还会因为设备被占而报 busy。
     """
+    _audio_release_current()          # 收掉共享采集, 别把 ffmpeg 留成孤儿
     for sess in (_cam_session, _audio_session):
         p = sess.get("proc")
         if p is not None and p.poll() is None:
@@ -3592,14 +3698,9 @@ atexit.register(_kill_children)
 
 
 def _audio_release_current(timeout=3.0):
-    stop = _audio_session.get("stop")
-    proc = _audio_session.get("proc")
-    if stop is not None:
-        stop.set()
-    if proc is not None and proc.poll() is None:
-        _cam_stop(proc)                  # 同样的"先礼后兵"收尾
-    _audio_session["proc"] = None
-    _audio_session["stop"] = None
+    """收掉当前那路共享采集(退出/换源时用)。"""
+    with _hub_lock:
+        _hub_stop_locked()
 
 
 # ---------------------------------------------------------------- 电源控制
@@ -3871,16 +3972,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            f"(试过 {len(_tried)} 个候选)")
         if kind == "pulse" and src != "default":
             audio_unmute(src)          # 内置麦克风常被默认静音
-        stop = threading.Event()
-        with _audio_lock:
-            _audio_release_current()          # 同时只保留一路采集
-            proc, chunks, first, err = _audio_start(src, kind=kind)
-            if proc is None:
-                self._json({"ok": False,
-                            "err": "采集声音失败: " + _audio_hint(err)})
-                return
-            _audio_session["proc"] = proc
-            _audio_session["stop"] = stop
+        proc, err = _hub_ensure(src, kind)
+        if proc is None:
+            self._json({"ok": False,
+                        "err": "采集声音失败: " + _audio_hint(err)})
+            return
+        q = queue.Queue(maxsize=64)
+        with _hub_lock:
+            if _hub["first"]:              # 让新来的立刻有数据, 不用干等第一包
+                try:
+                    q.put_nowait(_hub["first"])
+                except queue.Full:
+                    pass
+            _hub["subs"].append(q)
+            stop = _hub["stop"]
 
         audit("audio", f"开始采集声音 {src} (pid={proc.pid})")
         try:
@@ -3894,7 +3999,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.connection.settimeout(15)
             except OSError:
                 pass
-            buf = first
+            buf = None
             # 麦克风跟着"摄像头页还在不在"走 —— 但只在**这个流是从活着的摄像头页
             # 开起来的**时候才绑。否则像自检脚本、或者直接用 curl 拉流的场景,
             # 会被一个陈旧的全局时间戳误杀(踩过: cam_check 的音频用例就是这么挂的)。
@@ -3919,7 +4024,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     buf = None
                     continue
                 try:
-                    buf = chunks.get(timeout=1.0)
+                    buf = q.get(timeout=1.0)
                 except queue.Empty:
                     continue
                 if buf is None:
@@ -3927,14 +4032,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (OSError, BrokenPipeError, ConnectionResetError):
             pass
         finally:
-            stop.set()
-            _cam_stop(proc)
+            q_ = locals().get("q")
+            if q_ is not None:
+                _hub_detach(q_)            # 退订; 最后一个人走了才延迟收工
             if use_null:
                 silent_sink_release()      # 必须收工: 否则电脑一直没声音
-            with _audio_lock:
-                if _audio_session.get("proc") is proc:
-                    _audio_session["proc"] = None
-                    _audio_session["stop"] = None
             self.close_connection = True
         audit("audio", f"停止采集声音 {src} (pid={proc.pid})")
 
