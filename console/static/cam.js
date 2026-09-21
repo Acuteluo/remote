@@ -389,6 +389,7 @@
   const btnAudio = $('cam-audio'), btnAudioFs = $('cam-fs-audio');
   const volEl = $('cam-vol'), audioState = $('cam-audio-state');
   let audioOn = false;
+let silentOnly = false;   // 本机不出声, 只发手机(服务端走虚拟输出)
 
   function syncAudio() {
     const canUse = micReady !== false;          // 检测中(null)也允许点
@@ -460,7 +461,8 @@
     if (on) {
       initAnalyser();                     // 必须在用户手势里建 AudioContext
       // 加时间戳: 别让浏览器/中间代理拿缓存的旧流
-      audioEl.src = '/api/audio?src=default&_=' + Date.now();
+      audioEl.src = '/api/audio?src=' + (silentOnly ? 'silent' : 'default')
+        + '&_=' + Date.now();
       const pr = audioEl.play();
       if (pr && pr.catch) {
         pr.catch((e) => {
@@ -527,6 +529,15 @@
   [btnAudio, btnAudioFs].forEach((b) => {
     b.addEventListener('click', () => setAudio(!audioOn));
   });
+  // 「仅手机」: 让服务端把正在播放的声音搬到虚拟输出(本机一点不出声),
+  // 这样电脑静音也照样能把声音发到手机。开着声音时切换会重连一次流。
+  if ($('cam-silent')) {
+    $('cam-silent').addEventListener('click', () => {
+      silentOnly = !silentOnly;
+      $('cam-silent').classList.toggle('on', silentOnly);
+      if (audioOn) { setAudio(false); setTimeout(() => setAudio(true), 150); }
+    });
+  }
   syncAudio();
 
   const snap = () => {

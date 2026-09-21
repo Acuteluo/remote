@@ -3287,6 +3287,75 @@ def audio_first_usable_mic():
     return None
 
 
+# ---- "本机不出声, 声音只发手机" 用的虚拟输出 ----
+# 直接采硬件 sink 的 monitor 时, **本机一静音 monitor 就没声了**(用户实测确认),
+# 所以想"电脑静音但手机能听"必须换条路: 建一个 null sink(数据没人播 -> 一点声音
+# 都不出), 把正在播放的流挪过去, 再采它的 monitor。
+NULL_SINK = "meow_silent"
+
+
+def _pactl(*args, timeout=6):
+    """跑一条 pactl, 返回 (ok, 输出)。"""
+    try:
+        r = subprocess.run(["pactl", *args], env=x_env(),
+                           capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0, (r.stdout or r.stderr or "").strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+
+
+def _sink_idx(name):
+    ok, out = _pactl("list", "short", "sinks")
+    for ln in out.splitlines():
+        f = ln.split()
+        if len(f) >= 2 and f[1] == name:
+            return f[0]
+    return None
+
+
+def _null_sink_module():
+    ok, out = _pactl("list", "short", "modules")
+    for ln in out.splitlines():
+        if NULL_SINK in ln:
+            return ln.split()[0]
+    return None
+
+
+def silent_sink_ensure():
+    """确保虚拟输出存在, 并把正在播放的流都搬过去。返回 (ok, 说明)。"""
+    if _sink_idx(NULL_SINK) is None:
+        ok, out = _pactl("load-module", "module-null-sink",
+                         "sink_name=" + NULL_SINK,
+                         "sink_properties=device.description=MEOW-Silent")
+        if not ok:
+            return False, "建虚拟输出失败: " + out
+    idx = _sink_idx(NULL_SINK)
+    n = 0
+    ok, out = _pactl("list", "short", "sink-inputs")
+    for ln in out.splitlines():
+        f = ln.split()
+        if len(f) > 1 and f[1] != idx and _pactl("move-sink-input", f[0], NULL_SINK)[0]:
+            n += 1
+    return True, "搬到虚拟输出 %d 路声音(本机不再出声)" % n
+
+
+def silent_sink_release():
+    """把流搬回默认输出并卸掉虚拟输出 —— 不做的话电脑会一直没声音。"""
+    idx = _sink_idx(NULL_SINK)
+    if idx is None:
+        return
+    n = 0
+    ok, out = _pactl("list", "short", "sink-inputs")
+    for ln in out.splitlines():
+        f = ln.split()
+        if len(f) > 1 and f[1] == idx and _pactl("move-sink-input", f[0], "@DEFAULT_SINK@")[0]:
+            n += 1
+    mid = _null_sink_module()
+    if mid:
+        _pactl("unload-module", mid)
+    audit("audio", "虚拟输出收工: 搬回 %d 路声音, 本机声音已恢复" % n)
+
+
 def _audio_cmd(kind, src):
     """按 kind 组出 ffmpeg 采集命令(固定编码成 MP3 单声道)。"""
     # -fragment_size: pulse 采集每次读取的粒度。默认交给服务端决定, 在 PipeWire 上
@@ -3643,6 +3712,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # 关键: 不能"能打开就用" —— PulseAudio 的 default 常是扬声器回环,
         # 没播声音时是纯静音(实测 max_volume = -91dB)。必须逐个试过去,
         # 挑第一个真的有信号的源。
+        # 只用手机听: 走虚拟输出, 本机一点声音都不出
+        use_null = src in ("silent", "quiet", "onlyphone")
+        _null_forced = False
+        if use_null:
+            ok, msg = silent_sink_ensure()
+            if not ok:
+                self._json({"ok": False, "err": msg})
+                return
+            audit("audio", "只用手机听: " + msg)
+            _null_forced = True
+
         mode = "auto"
         if src in ("sys", "system", "monitor", "sound"):
             mode = "sys"          # 电脑正在放的声音(扬声器回环)
@@ -3663,7 +3743,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             kind, src = mic["kind"], mic["src"]
             audit("audio", f"选源(mic): {kind}:{src}")
         elif mode != "auto" or src in (None, "", "default"):
-            kind, src, _tried = audio_pick_source_cached(mode)
+            if _null_forced:
+                kind, src = "pulse", NULL_SINK + ".monitor"
+            else:
+                kind, src, _tried = audio_pick_source_cached(mode)
             audit("audio", f"选源({mode}): {kind}:{src} "
                            f"(试过 {len(_tried)} 个候选)")
         if kind == "pulse" and src != "default":
@@ -3726,6 +3809,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             stop.set()
             _cam_stop(proc)
+            if use_null:
+                silent_sink_release()      # 必须收工: 否则电脑一直没声音
             with _audio_lock:
                 if _audio_session.get("proc") is proc:
                     _audio_session["proc"] = None
