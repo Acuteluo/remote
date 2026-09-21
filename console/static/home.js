@@ -117,12 +117,18 @@ function render(s) {
   }).join('') || '<div class="kv d">无传感器数据</div>';
 
   // 网络: 当前 Wi-Fi 一行(SSID + 信号) + 各网卡速率前 6 个
+  // WiFi 那行单独排版: 标签独占一行, 内容另起一行且允许换行。
+  // 原来跟别的指标一样挤在 .kv 的"标签左 / 值右"一行里, 而
+  // "SSID · 信号 84% (-58 dBm) · wlp0s20f3" 太长 —— 窄屏上标签被挤没,
+  // 看着就像和 WiFi 名字重叠了。
   const wifiRow = s.wifi
-    ? '<div class="kv"><span class="d">WiFi</span><span>' +
-      `${esc(s.wifi.ssid || '(未命名)')} · 信号 ` +
-      `${s.wifi.pct == null ? '--' : s.wifi.pct + '%'}` +
+    ? '<div class="kv" style="display:block">' +
+      '<span class="d" style="display:block;margin-bottom:2px">WiFi</span>' +
+      '<span style="display:block;line-height:1.55;word-break:break-word">' +
+      esc(s.wifi.ssid || '(未命名)') +
+      ` · 信号 ${s.wifi.pct == null ? '--' : s.wifi.pct + '%'}` +
       `${s.wifi.level == null ? '' : ` (${Number(s.wifi.level).toFixed(0)} dBm)`}` +
-      ` · ${esc(s.wifi.iface)}</span></div>`
+      `<span style="color:var(--dim)"> · ${esc(s.wifi.iface)}</span></span></div>`
     : '';
   $('net').innerHTML = wifiRow + ((s.net || []).slice(0, 6).map(n =>
     `<div class="kv"><span class="d">${n.if}</span><span>↓${fmtRate(n.rx)} ↑${fmtRate(n.tx)}</span></div>`
