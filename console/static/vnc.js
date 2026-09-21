@@ -2110,8 +2110,10 @@ document.addEventListener('webkitfullscreenchange', fsSync);
     const n = document.getElementById('vol-note');
     if (l) l.textContent = silent ? '输出音量' : '电脑音量';
     if (n) n.textContent = silent
-      ? '这是"发给手机的音量" —— 模拟输出下声音走虚拟输出设备, 电脑本身不出声; 手机自己的音量键照常可用, 两级互不冲突。'
+      ? '模拟输出: 电脑音量被钉在 2%(1% 会被硬件舍入成 0% 而掐断转发), 听不见但转发仍是满幅信号; 锁定不可调以免拖到 0。手机上用你自己的音量键调, 切回电脑输出即可解锁。'
       : '调的是电脑本机的扬声器音量(不限于这次远程会话), 换手机打开也是同一个值; 超过 100% 会变红(软件放大, 可能失真), 拖到 0 即静音。';
+    const v = document.getElementById('set-vol');
+    if (v) v.disabled = silent;
   }
   function mark(mode) {
     btns.forEach((b) => b.classList.toggle('on', b.dataset.ao === mode));
@@ -2127,6 +2129,7 @@ document.addEventListener('webkitfullscreenchange', fsSync);
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ mode: b.dataset.ao }),
     }).catch(() => {});
+    if (typeof refreshVolume === 'function') setTimeout(refreshVolume, 400);
   }));
 })();
 

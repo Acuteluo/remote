@@ -1746,6 +1746,10 @@ class Collector:
         return snap
 
 
+try:
+    silent_sink_release()      # 启动清理: 以前版本可能留下 meow_silent, 别再影响系统
+except Exception:
+    pass
 COLLECTOR = Collector()
 COLLECTOR.cpu()          # 预热采样, 让首屏就有 CPU 数据
 COLLECTOR.procs()
@@ -2989,6 +2993,10 @@ def get_pc_volume():
 
 def set_pc_volume(pct):
     """设默认输出设备主音量为 pct(0~150 整数)。返回 (ok, msg)。"""
+    if audio_out_mode() == "silent":
+        # 锁定在 1%: 免得手滑拖到 0 —— 0%/静音会让 monitor 一起静音, 手机就听不到了。
+        # 切回「电脑输出」即可解锁, 那时可以从 1% 往上调。
+        return False, "模拟输出模式下音量锁定在 %d%%(切回电脑输出才能调)" % SILENT_VOL
     sink = _volume_target()
     if not sink:
         return False, "找不到默认输出设备(pactl get-default-sink 无输出)"
@@ -3353,6 +3361,7 @@ def audio_first_usable_mic():
 # 直接采硬件 sink 的 monitor 时, **本机一静音 monitor 就没声了**(用户实测确认),
 # 所以想"电脑静音但手机能听"必须换条路: 建一个 null sink(数据没人播 -> 一点声音
 # 都不出), 把正在播放的流挪过去, 再采它的 monitor。
+SILENT_VOL = 2        # "模拟输出"钉住的电脑音量(%, 听不见但有信号)
 NULL_SINK = "meow_silent"
 # 进"只发手机"前用户原本的默认输出, 收工时还回去
 _NULL_PREV_DEFAULT = {"sink": ""}
@@ -3797,11 +3806,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # 挑第一个真的有信号的源。
         # 只用手机听: 走虚拟输出, 本机一点声音都不出
         # 走虚拟输出的两种情况: 显式请求(src=silent) 或 设置里选了"只发手机"
-        use_null = (src in ("silent", "quiet", "onlyphone")
-                    or audio_out_mode() == "silent")
-        if not use_null:
-            # 兜底: 曾经进过模拟输出、但模式已经切回电脑输出(或有别的残留)时, 顺手收工
-            silent_sink_release()
+        # 2026-09-22: 虚拟输出那套**弃用**了。改成"模拟输出 = 电脑音量钉在 1%",
+        # 简单得多也没有搬流的副作用。这里固定 False, 并顺手清理历史残留。
+        use_null = False
+        silent_sink_release()
         _null_forced = False
         if use_null:
             ok, msg = silent_sink_ensure()
@@ -4090,6 +4098,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json({"ok": False, "vol": None,
                             "err": "读不到电脑音量(没有 pulseaudio 或 pactl)"})
             else:
+                v["locked"] = (audio_out_mode() == "silent")
                 self._json({"ok": True, **v})
         elif path == "/api/brightness":
             # 屏幕亮度: 值是滑块写的、存在 config.json(和音量一套做法)
@@ -4394,12 +4403,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if mode not in ("pc", "silent"):
                 self._json({"ok": False, "err": "mode 只能是 pc 或 silent"})
                 return
+            if mode == "silent":
+                # 「模拟输出」= 把电脑音量钉在 1% + 锁定。
+                # 用户实测发现的巧办法: 1% 已经听不见, 而 monitor **仍有满幅信号**;
+                # 只有 0%/静音才会让 monitor 一起静音(那手机就没声了)。所以根本不需要
+                # 虚拟输出那套搬流 —— 简单、且没有副作用。
+                # 注意用 2% 而不是 1%: 实测这块 HDA 上 1% 会被 ALSA 混合器舍入成 0%,
+                # 而 0% 会让 monitor 一起静音(手机就没声了)。2% 听不见但一定有信号。
+                set_pc_volume(SILENT_VOL)   # 必须在存 mode 之前(下面会按 mode 拦)
+            else:
+                silent_sink_release()     # 顺手清掉以前遗留的 meow_silent
             save_config({"audioOut": mode})
-            if mode == "pc":
-                # ★ 立刻把声音搬回来。否则: 正在跑的那路流还占着虚拟输出, 默认输出
-                #   也还指着它 —— 表现就是"设置切回电脑输出了, 电脑却没声音"(用户报的 bug)。
-                silent_sink_release()
-            audit("audio", "声音去向 -> " + ("模拟输出(电脑静音, 只发手机)"
+            audit("audio", "声音去向 -> " + ("模拟输出(电脑音量钉在 %d%%)" % SILENT_VOL
                                             if mode == "silent" else "电脑输出"))
             self._json({"ok": True, "mode": mode})
         elif path == "/api/bg":
