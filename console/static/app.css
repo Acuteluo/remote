@@ -183,3 +183,8 @@ button:disabled { transform: none; opacity: .5 }
     animation-duration: .001ms !important; animation-iteration-count: 1 !important;
     transition-duration: .001ms !important }
 }
+
+/* 持久性开关按钮的"点亮"态: 和剪贴板/键盘/触控板一致 —— 主题色铺满、文字转深色。
+   统一在这里兜一道, 免得以后新加的开关按钮忘了写 .on 样式。 */
+.topbar button.on, .vnc-toolbar button.on {
+  background: var(--acc); color: #04121f; border-color: transparent; font-weight: 700 }

@@ -1298,6 +1298,8 @@ document.querySelectorAll('#set-panel .seg.q button').forEach((b) => {
 $('vnc-setbtn').addEventListener('click', () => {
   const p = $('set-panel');
   p.style.display = p.style.display === 'none' ? 'block' : 'none';
+  // 持久性的开关要能看出"现在是开着的": 和剪贴板/键盘那些一样点亮(主题色铺满)
+  $('vnc-setbtn').classList.toggle('on', p.style.display === 'block');
   if (p.style.display === 'block') {
     refreshDockState(); refreshVncClients(); refreshVolume(); refreshBrightness();
   }
