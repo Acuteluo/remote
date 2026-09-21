@@ -2993,10 +2993,6 @@ def get_pc_volume():
 
 def set_pc_volume(pct):
     """设默认输出设备主音量为 pct(0~150 整数)。返回 (ok, msg)。"""
-    if audio_out_mode() == "silent":
-        # 锁定在 1%: 免得手滑拖到 0 —— 0%/静音会让 monitor 一起静音, 手机就听不到了。
-        # 切回「电脑输出」即可解锁, 那时可以从 1% 往上调。
-        return False, "模拟输出模式下音量锁定在 %d%%(切回电脑输出才能调)" % SILENT_VOL
     sink = _volume_target()
     if not sink:
         return False, "找不到默认输出设备(pactl get-default-sink 无输出)"
@@ -4099,7 +4095,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json({"ok": False, "vol": None,
                             "err": "读不到电脑音量(没有 pulseaudio 或 pactl)"})
             else:
-                v["locked"] = (audio_out_mode() == "silent")
                 self._json({"ok": True, **v})
         elif path == "/api/brightness":
             # 屏幕亮度: 值是滑块写的、存在 config.json(和音量一套做法)
@@ -4413,7 +4408,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 silent_sink_release()     # 顺手清掉以前遗留的 meow_silent
             save_config({"audioOut": mode})
-            audit("audio", "声音去向 -> " + ("模拟输出(电脑音量钉在 %d%%)" % SILENT_VOL
+            audit("audio", "声音去向 -> " + ("模拟输出(电脑音量一键设为 %d%%)" % SILENT_VOL
                                             if mode == "silent" else "电脑输出"))
             self._json({"ok": True, "mode": mode})
         elif path == "/api/bg":
