@@ -118,7 +118,15 @@ table.tbl td.num, table.tbl th.num { text-align: right; }
 /* ---- 终端页 ---- */
 body.term-page { display: flex; flex-direction: column; height: 100dvh; overflow: hidden; }
 body.term-page .topbar { flex: none; }
-#terminal { flex: 1; min-height: 0; padding: 4px 6px; }
+/* 终端: 画布透明(xterm 主题已改成透明), 这里垫一层和别的面板同样的半透明卡片 ——
+   底图透出来, 纯文字又不会压在照片上看不清; 透出多少由"背景透明度"统一控制
+   (--panel-a, 见 server.py 的 bg_css)。 */
+#terminal { flex: 1; min-height: 0; padding: 4px 6px; margin: 6px 8px;
+  background: var(--card); border: 1px solid var(--line); border-radius: var(--r); }
+/* xterm.css 把这两处写死成 #000 了(它自己排在 app.css 后面, 所以这里必须显式盖);
+   不盖的话整块还是黑的, 底图看不见。 */
+.xterm .xterm-viewport, .xterm .xterm-screen { background-color: transparent; }
+.xterm .composition-view { background: transparent; }
 #term-status { font-size: 12px; color: var(--dim); }
 .qkbar { flex: none; display: flex; gap: 6px; padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
   overflow-x: auto; background: var(--card); border-top: 1px solid var(--line); }

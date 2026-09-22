@@ -12,10 +12,16 @@ const term = new Terminal({
   fontFamily: '"Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace',
   cursorBlink: true,
   scrollback: 5000,
+  // 背景跟着全局的自定义背景走(原来是写死的 #0b0f14 -> 整屏全黑)。
+  // 画布透明 + 页面那层半透明面板(#terminal, 见 app.css) = 底图透出来,
+  // 文字又不会被照片晃得看不清; 透出多少由设置里"背景透明度"统一控制。
+  // allowTransparency 是 xterm 允许画布透明的开关, 不开的话某些渲染器仍会
+  // 自己铺一层不透明底色。
+  allowTransparency: true,
   theme: {
-    background: '#0b0f14', foreground: '#dce6f2', cursor: ACC,
+    background: 'rgba(0,0,0,0)', foreground: '#dce6f2', cursor: ACC,
     selectionBackground: '#264f78',
-    black: '#0b0f14', red: '#ff6b6b', green: '#3ecf8e', yellow: '#ffb454',
+    black: '#5a6a7d', red: '#ff6b6b', green: '#3ecf8e', yellow: '#ffb454',
     blue: ACC, magenta: '#c792ea', cyan: '#56d4dd', white: '#dce6f2',
   },
 });
