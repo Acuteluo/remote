@@ -1131,6 +1131,12 @@ class WSConn:
         # 只发 ping 不看 pong 是没用的: 手机锁屏/切网后连接会变成半死状态,
         # 数据发得出去(TCP 缓冲收着), 但对端早就不处理了。
         self.last_pong = time.time()
+        self.ping_rtt_ms = None
+        self._ping_payload = None
+        self._ping_started = 0.0
+        self.send_started = None
+        self.last_send_ms = 0.0
+        self.last_send_at = 0.0
 
     # ---- 发送
     def send_frame(self, opcode, payload=b""):
@@ -1155,7 +1161,10 @@ class WSConn:
 
     def ping(self):
         try:
-            self.send_frame(0x9, b"hb")
+            # 包括等待发送锁的耗时，反映画面通道实际拥堵。
+            self._ping_started = time.monotonic()
+            self._ping_payload = b"hb" + struct.pack(">d", self._ping_started)
+            self.send_frame(0x9, self._ping_payload)
         except OSError:
             self.alive = False
 
@@ -1200,6 +1209,8 @@ class WSConn:
                 continue
             if opcode == 0xA:
                 self.last_pong = time.time()
+                if self._ping_payload is not None and data == self._ping_payload:
+                    self.ping_rtt_ms = (time.monotonic() - self._ping_started) * 1000
                 continue
             if opcode in (0x1, 0x2):
                 if msg_op is not None:
@@ -1932,6 +1943,21 @@ def _hb(ws):
 MAX_VNC_BRIDGES = 2
 _vnc_lock = threading.Lock()
 _vnc_bridges = []            # [[创建时间, teardown, 本地端口], ...] 按时间升序
+_vnc_network = {}            # viewer id -> WSConn；桥接退出时移除
+
+
+def vnc_network_stats(viewer):
+    with _vnc_lock:
+        ws = _vnc_network.get(viewer)
+        if ws is None:
+            return {"active": False}
+        now = time.monotonic()
+        started = ws.send_started
+        pending_ms = (now - started) * 1000 if started is not None else 0
+        recent_ms = ws.last_send_ms if now - ws.last_send_at < 10 else 0
+        return {"active": ws.alive, "rttMs": ws.ping_rtt_ms,
+                "sendMs": max(pending_ms, recent_ms),
+                "pongAgeMs": (time.time() - ws.last_pong) * 1000}
 
 
 def _vnc_register(teardown, port=None):
@@ -1963,7 +1989,7 @@ def _vnc_unregister(teardown):
                 break
 
 
-def ws_vnc_bridge(ws):
+def ws_vnc_bridge(ws, viewer=""):
     """浏览器 noVNC <-> 127.0.0.1:VNC_PORT x11vnc 双向搬运。
 
     2026-09-14 加固(针对"用一会儿就卡/要刷新"):
@@ -2019,6 +2045,9 @@ def ws_vnc_bridge(ws):
             pass
 
     _vnc_register(teardown, vnc_port)
+    if viewer:
+        with _vnc_lock:
+            _vnc_network[viewer] = ws
 
     def v2w():
         import select as _select
@@ -2059,7 +2088,13 @@ def ws_vnc_bridge(ws):
                         if not more:
                             break
                         data += more
-                ws.send_binary(data)
+                ws.send_started = time.monotonic()
+                try:
+                    ws.send_binary(data)
+                    ws.last_send_ms = (time.monotonic() - ws.send_started) * 1000
+                    ws.last_send_at = time.monotonic()
+                finally:
+                    ws.send_started = None
         except (OSError, WSClosed):
             pass
         finally:
@@ -2118,6 +2153,10 @@ def ws_vnc_bridge(ws):
     if stuck:
         audit("vnc", f"桥接线程未及时退出: {','.join(stuck)} (可能有连接残留)")
     _vnc_unregister(teardown)           # 主动退出也要撤下登记, 别占着名额
+    if viewer:
+        with _vnc_lock:
+            if _vnc_network.get(viewer) is ws:
+                del _vnc_network[viewer]
     try:
         vnc.close()
     except OSError:
@@ -4313,7 +4352,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ws = self._ws(protocols=["binary"])
             if ws:
                 audit("vnc", "远程桌面连接 from " + _who(self))
-                ws_vnc_bridge(ws)
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                viewer = q.get("viewer", [""])[0][:80]
+                ws_vnc_bridge(ws, viewer)
+        elif path == "/api/vnc/network":
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            self._json({"ok": True, **vnc_network_stats(q.get("viewer", [""])[0])})
         elif path == "/api/vnc/clients":
             # 诊断用: x11vnc 上当前几个客户端(正常 1)。数字偏大 = 有遗留连接。
             self._json({"ok": True, "clients": vnc_client_count(),

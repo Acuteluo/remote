@@ -73,6 +73,7 @@ let reconnectTimer = 0;
 let hideTimer = 0;
 let autoSaver = false;
 let slowSamples = 0, fastSamples = 0;
+let viewerId = '', streamRtt = null;
 
 // ---- 图传实际帧率/码率 ----
 // 为什么要显示这个: "延迟 <50ms 但画面很卡"是很常见的情况 —— 延迟量的是
@@ -99,6 +100,8 @@ function connect() {
   releaseOverlay();
 
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  viewerId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+  streamRtt = null;
   // 统计码率: 临时包一层 WebSocket 数收到的字节数 —— noVNC 在构造 RFB 时
   // 就会建连, 所以只在这几行里替换, 建完立刻还原, 不影响别的地方。
   const NativeWS = window.WebSocket;
@@ -119,7 +122,7 @@ function connect() {
   let r;
   try {
     window.WebSocket = CountingWS;
-    r = new RFB($('screen'), `${proto}://${location.host}/ws/vnc`, { shared: true });
+    r = new RFB($('screen'), `${proto}://${location.host}/ws/vnc?viewer=${viewerId}`, { shared: true });
   } finally {
     window.WebSocket = NativeWS;
   }
@@ -241,8 +244,7 @@ window.addEventListener('online', () => {
 
 // ================= 右上角实时延迟 =================
 // 用 /api/health 做一次极小请求测往返(HTTP RTT)。
-// 为什么不测 VNC 那条 WebSocket: 它是原始 RFB 字节流, 塞自定义消息会污染协议;
-// 而延迟的大头本来就是网络往返, HTTP RTT 完全能代表, 顺带还验证了服务端活着。
+// HTTP 测请求往返；服务端另外测 WebSocket 控制帧往返，不向 RFB 字节流塞消息。
 // 5s 一次 + 指数平滑(避免数字乱跳); 点一下立刻重测。
 let pingEma = 0, pingTimer = 0, pingBusy = false;
 
@@ -258,28 +260,13 @@ function renderPing(ms) {
     el.textContent = '网络 ' + Math.round(ms) + 'ms';
     el.className = 'ping ' + (ms < 80 ? 'ok' : ms < 200 ? 'warn' : 'bad');
   }
-  el.title = '网络延迟(HTTP 往返)。画面延时还要加上服务端变更检测和手机解码, '
-    + '看旁边那一栏';
+  el.title = '网络数值为 HTTP 往返；旁边图传数值为画面连接的 WebSocket 心跳往返。';
   renderFsInfo();
 }
 
-// ---- 图传帧率 / 码率 / 画面延时 ----
+// ---- 图传帧率 / 码率 / 通道往返 ----
 // 每秒刷新一次。**卡不卡看帧率, 不看延迟**。
 let lastKbs = 0, lastFps = 0;
-
-// 画面延时是**估算**, 不是实测 —— 只有网络那一段是真量出来的:
-//   网络单程            = HTTP RTT/2                         实测
-//   服务端变更检测      = x11vnc -wait 5 -defer 5, 最坏 10ms  由服务单元参数决定
-//   编码 + 手机解码渲染 = 约 15ms                             经验值, 没有接口可测
-// 常数 25ms = 10 + 15。它只保证"量级对"(几十毫秒), 不是标定过的真值:
-// 换台手机、换个码率, 那 15ms 就会变。真值只能拿高速摄像机拍屏幕。
-const PIC_SERVER_MS = 10;      // x11vnc -wait 5 -defer 5 的上界
-const PIC_CLIENT_MS = 15;      // JPEG 编码 + 手机解码合成, 经验值
-const PIC_FIXED_MS = PIC_SERVER_MS + PIC_CLIENT_MS;
-
-function picLatency() {
-  return pingEma ? Math.round(pingEma / 2 + PIC_FIXED_MS) : null;
-}
 
 function renderFsInfo() {
   const el = $('vnc-fs-info');
@@ -291,8 +278,7 @@ function renderFsInfo() {
                                : lastKbs.toFixed(0) + 'KB/s');
   }
   parts.push(pingEma ? '网络 ' + Math.round(pingEma) + 'ms' : '网络 --');
-  const pic = picLatency();
-  if (pic != null) parts.push('画面 ' + pic + 'ms');
+  if (streamRtt != null) parts.push('图传往返 ' + Math.round(streamRtt) + 'ms');
   el.textContent = parts.join(' · ');
 }
 
@@ -302,21 +288,16 @@ function renderRate(fps, kbs) {
   lastKbs = kbs;
   if (el) {
     if (!connected) {
-      el.textContent = '画面 --';
+      el.textContent = '图传 --';
       el.className = 'ping bad';
     } else {
-      const f = fps >= 10 ? 0 : (fps >= 5 ? 1 : 2);
-      const pic = picLatency();
-      // 顶栏只放"画面 xx ms"。手机顶栏只有 ~390px, 原来那句
-      // "41fps · 画面 33ms" 会把"返回/远程桌面"挤成**竖排单字**。
-      // 帧率/码率不丢, 挪到 tooltip 和全屏信息栏里(那边一整行, 够宽)。
-      el.textContent = pic == null ? '画面 --' : `画面 ${pic}ms`;
+      // 心跳与画面共用连接，包含网络和排队耗时；静止画面0fps不算故障。
+      el.textContent = streamRtt == null ? '图传 --' : `图传 ${Math.round(streamRtt)}ms`;
       el.title = `图传帧率 ${fps.toFixed(1)} fps，码率 ${kbs >= 1024
         ? (kbs / 1024).toFixed(2) + ' MB/s' : kbs.toFixed(0) + ' KB/s'}\n`
-        + `画面延时估算 ≈ 网络单程 + ${PIC_FIXED_MS}ms`
-        + `（服务端变更检测≤${PIC_SERVER_MS}ms + 编码/手机解码约${PIC_CLIENT_MS}ms，`
-        + '后两项是经验值，不是实测）';
-      el.className = 'ping ' + (f === 0 ? 'ok' : f === 1 ? 'warn' : 'bad');
+        + '图传数值为 WebSocket 心跳往返，含排队耗时；每20秒测量一次，并非画面渲染延时。';
+      el.className = 'ping ' + (streamRtt == null || streamRtt < 200
+        ? 'ok' : streamRtt < 500 ? 'warn' : 'bad');
     }
   }
   renderFsInfo();
@@ -346,14 +327,31 @@ async function pingOnce() {
   if (pingBusy) return;
   pingBusy = true;
   const t0 = performance.now();
+  const viewer = viewerId;
   try {
-    const response = await fetchAbort('/api/health?t=' + Date.now(), 10000);
+    let response = await fetchAbort('/api/vnc/network?viewer=' + viewer, 10000);
+    // 兼容尚未重载的服务端；前端补丁可先刷新使用。
+    if (response.status === 404) response = await fetchAbort('/api/health?t=' + Date.now(), 10000);
     if (!response.ok) throw new Error('健康检查失败');
+    const channel = await response.json();
+    if (viewer !== viewerId) return;
     const ms = performance.now() - t0;
     pingEma = pingEma ? pingEma * 0.6 + ms * 0.4 : ms;
-    updateAutoSaver(ms);
+    streamRtt = typeof channel.rttMs === 'number' ? channel.rttMs : null;
+    const congestion = Math.max(ms, streamRtt ?? 0, channel.sendMs ?? 0);
+    updateAutoSaver(congestion);
+    if (connected && channel.active === false) {
+      setStatus('画面连接失效，重连中…');
+      connect();
+      return;
+    }
+    if (connected) setStatus(congestion >= 1000
+      ? (autoSaver ? '图传拥堵 · 自动省流' : '图传拥堵') : '已连接');
     renderPing(S.showPing ? pingEma : null);
   } catch (e) {
+    if (viewer !== viewerId) return;
+    updateAutoSaver(10000);
+    if (connected) setStatus('网络响应超时');
     renderPing(null);
   } finally {
     pingBusy = false;

@@ -89,6 +89,8 @@ check("GET /api/health", st == 200 and b"meow-console" in body)
 
 st, hdrs, _ = req("GET", "/api/screen")
 check("GET /api/screen 需登录", st in (301, 302), f"-> {st}")
+st, _, _ = req("GET", "/api/vnc/network?viewer=test")
+check("图传诊断需登录", st in (301, 302), f"-> {st}")
 
 # 登录拿 cookie
 st, _, body = req("POST", "/login", login_body(),
@@ -102,6 +104,8 @@ cookie = (r.getheader("Set-Cookie") or "").split(";")[0]
 c.close()
 check("登录成功", cookie.startswith("meow_session="), cookie[:20] + "…")
 CK = {"Cookie": cookie}
+st, _, body = req("GET", "/api/vnc/network?viewer=missing", headers=CK)
+check("失效图传返回明确状态", st == 200 and json.loads(body) == {"ok": True, "active": False})
 
 st, _, body = req("GET", "/api/dock", headers=CK)
 j = json.loads(body)
