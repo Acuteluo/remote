@@ -3579,6 +3579,33 @@ def audio_out_mode():
     return "silent" if v == "silent" else "pc"
 
 
+def set_audio_out_mode(mode):
+    """执行并确认声音去向变更；真实状态确认通过前不持久化模式。"""
+    if mode == "silent":
+        ok, msg = set_pc_volume(SILENT_VOL)
+        if not ok:
+            return False, msg
+        actual = get_pc_volume()
+        if actual is None:
+            return False, "音量命令已执行，但读回失败，未切换声音去向"
+        if actual.get("vol") != SILENT_VOL:
+            return False, f"音量读回为 {actual.get('vol')}%，未达到 {SILENT_VOL}%，未切换声音去向"
+    elif mode == "pc":
+        silent_sink_release()
+        sink = _default_sink_name()
+        if not sink or sink == NULL_SINK:
+            return False, "恢复电脑输出失败：默认输出设备未恢复"
+    else:
+        return False, "mode 只能是 pc 或 silent"
+
+    ok, msg, _cfg = save_config({"audioOut": mode})
+    if not ok:
+        return False, f"声音去向已调整，但配置保存失败：{msg}"
+    audit("audio", "声音去向 -> " + ("模拟输出(电脑音量一键设为 %d%%)" % SILENT_VOL
+                                    if mode == "silent" else "电脑输出"))
+    return True, mode
+
+
 def silent_sink_ensure():
     """确保虚拟输出存在, 并把正在播放的流都搬过去。返回 (ok, 说明)。"""
     if _sink_idx(NULL_SINK) is None:
@@ -4765,18 +4792,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if mode not in ("pc", "silent"):
                 self._json({"ok": False, "err": "mode 只能是 pc 或 silent"})
                 return
-            if mode == "silent":
-                # 「模拟输出」= 把电脑音量钉在 1% + 锁定。
-                # 用户实测发现的巧办法: 1% 已经听不见, 而 monitor **仍有满幅信号**;
-                # 只有 0%/静音才会让 monitor 一起静音(那手机就没声了)。所以根本不需要
-                # 虚拟输出那套搬流 —— 简单、且没有副作用。
-                set_pc_volume(SILENT_VOL)   # 必须在存 mode 之前(下面会按 mode 拦)
-            else:
-                silent_sink_release()     # 顺手清掉以前遗留的 meow_silent
-            save_config({"audioOut": mode})
-            audit("audio", "声音去向 -> " + ("模拟输出(电脑音量一键设为 %d%%)" % SILENT_VOL
-                                            if mode == "silent" else "电脑输出"))
-            self._json({"ok": True, "mode": mode})
+            ok, msg = set_audio_out_mode(mode)
+            self._json({"ok": ok, "mode": mode if ok else audio_out_mode(),
+                        "err": "" if ok else msg})
         elif path == "/api/bg":
             # 两种 body: 图片二进制(Content-Type: image/*) / JSON(参数或清除)
             # 两种 body, 都是 JSON: 图片(base64, 键 img) / 参数或清除。

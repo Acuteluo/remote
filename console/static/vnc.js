@@ -509,13 +509,26 @@ function flushType() {
   if (typeBusy) return;                  // 上一批还没落地; 回来时 .finally 会续上
   // 文本和特殊按键共用顺序队列，回车不能抢在 HTTP 文本前抵达。
   while (typeof typeBuf[0] === 'function') {
-    try { typeBuf.shift()(); }
+    try {
+      const pending = typeBuf.shift()();
+      if (pending && typeof pending.then === 'function') {
+        typeBusy = true;
+        Promise.resolve(pending).catch((e) => {
+          releaseHold(); typeBuf = []; showTypeErr(e.message);
+        }).finally(() => {
+          typeBusy = false;
+          if (typeBuf.length) flushType();
+        });
+        return;
+      }
+    }
     catch (e) { typeBuf = []; showTypeErr(e.message); return; }
   }
   const text = [];
   while (typeBuf.length && typeof typeBuf[0] === 'string') text.push(typeBuf.shift());
   const s = text.join('');
   if (!s) return;
+  releaseHold();                         // 切窗后再键入时不能仍按着 Alt
   typeBusy = true;
   const ac = new AbortController();
   // 15 秒足够本地 xdotool 敲完 normal 批次(5000 字约 10 秒)。别设太长 ——
@@ -646,6 +659,7 @@ function sendSpecial(name) {
   clearMods();
   typeBuf.push(() => {
     if (!canSend() || rfb !== target) throw new Error('按键未发送：画面连接已改变');
+    releaseHold();
     for (const m of held) target.sendKey(m.keysym, m.code, true);
     target.sendKey(t[0], t[1], true);
     target.sendKey(t[0], t[1], false);
@@ -670,7 +684,7 @@ document.querySelectorAll('#keybar [data-key]').forEach((b) => {
 // 旧实现 Alt↓ Tab↓ Tab↑ Alt↑ 一股脑连发, 切换器常常还没被抓住就结束了 ——
 // 表现就是"点 Alt+Tab 没反应, 或者闪一下就没了"。
 const HOLD_COMBO = { 'alt+tab': 900 };
-const holdState = { combo: null, timer: 0, target: null, token: 0 };
+const holdState = { combo: null, timer: 0, target: null, token: 0, key: null };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function releaseHold() {
@@ -680,10 +694,15 @@ function releaseHold() {
   const [modk] = st.combo.split('+');
   const m = MODS.find((x) => x.key === modk);
   const target = st.target;
+  const key = st.key;
   st.combo = null;
   st.target = null;
+  st.key = null;
   st.token++;
-  if (m && canSend() && rfb === target) target.sendKey(m.keysym, m.code, false);
+  if (canSend() && rfb === target) {
+    if (key) target.sendKey(key[0], key[1], false);
+    if (m) target.sendKey(m.keysym, m.code, false);
+  }
 }
 
 document.querySelectorAll('#keybar [data-combo]').forEach((b) => {
@@ -705,6 +724,7 @@ document.querySelectorAll('#keybar [data-combo]').forEach((b) => {
       clearMods();
       typeBuf.push(() => {
         if (!canSend() || rfb !== target) throw new Error('快捷键未发送：画面连接已改变');
+        releaseHold();
         for (const m of held) target.sendKey(m.keysym, m.code, true);
         target.sendKey(ks, code, true);
         target.sendKey(ks, code, false);
@@ -717,6 +737,8 @@ document.querySelectorAll('#keybar [data-combo]').forEach((b) => {
     const m = held[0];
     const target = rfb;
     clearMods();                                   // 别让粘滞修饰键混进来
+    typeBuf.push(async () => {
+    if (!canSend() || rfb !== target) throw new Error('切窗键未发送：画面连接已改变');
     if (holdState.combo !== combo || holdState.target !== target) {
       if (holdState.combo) releaseHold();
       holdState.combo = combo;
@@ -724,15 +746,19 @@ document.querySelectorAll('#keybar [data-combo]').forEach((b) => {
       target.sendKey(m.keysym, m.code, true);
       const token = holdState.token;
       await sleep(50);                             // 让 X 先认下 Alt
-      if (!canSend() || rfb !== target || holdState.token !== token) return;
+      if (!canSend() || rfb !== target || holdState.token !== token) throw new Error('切窗操作已取消：连接或页面状态已改变');
     }
     const token = holdState.token;
+    holdState.key = [ks, code];
     target.sendKey(ks, code, true);                   // 再点一次就再往后切一个
     await sleep(60);
-    if (!canSend() || rfb !== target || holdState.token !== token) return;
+    if (!canSend() || rfb !== target || holdState.token !== token) throw new Error('切窗操作已取消：连接或页面状态已改变');
     target.sendKey(ks, code, false);
+    holdState.key = null;
     clearTimeout(holdState.timer);
     holdState.timer = setTimeout(releaseHold, hold);
+    });
+    flushType();
   });
 });
 
