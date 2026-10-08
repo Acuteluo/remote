@@ -1004,6 +1004,15 @@ def _resolve_mode(mode):
     return "term" if _focus_is_terminal() else "paste"
 
 
+def _paste_combo(mode):
+    """按当前窗口选择粘贴键；老 xterm 使用 Shift+Insert。"""
+    if mode != "term":
+        return "ctrl+v"
+    cls = _focus_key()
+    return "shift+Insert" if "xterm" in cls and "gnome" not in cls \
+        else "ctrl+shift+v"
+
+
 def _remember_mode_for_class(mode):
     """把用户这次的选择记到当前窗口类名上, 下次自动用。"""
     key = _focus_key()
@@ -1032,10 +1041,8 @@ def deliver_text(text, req_mode=None):
 
     # 终端**不认 Ctrl+V**。VTE(gnome-terminal/kgx/tilix/terminator/xfce4-terminal)、
     # kitty、alacritty、konsole、foot 用 Ctrl+Shift+V; 老 xterm 只能 Shift+Insert。
-    if mode == "term" or (mode == "auto" and _focus_is_terminal()):
-        cls = _focus_key()
-        combo = "shift+Insert" if "xterm" in cls and "gnome" not in cls \
-            else "ctrl+shift+v"
+    if mode == "term":
+        combo = _paste_combo(mode)
         ok, msg = _paste_raw(text, combo)
         if ok:
             return True, msg, f"粘贴({combo})"
@@ -1087,23 +1094,11 @@ def type_text(text):
     return _xin_submit(lambda: _type_raw(text), budget=20.0 + len(text) * 0.02)
 
 
-def _ctrl_v_raw():
-    # 同步等它敲完再返回: 队列的意义就在于"前一个动作真的落地了才做下一个",
-    # 这里若 fire-and-forget, 后面的键入就可能插到 Ctrl+V 之前。
-    try:
-        p = subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+v"],
-                           env=x_env(), capture_output=True, timeout=20)
-    except (OSError, subprocess.SubprocessError) as e:
-        return False, str(e)
-    return p.returncode == 0, ("已发送 Ctrl+V" if p.returncode == 0
-                               else p.stderr.decode("utf-8", "replace")[:200])
-
-
-def send_ctrl_v():
-    """发 Ctrl+V。同样进队列: --clearmodifiers 会改修饰键状态, 不能和键入交错。"""
+def send_paste_key(combo):
+    """只发粘贴键；与文本投递共用队列，避免按键交错。"""
     if not shutil.which("xdotool"):
         return False, "xdotool 未安装"
-    return _xin_submit(_ctrl_v_raw, budget=15.0)
+    return _xin_submit(lambda: _combo_raw(combo), budget=15.0)
 
 
 # ---------------------------------------------------------------- WebSocket
@@ -4179,7 +4174,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path == "/api/health":
             # boot: 本进程的启动标识, 前端靠它判断"服务是否真的换了进程"
-            self._json({"ok": True, "app": "meow-console", "boot": BOOT_ID})
+            self._json({"ok": True, "app": "meow-console", "boot": BOOT_ID,
+                        "inputVersion": 2})
             return
         if path.startswith("/static/"):
             # 静态资源不含敏感信息, 放在鉴权前 —— 否则登录页 CSS 会被重定向
@@ -4658,15 +4654,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                           f"{'OK' if ok else 'FAIL: ' + str(msg)[:60]}")
             self._json({"ok": ok, "msg": msg})
         elif path == "/api/paste":
-            # 关键: 设置剪贴板和发 Ctrl+V 必须在服务端一次做完。
-            # 旧实现是前端先 rfb.clipboardPasteFrom() 再立刻 fetch /api/paste,
-            # 两条路完全异步 —— Ctrl+V 常常在选区还没换过来时就按下去了,
-            # 粘出来的是上一次的内容。
+            # 按当前焦点窗口选粘贴键；设剪贴板与按键必须在同一个串行任务里。
+            combo = _paste_combo(_resolve_mode(_type_mode()))
             text = data.get("text")
             if isinstance(text, str) and text:
-                ok, msg = clip_set(text)
+                # 面板的“粘贴”原本会保留写入的远端剪贴板；只把设值与按键
+                # 合成一个队列任务，不改变这个语义。
+                ok, msg = _xin_submit(lambda: _paste_job(text, combo), budget=20.0)
                 if not ok:
-                    # 设不上选区(远端有程序占着/没有 xclip)就只能退化成逐字键入。
+                    # 选区或粘贴键失败时退化成逐字键入。
                     # 但键入是每字 ~4ms, 8000 字要敲 40 秒 —— 期间界面一直停在
                     # "粘贴中…", 看着就跟卡死一样(实测到的"粘贴卡死"就是这个)。
                     # 长文本直接报错, 把选择权还给用户。
@@ -4681,8 +4677,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._json({"ok": ok2, "msg": "剪贴板不可用, 已直接键入" if ok2
                                 else f"失败: {msg} / {msg2}"})
                     return
-            ok, msg = send_ctrl_v()
-            audit("clip", f"粘贴 {len(text) if isinstance(text, str) else 0} 字")
+            else:
+                ok, msg = send_paste_key(combo)
+            audit("clip", f"粘贴({combo}) {len(text) if isinstance(text, str) else 0} 字")
             self._json({"ok": ok, "msg": msg})
         elif path == "/api/vnc/reset":
             # 一键清理并重启: 先回响应, 再重启服务(见 _restart_soon)。

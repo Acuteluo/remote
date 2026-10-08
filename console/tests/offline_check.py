@@ -21,6 +21,7 @@ import http.client
 import http.server
 import socket
 import json
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONSOLE = os.path.dirname(HERE)
@@ -40,7 +41,7 @@ def check(name, cond, extra=""):
 
 
 # ---- 1) 无 X 会话下的降级行为 -------------------------------------------
-print("== 降级行为(本沙箱没有 X 会话, 这些调用必须不抛异常) ==")
+print("== 降级行为(模拟无 X 会话，不触碰正在运行的桌面) ==")
 try:
     w, h = srv_mod.screen_size()
     check("screen_size() 不抛异常", True, f"-> {w}x{h}")
@@ -48,12 +49,12 @@ except Exception as e:
     check("screen_size() 不抛异常", False, repr(e))
 
 try:
-    ok, msg = srv_mod.edge_nudge("bottom", 480, 269, 960, 540)
-    # 有真实 X 会话时会成功钉指针; 没有时会优雅返回 False。两者都不能抛异常。
-    check("edge_nudge() 返回结构正常", isinstance(ok, bool) and isinstance(msg, str),
+    with patch.object(srv_mod, "screen_size", return_value=(0, 0)):
+        ok, msg = srv_mod.edge_nudge("bottom", 480, 269, 960, 540)
+    check("edge_nudge() 无 X 时返回结构正常", ok is False and isinstance(msg, str),
           f"-> ok={ok} {msg}")
 except Exception as e:
-    check("edge_nudge() 返回结构正常", False, repr(e))
+    check("edge_nudge() 无 X 时返回结构正常", False, repr(e))
 
 try:
     st = srv_mod.dock_state()
@@ -109,14 +110,31 @@ check("GET /api/dock 结构", st == 200 and "ok" in j and "pressure" in j, body[
 st, _, body = req("GET", "/api/screen", headers=CK)
 check("GET /api/screen(已登录)", st == 200 and "ok" in json.loads(body), body[:80])
 
-st, _, body = req("POST", "/api/edge",
-                  json.dumps({"edge": "bottom", "fx": 480, "fy": 539, "fbw": 960, "fbh": 540}),
-                  {**CK, "Content-Type": "application/json"})
+with patch.object(srv_mod, "edge_nudge", return_value=(False, "测试环境不移动鼠标")):
+    st, _, body = req("POST", "/api/edge",
+                      json.dumps({"edge": "bottom", "fx": 480, "fy": 539, "fbw": 960, "fbh": 540}),
+                      {**CK, "Content-Type": "application/json"})
 check("POST /api/edge 不 500", st == 200, body[:100])
 
 st, _, body = req("POST", "/api/edge", json.dumps({"edge": "nonsense"}),
                   {**CK, "Content-Type": "application/json"})
 check("POST /api/edge 参数校验", st == 200 and json.loads(body)["ok"] is False, body[:80])
+
+with patch.object(srv_mod, "_resolve_mode", return_value="term"), \
+     patch.object(srv_mod, "_focus_key", return_value="gnome-terminal"), \
+     patch.object(srv_mod, "_paste_job", return_value=(True, "已发送 ctrl+shift+v")) as paste_job:
+    st, _, body = req("POST", "/api/paste", json.dumps({"text": "测试"}),
+                      {**CK, "Content-Type": "application/json"})
+    check("终端面板粘贴使用 Ctrl+Shift+V", st == 200 and json.loads(body)["ok"]
+          and paste_job.call_args.args == ("测试", "ctrl+shift+v"), body[:100])
+
+with patch.object(srv_mod, "_resolve_mode", return_value="term"), \
+     patch.object(srv_mod, "_focus_key", return_value="gnome-terminal"), \
+     patch.object(srv_mod, "send_paste_key", return_value=(True, "已发送 ctrl+shift+v")) as paste_key:
+    st, _, body = req("POST", "/api/paste", "{}",
+                      {**CK, "Content-Type": "application/json"})
+    check("空文本粘贴使用终端快捷键", st == 200 and json.loads(body)["ok"]
+          and paste_key.call_args.args == ("ctrl+shift+v",), body[:100])
 
 # ---- 3) DOM id 一致性 ----------------------------------------------------
 print("\n== vnc.js 查询的 DOM id vs 渲染出的 HTML ==")

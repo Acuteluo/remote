@@ -141,6 +141,16 @@
   #vnc-banner { flex: none; display: none; padding: 8px 12px; background: #3a2418;
     border-bottom: 1px solid #5a3a22; color: var(--warn); font-size: 12px; line-height: 1.6; }
   #vnc-banner.show { display: block; }
+  #vnc-input-alert { display: none; position: fixed; left: 8px; right: 8px;
+    top: calc(52px + env(safe-area-inset-top)); z-index: 10050;
+    align-items: start; gap: 8px; padding: 10px 12px; border-radius: 9px;
+    background: #51252b; border: 1px solid #a85860; color: #fff;
+    box-shadow: 0 4px 16px #0009; font-size: 13px; line-height: 1.45; }
+  #vnc-input-alert.show { display: flex; }
+  #vnc-input-alert-text { flex: 1; overflow-wrap: anywhere; }
+  #vnc-input-alert-close { flex: none; padding: 0 3px; border: 0;
+    background: transparent; color: #fff; font-size: 19px; line-height: 1; }
+  body.vnc-fs #vnc-input-alert { top: calc(8px + env(safe-area-inset-top)); }
   /* 右上角实时延迟: 绿 <80ms / 黄 <200ms / 红 >=200ms */
   /* 网络 / 画面 合成**一个胶囊**: 手机顶栏太窄, 两个独立胶囊各自带边框+内边距
      要多占 ~20px, 正好把"返回/远程桌面"挤成竖排。合成一个框后显示
@@ -184,11 +194,16 @@
 </div>
 <audio id="vnc-audio-el" preload="none"></audio>
 <div id="vnc-banner"></div>
+<div id="vnc-input-alert" role="alert" aria-live="assertive">
+  <span id="vnc-input-alert-text"></span>
+  <button id="vnc-input-alert-close" aria-label="关闭输入错误提示">×</button>
+</div>
 <div class="vnc-toolbar">
   <button id="vnc-kbbtn">键盘</button>
   <button id="vnc-keybtn">按键</button>
   <button id="vnc-padbtn" class="on">触控板</button>
   <button id="vnc-clipbtn">剪贴板</button>
+  <button id="vnc-saver" title="跨网络卡顿时降低图传数据量；再点恢复原画质">省流</button>
   <button id="vnc-shot" title="把当前远程画面保存为图片到手机">截图</button>
   <button id="vnc-setbtn">设置</button>
   <button id="vnc-fs" title="全屏横屏观看(只展示画面和声音)">⛶ 全屏</button>
@@ -218,6 +233,8 @@
   <button class="kb combo" data-combo="ctrl+a">Ctrl+A</button>
   <button class="kb combo" data-combo="ctrl+c">Ctrl+C</button>
   <button class="kb combo" data-combo="ctrl+v">Ctrl+V</button>
+  <button class="kb combo" data-combo="ctrl+shift+c">Ctrl+Shift+C</button>
+  <button class="kb combo" data-combo="ctrl+shift+v">Ctrl+Shift+V</button>
   <button class="kb combo" data-combo="ctrl+x">Ctrl+X</button>
   <button class="kb combo" data-combo="ctrl+z">Ctrl+Z</button>
   <button class="kb combo" data-combo="ctrl+enter">Ctrl+↵</button>
@@ -385,13 +402,13 @@
     <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">
       <button class="cbtn" id="clip-get">读取远端</button>
       <button class="cbtn" id="clip-set">写入远端</button>
-      <button class="cbtn pri" id="clip-paste">粘贴到光标(Ctrl+V)</button>
+      <button class="cbtn pri" id="clip-paste">粘贴到光标(自动适配)</button>
       <button class="cbtn" id="clip-type">直接键入</button>
       <button class="cbtn" id="clip-close" style="color:var(--dim);flex:0 1 auto">关闭</button>
     </div>
     <p id="clip-msg" style="color:var(--dim);font-size:11px;margin:7px 0 0"></p>
     <p style="color:var(--dim);font-size:11px;margin:3px 0 0">
-      终端(xterm 等)不响应 Ctrl+V, 请用"直接键入"; 读取到的内容长按可复制到手机。</p>
+      终端自动使用 Ctrl+Shift+V（老 xterm 用 Shift+Insert）；复制终端选区可用「按键」中的 Ctrl+Shift+C。读取到的内容长按可复制到手机。</p>
   </div>
 </div>
 

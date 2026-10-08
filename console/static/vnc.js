@@ -42,6 +42,7 @@ function setStatus(text) {
 // ================= 设置(存 localStorage) =================
 // scrollDir: 1 = 双指上滑 -> 内容上移(继续往下读文档); -1 = 反之
 const DEFAULTS = { quality: 6, padH: 195, hints: true, scrollDir: 1, scrollSpeed: 1.0,
+                   dataSaver: false,
                    edgeNudge: false, dockFixVer: 0, keybar: false, showPing: true,
                    // 输入: 投递方式 + 攒批时间(越大=每次请求带的字越多=越省流量, 但手感稍迟)
                    typeMode: 'auto', typeBatch: 80,
@@ -429,28 +430,6 @@ function cleanText(s) { return String(s).replace(/[\r\n]/g, ''); }
 // 所以非 ASCII 改走服务端 xdotool type(它自己做重映射且带间隔), 实测 9/9 全到。
 let typeBuf = [], typeTimer = 0;
 
-// 服务端键入失败时的兜底。
-// **必须限长**: 这条路径是逐字经 RFB 发 keyEvent, 一次 8000 字就是 16000 条事件
-// 灌进 x11vnc —— 服务端扛不住、客户端也会卡死(实测就是这么把机器拖死的)。
-// 而且它对中文本来就有损(x11vnc 侧重映射跟不上), 长文本兜底毫无意义, 直接报错。
-const FALLBACK_MAX = 40;
-
-function keysymFallback(s) {
-  // 纯 ASCII 经 RFB 发是"不可靠但不会污染", 且没有中文那种重映射问题,
-  // 所以上限放宽些; 含非 ASCII 的一律严格限长, 发过去也只会变成乱码。
-  const max = /[^\x20-\x7e]/.test(s) ? FALLBACK_MAX : 200;
-  if (s.length > max) {
-    if (typeof clipStatus === 'function') {
-      clipStatus(`键入失败(${s.length} 字太长, 已放弃)`, true);
-    }
-    return;
-  }
-  for (const ch of s) {
-    const ks = keysymFor(ch.codePointAt(0));
-    if (ks) tapKey(ks, 'VoidSymbol');
-  }
-}
-
 // 同一时刻只允许一个 /api/type 在飞。
 // 服务端虽然已经把 xdotool 串行化了, 但前端若不自律, 后一批请求会在前一批
 // 还没被处理时就入队 —— 队列里堆着的批次越多, 屏幕上出现得越晚, 手感就是
@@ -464,8 +443,15 @@ let selfClipUntil = 0;
 // 键入失败一定要让用户看见。否则他以为自己没打上, 会反复重打, 越打越乱;
 // 更糟的是旧代码会偷偷改走 RFB, 产出"上辈子打的字", 完全无法归因。
 let typeErrTimer = 0;
+function showInputAlert(msg) {
+  $('vnc-input-alert-text').textContent = msg;
+  $('vnc-input-alert').classList.add('show');
+}
+function clearInputAlert() { $('vnc-input-alert').classList.remove('show'); }
+$('vnc-input-alert-close').addEventListener('click', clearInputAlert);
 function showTypeErr(msg) {
   const text = '键入失败: ' + msg;
+  showInputAlert(text);
   try { setStatus(text); } catch (e) { /* 页面还没初始化 */ }
   if (typeof clipStatus === 'function') clipStatus(text, true);
   clearTimeout(typeErrTimer);
@@ -490,19 +476,16 @@ function flushType() {
     body: JSON.stringify({ text: s, mode: S.typeMode || 'auto' }), signal: ac.signal,
   }).then((r) => r.json().then((j) => [r.status, j]).catch(() => [r.status, null]))
     .then(([st, j]) => {
-      if (j && j.ok) return;
+      if (j && j.ok) { clearInputAlert(); return; }
       // **绝不再静默回退到 RFB 直发。**
       // 那条路送出去的按键会被远端 fcitx 收进预编辑缓冲: 屏幕上什么都不显示,
       // 攒到某次提交时一次性冒出来 —— 用户看到的就是"打这个出来的是上次的内容"。
       // 中文回退过去更是直接变乱码。宁可明确报错, 也不要产出这种鬼影文字。
       const err = (j && (j.err || j.msg)) || `HTTP ${st}`;
       showTypeErr(err);
-      // 唯一的例外: 完全没收到响应(网络断了, 服务端根本没处理), 且是纯 ASCII
-      // 且很短 —— 这时 RFB 直发至少还有机会是对的。
-      if (!j && !st && s.length <= 40 && !/[^\x20-\x7e]/.test(s)) keysymFallback(s);
     }).catch(() => {
-      showTypeErr('网络异常, 未送达');
-      if (s.length <= 40 && !/[^\x20-\x7e]/.test(s)) keysymFallback(s);
+      // 断网/超时后无法知道服务端是否已经处理。直接重发会让文字重复。
+      showTypeErr('网络异常，送达状态未知；请检查远端窗口后再重试');
     }).finally(() => {
     clearTimeout(to);
     typeBusy = false;
@@ -641,9 +624,10 @@ document.querySelectorAll('#keybar [data-combo]').forEach((b) => {
   b.addEventListener('click', async () => {
     if (!canSend()) return;
     const combo = b.dataset.combo;
-    const [mod, key] = combo.split('+');
-    const m = MODS.find((x) => x.key === mod);
-    if (!m) return;
+    const parts = combo.split('+');
+    const key = parts.pop();
+    const held = parts.map((mod) => MODS.find((x) => x.key === mod));
+    if (!held.length || held.some((m) => !m)) return;
     let ks, code;
     if (SPECIAL[key]) { [ks, code] = SPECIAL[key]; }   // alt+tab / ctrl+esc 这类
     else { ks = keysymFor(key.codePointAt(0)); code = 'VoidSymbol'; }
@@ -651,13 +635,14 @@ document.querySelectorAll('#keybar [data-combo]').forEach((b) => {
 
     const hold = HOLD_COMBO[combo];
     if (!hold) {                                   // 普通 combo: 快按快放即可
-      rfb.sendKey(m.keysym, m.code, true);
+      for (const m of held) rfb.sendKey(m.keysym, m.code, true);
       rfb.sendKey(ks, code, true);
       rfb.sendKey(ks, code, false);
-      rfb.sendKey(m.keysym, m.code, false);
+      for (const m of held.slice().reverse()) rfb.sendKey(m.keysym, m.code, false);
       return;
     }
 
+    const m = held[0];
     clearMods();                                   // 别让粘滞修饰键混进来
     if (holdState.combo !== combo) {               // 首次按下: 按住修饰键
       if (holdState.combo) releaseHold();
@@ -1178,6 +1163,7 @@ const clipMsg = $('clip-msg');
 function clipStatus(msg, bad) {
   clipMsg.textContent = msg;
   clipMsg.style.color = bad ? 'var(--bad)' : 'var(--dim)';
+  if (bad) showInputAlert(msg);
 }
 
 async function clipApi(path, body) {
@@ -1209,8 +1195,9 @@ async function clipRun(label, path, body, done) {
   try {
     const j = await clipApi(path, body);
     clipStatus(j.ok ? done : ('失败: ' + (j.err || j.msg || '未知错误')), !j.ok);
+    if (j.ok) clearInputAlert();
   } catch (e) {
-    clipStatus('失败: 服务未响应', true);
+    clipStatus('服务未响应，操作状态未知；请检查远端窗口后再重试', true);
   }
 }
 
@@ -1243,7 +1230,7 @@ $('clip-set').addEventListener('click', () => {
 
 $('clip-paste').addEventListener('click', () => {
   const text = clipText.value;
-  clipRun('粘贴中', '/api/paste', text ? { text } : {}, '已发送 Ctrl+V');
+  clipRun('粘贴中', '/api/paste', text ? { text } : {}, '已发送粘贴快捷键');
 });
 
 $('clip-type').addEventListener('click', () => {
@@ -1269,9 +1256,20 @@ function onRemoteClipboard(text) {
 // ================= 设置面板 =================
 function applyQuality() {
   if (!rfb) return;
-  rfb.qualityLevel = S.quality;
-  rfb.compressionLevel = QUALITY_MAP[S.quality] ?? 2;
+  const q = S.dataSaver ? 3 : S.quality;
+  rfb.qualityLevel = q;
+  rfb.compressionLevel = QUALITY_MAP[q] ?? 2;
 }
+function applySaverUI() {
+  $('vnc-saver').classList.toggle('on', !!S.dataSaver);
+  $('vnc-saver').setAttribute('aria-pressed', S.dataSaver ? 'true' : 'false');
+}
+$('vnc-saver').addEventListener('click', () => {
+  S.dataSaver = !S.dataSaver;
+  saveS();
+  applyQuality();
+  applySaverUI();
+});
 function applyPadH() {
   $('pad-area').style.height = S.padH + 'px';
   $('set-padh-v').textContent = S.padH + 'px';
@@ -1294,6 +1292,7 @@ applyPadH();
 applyHints();
 applyScrollUI();
 applyKeybar();
+applySaverUI();
 $('set-padh').value = S.padH;
 $('set-hints').checked = S.hints;
 $('set-ping').checked = S.showPing;
@@ -1394,7 +1393,9 @@ $('set-close').addEventListener('click', () => { $('set-panel').style.display = 
 document.querySelectorAll('#set-panel .seg.q button').forEach((b) => {
   b.addEventListener('click', () => {
     S.quality = Number(b.dataset.q);
+    S.dataSaver = false;
     saveS(); applyQuality();
+    applySaverUI();
     document.querySelectorAll('#set-panel .seg.q button').forEach((x) =>
       x.classList.toggle('on', x === b));
   });
@@ -1654,18 +1655,16 @@ document.querySelectorAll('#set-dockdelay button').forEach((b) => {
 noFocusSteal();   // 所有按钮都不抢焦点(否则点一下键, 软键盘就收起)
 startPing();      // 右上角延迟: 不依赖 VNC 是否连上, 开机就测
 
-// 服务端版本自检: static/ 与 templates/ 是每次请求都从磁盘读的, 所以前端改动
-// 刷新即生效; 但 server.py 改了必须重启服务。新接口返回 404 就说明跑的还是旧进程,
-// 直接告诉用户该敲什么命令 —— 不然只会静默失败, 让人以为代码没起作用。
+// 静态资源刷新即生效，server.py 必须重启。用输入能力版本明确区分新旧进程。
 (async function checkServerVersion() {
   try {
-    const r = await fetch('/api/screen');
-    if (r.status !== 404) return;
+    const r = await fetch('/api/health', { cache: 'no-store' });
+    const j = await r.json();
+    if (Number(j.inputVersion) >= 2) return;
     const el = $('vnc-banner');
     el.classList.add('show');
-    el.innerHTML = '服务端仍是旧版本: <b>剪贴板 / 直接键入</b> 还没生效。'
-      + '请在电脑上执行 <b>systemctl --user restart meow-console meow-vnc</b> 再刷新本页。'
-      + '(触控板、键盘、Dock 贴边弹出属于前端改动, 已经生效)';
+    el.textContent = '控制台服务仍是旧进程：终端自动粘贴和输入修复尚未生效。'
+      + '请在合适时机执行 systemctl --user restart meow-console，再刷新本页。';
   } catch (e) {}
 })();
 
