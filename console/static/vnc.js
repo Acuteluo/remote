@@ -1363,6 +1363,9 @@ function applySaverUI() {
   $('vnc-saver').setAttribute('aria-pressed', enabled ? 'true' : 'false');
   $('vnc-saver').textContent = autoSaver && !S.dataSaver ? '自动省流' : '省流';
   $('vnc-saver').title = autoSaver ? '高延迟自动降低画质；网络恢复后还原' : '手动降低画质和传输量';
+  document.querySelectorAll('#set-panel .seg.q button').forEach((b) => {
+    b.title = enabled ? '省流中实际画质为低档；此处保留网络恢复后的画质选择' : '';
+  });
 }
 function updateAutoSaver(ms) {
   slowSamples = ms >= 450 ? slowSamples + 1 : 0;
@@ -1409,7 +1412,6 @@ $('set-edge').checked = S.edgeNudge;
 $('set-awake').checked = S.keepAwake;
 $('set-bgkeep').checked = S.bgKeep;
 applyTypeUI();
-applyAwake();                       // 异步, 不 await; 失败也不影响其它初始化
 document.querySelectorAll('#set-panel .seg.q button').forEach((b) => {
   b.classList.toggle('on', Number(b.dataset.q) === S.quality);
 });
@@ -1535,6 +1537,7 @@ $('set-scroll').addEventListener('input', (e) => {
 const elVol = $('set-vol');
 const elVolV = $('set-vol-v');
 let volTimer = null;
+let volRevision = 0;
 
 function volLabel(pct) {
   const over = pct > 100;
@@ -1545,10 +1548,11 @@ function volLabel(pct) {
 
 async function refreshVolume() {
   if (!elVol) return;
+  const revision = volRevision;
   try {
     const r = await fetch('/api/volume', { cache: 'no-store' });
     const j = await r.json();
-    if (j && j.ok && typeof j.vol === 'number') {
+    if (revision === volRevision && j && j.ok && typeof j.vol === 'number') {
       elVol.value = String(Math.max(0, Math.min(150, j.vol)));
       volLabel(Number(elVol.value));
     }
@@ -1557,16 +1561,13 @@ async function refreshVolume() {
 
 if (elVol) {
   elVol.addEventListener('input', (e) => {
+    volRevision++;
     const pct = Number(e.target.value);
     volLabel(pct);
     // 滑动中别每个 tick 都发包 —— 攒 250ms 再发(手感更跟手, 请求也更少)
     if (volTimer) clearTimeout(volTimer);
     volTimer = setTimeout(() => {
-      fetch('/api/volume', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ vol: pct }),
-      }).catch(() => {});
+      saveSetting('电脑音量', '/api/volume', { vol: pct });
     }, 250);
   });
 }
@@ -1576,6 +1577,7 @@ if (elVol) {
 const elBri = $('set-bri');
 const elBriV = $('set-bri-v');
 let briTimer = null;
+let briRevision = 0;
 
 function briLabel(pct) {
   if (elBriV) elBriV.textContent = pct + '%';
@@ -1583,10 +1585,11 @@ function briLabel(pct) {
 
 async function refreshBrightness() {
   if (!elBri) return;
+  const revision = briRevision;
   try {
     const r = await fetch('/api/brightness', { cache: 'no-store' });
     const j = await r.json();
-    if (j && j.ok && typeof j.pct === 'number') {
+    if (revision === briRevision && j && j.ok && typeof j.pct === 'number') {
       elBri.value = String(Math.max(5, Math.min(100, j.pct)));
       briLabel(Number(elBri.value));
     }
@@ -1595,16 +1598,13 @@ async function refreshBrightness() {
 
 if (elBri) {
   elBri.addEventListener('input', (e) => {
+    briRevision++;
     const pct = Number(e.target.value);
     briLabel(pct);
     // 和音量一样攒 250ms 再发: 拖动过程中别把请求打满(每次都要起一个 xrandr)
     if (briTimer) clearTimeout(briTimer);
     briTimer = setTimeout(() => {
-      fetch('/api/brightness', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pct: pct }),
-      }).catch(() => {});
+      saveSetting('屏幕亮度', '/api/brightness', { pct });
     }, 250);
   });
 }
@@ -1628,12 +1628,34 @@ function applyTypeUI() {
 // 「输入方式 / 输入响应」是**跟电脑有关**的设置(切的是电脑上的投递方式),
 // 换手机也该一样, 所以真正的家是电脑上的 config.json, localStorage 只当本地缓存。
 // 开机先拉服务端的为准; 改的时候两边都写。
-function saveCfg(patch) { clipApi('/api/config', patch).catch(() => {}); }
+const settingQueues = new Map();
+function saveSetting(label, path, patch) {
+  // 同一设置按点击顺序保存，避免弱网下旧请求后完成覆盖新值。
+  const pending = (settingQueues.get(path) || Promise.resolve()).then(async () => {
+    try {
+      const j = await clipApi(path, patch);
+      if (!j || !j.ok) throw new Error(j?.err || j?.msg || '服务未确认保存');
+      return j;
+    } catch (e) {
+      showInputAlert(label + '保存失败：' + (e.name === 'AbortError'
+        ? '请求超时，结果未知；请重新读取确认' : e.message), 'setting');
+      return null;
+    }
+  });
+  settingQueues.set(path, pending);
+  return pending;
+}
+let inputCfgRevision = 0;
+function saveCfg(patch) {
+  inputCfgRevision++;
+  return saveSetting('输入设置', '/api/config', patch);
+}
 
 async function loadServerConfig() {
+  const revision = inputCfgRevision;
   try {
     const j = await clipApi('/api/config');
-    if (j && j.ok && j.config) {
+    if (revision === inputCfgRevision && j && j.ok && j.config) {
       if (j.config.typeMode) S.typeMode = j.config.typeMode;
       if (j.config.typeBatch) S.typeBatch = Number(j.config.typeBatch);
       saveS(); applyTypeUI();
@@ -1658,8 +1680,11 @@ document.querySelectorAll('#set-typebatch button').forEach((b) => {
 // 用手机控电脑时屏幕动不动就熄, 非常烦。Wake Lock API 只在 HTTPS / localhost 下
 // 可用, 且切后台会被系统自动释放 —— 所以每次回到前台都要重新申请。
 let wakeLock = null;
-async function applyAwake() {
-  if (!('wakeLock' in navigator)) return;
+async function applyAwake(notify = false) {
+  if (!('wakeLock' in navigator)) {
+    if (notify && S.keepAwake) showInputAlert('当前浏览器或连接不支持屏幕常亮；请使用支持此功能的浏览器和 HTTPS', 'setting');
+    return;
+  }
   try {
     if (S.keepAwake && document.visibilityState === 'visible') {
       if (!wakeLock) {
@@ -1670,10 +1695,13 @@ async function applyAwake() {
       await wakeLock.release();
       wakeLock = null;
     }
-  } catch (e) { /* 不支持或用户拒绝, 默默跳过 */ }
+  } catch (e) {
+    if (notify) showInputAlert('屏幕常亮申请失败：' + e.message, 'setting');
+  }
 }
+applyAwake();
 $('set-awake').addEventListener('change', (e) => {
-  S.keepAwake = e.target.checked; saveS(); applyAwake();
+  S.keepAwake = e.target.checked; saveS(); applyAwake(true);
 });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') applyAwake();
@@ -1693,6 +1721,7 @@ async function refreshDockState() {
   const el = $('dock-state');
   try {
     const j = await (await fetch('/api/dock')).json();
+    $('set-dock').disabled = false;
     $('set-dock').checked = !j.pressure;
     // 标出当前延迟档位(系统里可能是别的值, 那就都不高亮, 不撒谎)
     document.querySelectorAll('#set-dockdelay button').forEach((b) => {
@@ -2235,17 +2264,18 @@ document.addEventListener('webkitfullscreenchange', fsSync);
     btns.forEach((b) => b.classList.toggle('on', b.dataset.ao === mode));
     labels(mode);
   }
+  let revision = 0;
   fetch('/api/audio/out', { cache: 'no-store' })
     .then((r) => r.json())
-    .then((j) => { if (j && j.ok) mark(j.mode); })
+    .then((j) => { if (!revision && j && j.ok) mark(j.mode); })
     .catch(() => {});
-  btns.forEach((b) => b.addEventListener('click', () => {
-    mark(b.dataset.ao);
-    fetch('/api/audio/out', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: b.dataset.ao }),
-    }).catch(() => {});
-    if (typeof refreshVolume === 'function') setTimeout(refreshVolume, 400);
+  btns.forEach((b) => b.addEventListener('click', async () => {
+    revision++;
+    btns.forEach((x) => { x.disabled = true; });
+    const j = await saveSetting('声音去向', '/api/audio/out', { mode: b.dataset.ao });
+    if (j) mark(j.mode || b.dataset.ao);
+    btns.forEach((x) => { x.disabled = false; });
+    if (typeof refreshVolume === 'function') refreshVolume();
   }));
 })();
 
@@ -2253,18 +2283,20 @@ document.addEventListener('webkitfullscreenchange', fsSync);
 (function bindScreenMode() {
   const sel = document.getElementById('set-mode');
   if (!sel) return;
+  let confirmedMode = '';
   fetch('/api/screen/modes', { cache: 'no-store' }).then((r) => r.json()).then((j) => {
     if (!j || !j.ok || !j.modes) return;
+    confirmedMode = j.current;
     sel.innerHTML = j.modes.map((m) =>
       '<option value="' + m.name + '"' + (m.name === j.current ? ' selected' : '') + '>'
       + m.name + ' @' + m.hz + 'Hz</option>').join('');
   }).catch(() => {});
-  sel.addEventListener('change', () => {
-    fetch('/api/screen/mode', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: sel.value }),
-    }).then((r) => r.json()).then((j) => {
-      if (j && !j.ok) alert('切换失败: ' + (j.err || ''));
-    }).catch(() => {});
+  sel.addEventListener('change', async () => {
+    const mode = sel.value;
+    sel.disabled = true;
+    const j = await saveSetting('分辨率', '/api/screen/mode', { mode });
+    if (j) confirmedMode = mode;
+    else if (confirmedMode) sel.value = confirmedMode;
+    sel.disabled = false;
   });
 })();
