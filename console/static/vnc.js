@@ -74,6 +74,7 @@ let hideTimer = 0;
 let autoSaver = false;
 let slowSamples = 0, fastSamples = 0;
 let viewerId = '', streamRtt = null;
+let networkError = '';
 
 // ---- 图传实际帧率/码率 ----
 // 为什么要显示这个: "延迟 <50ms 但画面很卡"是很常见的情况 —— 延迟量的是
@@ -87,6 +88,7 @@ function connect() {
   clearTimeout(reconnectTimer);
   if (rfb) { try { rfb.disconnect(); } catch (e) {} rfb = null; }
   connected = false;
+  networkError = '';
   if (!everConnected) {
     // 首次连接才在中央提示; 重连时不弹 —— 否则每次抖动都会闪一下中央文字
     overlay.style.display = 'flex';
@@ -109,7 +111,16 @@ function connect() {
     const w = new NativeWS(...a);
     w.addEventListener('message', (ev) => {
       const d = ev.data;
-      if (typeof d === 'string') wsRxBytes += d.length;
+      if (typeof d === 'string') {
+        wsRxBytes += d.length;
+        try {
+          const msg = JSON.parse(d);
+          if (msg.t === 'err') {
+            networkError = msg.d || '远程桌面连接失败';
+            showInputAlert(networkError, 'network');
+          }
+        } catch (e) { /* 普通RFB数据由noVNC处理 */ }
+      }
       else if (d && d.byteLength) wsRxBytes += d.byteLength;
     });
     return w;
@@ -127,6 +138,15 @@ function connect() {
     window.WebSocket = NativeWS;
   }
   rfb = r;
+  lastFbPointer = null;
+  // 普通画布由 noVNC 直接发鼠标，触控板走 sendPointer；两条路径统一记录。
+  const origMouse = r._sendMouse.bind(r);
+  r._sendMouse = function (x, y, buttons) {
+    if (rfb === r && r._rfbConnectionState === 'connected' && !r._viewOnly) {
+      lastFbPointer = { x: r._display.absX(x), y: r._display.absY(y) };
+    }
+    return origMouse(x, y, buttons);
+  };
   // 只计完整更新；分包时同一条更新会多次调用 _framebufferUpdate。
   // 属于内部方法, 版本换了可能失效 —— 所以套 try, 失效就只显示码率。
   try {
@@ -152,6 +172,7 @@ function connect() {
     overlay.style.display = 'none';
     $('vnc-reconnect').style.display = 'none';
     setStatus('已连接');
+    if ($('vnc-input-alert').dataset.kind === 'network') clearInputAlert();
     virtInit();
     $('pad-cursor').style.display = 'block';
     startPing();                       // 右上角实时延迟
@@ -173,7 +194,8 @@ function connect() {
       if (connected) return;
       overlay.style.display = 'flex';
       overlayMsg.className = clean ? '' : 'err';
-      overlayMsg.textContent = clean ? '已断开' : '连接断开(远程桌面服务可能未启动)';
+      overlayMsg.textContent = networkError || (navigator.onLine === false
+        ? '本机网络不可用，等待网络恢复' : '连接中断，正在自动重连');
       $('vnc-reconnect').style.display = 'inline-block';
       setStatus('未连接');
     }, 5000);
@@ -332,7 +354,8 @@ async function pingOnce() {
     let response = await fetchAbort('/api/vnc/network?viewer=' + viewer, 10000);
     // 兼容尚未重载的服务端；前端补丁可先刷新使用。
     if (response.status === 404) response = await fetchAbort('/api/health?t=' + Date.now(), 10000);
-    if (!response.ok) throw new Error('健康检查失败');
+    if (response.status === 401 || response.redirected) throw new Error('登录已失效，请重新登录');
+    if (!response.ok) throw new Error(`连接检测失败（HTTP ${response.status}）`);
     const channel = await response.json();
     if (viewer !== viewerId) return;
     const ms = performance.now() - t0;
@@ -347,11 +370,15 @@ async function pingOnce() {
     }
     if (connected) setStatus(congestion >= 1000
       ? (autoSaver ? '图传拥堵 · 自动省流' : '图传拥堵') : '已连接');
+    if ($('vnc-input-alert').dataset.kind === 'network') clearInputAlert();
     renderPing(S.showPing ? pingEma : null);
   } catch (e) {
     if (viewer !== viewerId) return;
     updateAutoSaver(10000);
-    if (connected) setStatus('网络响应超时');
+    const reason = e.name === 'AbortError' ? '网络请求超时（10秒）'
+      : e instanceof TypeError ? '网络请求失败，请检查网络连接' : e.message;
+    if (connected) setStatus(reason);
+    showInputAlert(reason, 'network');
     renderPing(null);
   } finally {
     pingBusy = false;
@@ -459,9 +486,10 @@ let selfClipUntil = 0;
 // 键入失败一定要让用户看见。否则他以为自己没打上, 会反复重打, 越打越乱;
 // 更糟的是旧代码会偷偷改走 RFB, 产出"上辈子打的字", 完全无法归因。
 let typeErrTimer = 0;
-function showInputAlert(msg) {
+function showInputAlert(msg, kind = 'input') {
   $('vnc-input-alert-text').textContent = msg;
   $('vnc-input-alert').classList.add('show');
+  $('vnc-input-alert').dataset.kind = kind;
 }
 function clearInputAlert() { $('vnc-input-alert').classList.remove('show'); }
 $('vnc-input-alert-close').addEventListener('click', clearInputAlert);
@@ -642,7 +670,7 @@ document.querySelectorAll('#keybar [data-key]').forEach((b) => {
 // 旧实现 Alt↓ Tab↓ Tab↑ Alt↑ 一股脑连发, 切换器常常还没被抓住就结束了 ——
 // 表现就是"点 Alt+Tab 没反应, 或者闪一下就没了"。
 const HOLD_COMBO = { 'alt+tab': 900 };
-const holdState = { combo: null, timer: 0 };
+const holdState = { combo: null, timer: 0, target: null, token: 0 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function releaseHold() {
@@ -651,8 +679,11 @@ function releaseHold() {
   clearTimeout(st.timer);
   const [modk] = st.combo.split('+');
   const m = MODS.find((x) => x.key === modk);
+  const target = st.target;
   st.combo = null;
-  if (m && canSend()) rfb.sendKey(m.keysym, m.code, false);   // 松开 = 提交切换
+  st.target = null;
+  st.token++;
+  if (m && canSend() && rfb === target) target.sendKey(m.keysym, m.code, false);
 }
 
 document.querySelectorAll('#keybar [data-combo]').forEach((b) => {
@@ -684,16 +715,22 @@ document.querySelectorAll('#keybar [data-combo]').forEach((b) => {
     }
 
     const m = held[0];
+    const target = rfb;
     clearMods();                                   // 别让粘滞修饰键混进来
-    if (holdState.combo !== combo) {               // 首次按下: 按住修饰键
+    if (holdState.combo !== combo || holdState.target !== target) {
       if (holdState.combo) releaseHold();
       holdState.combo = combo;
-      rfb.sendKey(m.keysym, m.code, true);
+      holdState.target = target;
+      target.sendKey(m.keysym, m.code, true);
+      const token = holdState.token;
       await sleep(50);                             // 让 X 先认下 Alt
+      if (!canSend() || rfb !== target || holdState.token !== token) return;
     }
-    rfb.sendKey(ks, code, true);                   // 再点一次就再往后切一个
+    const token = holdState.token;
+    target.sendKey(ks, code, true);                   // 再点一次就再往后切一个
     await sleep(60);
-    rfb.sendKey(ks, code, false);
+    if (!canSend() || rfb !== target || holdState.token !== token) return;
+    target.sendKey(ks, code, false);
     clearTimeout(holdState.timer);
     holdState.timer = setTimeout(releaseHold, hold);
   });
@@ -773,6 +810,7 @@ const BTN_LEFT = 0x1, BTN_RIGHT = 0x4;
 const WHEEL_UP = 0x8, WHEEL_DOWN = 0x10, WHEEL_LEFT = 0x20, WHEEL_RIGHT = 0x40;
 
 let mask = 0;                    // 当前按住的按钮(不含滚轮瞬时位)
+let lastFbPointer = null;        // 远端坐标，不受全屏/缩放/旋转后的 CSS 布局影响
 
 const padPanel = $('pad-panel');
 const padArea = $('pad-area');
@@ -845,6 +883,7 @@ function sendPointer(m) {
   if (!ready()) return;
   const p = toFb();
   if (!p) return;
+  lastFbPointer = p;
   RFB.messages.pointerEvent(rfb._sock, p.x, p.y, m & 0xff);
 }
 
@@ -866,6 +905,14 @@ function wheelStep(dirY, dirX) {
   if (dirY < 0) bit = WHEEL_UP; else if (dirY > 0) bit = WHEEL_DOWN;
   else if (dirX < 0) bit = WHEEL_LEFT; else if (dirX > 0) bit = WHEEL_RIGHT;
   if (!bit) return;
+  if (fsOn()) {
+    // RFB 滚轮包也带坐标；重新换算普通视图 virt 会把鼠标送到错误窗口。
+    const p = lastFbPointer;
+    if (!p) return;
+    RFB.messages.pointerEvent(rfb._sock, p.x, p.y, mask | bit);
+    RFB.messages.pointerEvent(rfb._sock, p.x, p.y, mask);
+    return;
+  }
   sendPointer(mask | bit);
   sendPointer(mask);
 }
@@ -1966,6 +2013,7 @@ function fsResize() {
 
 async function fsEnter() {
   const wrap = $('screen-wrap');
+  if (!lastFbPointer && ready()) lastFbPointer = toFb();
   fsFake = false;
   try {
     if (wrap.requestFullscreen) {
