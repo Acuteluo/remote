@@ -1107,8 +1107,8 @@ padArea.addEventListener('pointermove', (e) => {
     const dt = Math.max(1, now - SCROLL.lastT);
     SCROLL.lastT = now;
     const dir = S.scrollDir;
-    const dAcc = (-dy * dir) * S.scrollSpeed;
-    const dAccX = (-dx) * S.scrollSpeed;
+    const dAcc = -dy * dir;
+    const dAccX = -dx;
     SCROLL.acc += dAcc;
     SCROLL.accX += dAccX;
     SCROLL.vel = SCROLL.vel * 0.6 + (dAcc / dt) * 0.4;
@@ -1680,6 +1680,7 @@ document.querySelectorAll('#set-typebatch button').forEach((b) => {
 // 用手机控电脑时屏幕动不动就熄, 非常烦。Wake Lock API 只在 HTTPS / localhost 下
 // 可用, 且切后台会被系统自动释放 —— 所以每次回到前台都要重新申请。
 let wakeLock = null;
+let wakeRequest = null;
 async function applyAwake(notify = false) {
   if (!('wakeLock' in navigator)) {
     if (notify && S.keepAwake) showInputAlert('当前浏览器或连接不支持屏幕常亮；请使用支持此功能的浏览器和 HTTPS', 'setting');
@@ -1688,12 +1689,25 @@ async function applyAwake(notify = false) {
   try {
     if (S.keepAwake && document.visibilityState === 'visible') {
       if (!wakeLock) {
-        wakeLock = await navigator.wakeLock.request('screen');
-        wakeLock.addEventListener('release', () => { wakeLock = null; });
+        if (wakeRequest) { await wakeRequest; return; }
+        wakeRequest = (async () => {
+          const acquired = await navigator.wakeLock.request('screen');
+          // 申请期间可能关开关或切后台；迟到的锁不能重新开启常亮。
+          if (!S.keepAwake || document.visibilityState !== 'visible') {
+            await acquired.release();
+            return;
+          }
+          wakeLock = acquired;
+          acquired.addEventListener('release', () => {
+            if (wakeLock === acquired) wakeLock = null;
+          });
+        })();
+        try { await wakeRequest; } finally { wakeRequest = null; }
       }
     } else if (wakeLock) {
-      await wakeLock.release();
+      const previous = wakeLock;
       wakeLock = null;
+      await previous.release();
     }
   } catch (e) {
     if (notify) showInputAlert('屏幕常亮申请失败：' + e.message, 'setting');
