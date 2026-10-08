@@ -585,8 +585,8 @@ def _decode_clip(raw):
     return raw.decode("latin-1")
 
 
-def clip_get(timeout=3):
-    """读 X CLIPBOARD; 失败返回 None。"""
+def clip_get(timeout=3, selection="clipboard"):
+    """读 X 选区; 失败返回 None。"""
     if not shutil.which("xclip"):
         return None
     env = x_env()
@@ -594,7 +594,7 @@ def clip_get(timeout=3):
     # 先明确要 UTF8_STRING; 选区持有者不认这个靶子时再退回默认(让 xclip 自己挑)
     for args in (["-target", "UTF8_STRING", "-o"], ["-o"]):
         try:
-            r = subprocess.run(["xclip", "-selection", "clipboard", *args],
+            r = subprocess.run(["xclip", "-selection", selection, *args],
                                env=env, capture_output=True, timeout=timeout)
         except (OSError, subprocess.SubprocessError):
             continue
@@ -607,8 +607,8 @@ def clip_get(timeout=3):
     return "" if ran_ok else None      # 跑通了但没内容 = 剪贴板是空的
 
 
-def clip_set(text):
-    """把文本写进 X CLIPBOARD, 轮询确认真的生效。
+def clip_set(text, selection="clipboard"):
+    """把文本写进 X 选区, 轮询确认真的生效。
 
     xclip 会 fork 一个子进程常驻持有选区 —— 必须把 stdout/stderr 指向 DEVNULL
     且不 wait, 否则管道不关, HTTP 请求会一直挂着。
@@ -616,13 +616,14 @@ def clip_set(text):
     if not shutil.which("xclip"):
         return False, "xclip 未安装"
     try:
-        with open(CLIP_TMP, "w", encoding="utf-8") as f:
+        path = CLIP_TMP if selection == "clipboard" else CLIP_TMP + ".primary"
+        with open(path, "w", encoding="utf-8") as f:
             f.write(text)
     except OSError as e:
         return False, str(e)
     _reap_clip()
     try:
-        p = subprocess.Popen(["xclip", "-selection", "clipboard", "-i", CLIP_TMP],
+        p = subprocess.Popen(["xclip", "-selection", selection, "-i", path],
                              env=x_env(), stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              start_new_session=True)
@@ -631,7 +632,7 @@ def clip_set(text):
     _clip_procs.append(p)
     # xclip 要跟当前选区持有者握手, 不是瞬时生效, 所以读回确认
     for _ in range(12):
-        if clip_get(timeout=0.6) == text:
+        if clip_get(timeout=0.6, selection=selection) == text:
             return True, "ok"
         time.sleep(0.07)
     return False, "写入后读回不一致(远端可能有程序占着选区)"
@@ -959,7 +960,19 @@ def _paste_job(text, combo="ctrl+v"):
     ok, msg = clip_set(text)
     if not ok:
         return False, f"剪贴板写入失败: {msg}"
-    return _combo_raw(combo)
+    if combo != "shift+Insert":
+        return _combo_raw(combo)
+    # xterm 的 Shift+Insert 读 PRIMARY，不读 CLIPBOARD。保留原 PRIMARY，
+    # 临时同步过去完成粘贴后再还原，避免覆盖用户当前选中的文本。
+    original = clip_get(selection="primary")
+    ok, msg = clip_set(text, selection="primary")
+    if not ok:
+        return False, f"PRIMARY 写入失败: {msg}"
+    try:
+        return _combo_raw(combo)
+    finally:
+        if original is not None:
+            clip_set(original, selection="primary")
 
 
 def _paste_raw(text, combo="ctrl+v"):
@@ -4678,7 +4691,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 else f"失败: {msg} / {msg2}"})
                     return
             else:
-                ok, msg = send_paste_key(combo)
+                if combo == "shift+Insert":
+                    current = clip_get()
+                    if current is None:
+                        ok, msg = False, "无法读取远端剪贴板"
+                    elif not current:
+                        ok, msg = False, "远端剪贴板为空"
+                    else:
+                        ok, msg = _xin_submit(lambda: _paste_job(current, combo),
+                                             budget=20.0)
+                else:
+                    ok, msg = send_paste_key(combo)
             audit("clip", f"粘贴({combo}) {len(text) if isinstance(text, str) else 0} 字")
             self._json({"ok": ok, "msg": msg})
         elif path == "/api/vnc/reset":

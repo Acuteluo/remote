@@ -136,6 +136,15 @@ with patch.object(srv_mod, "_resolve_mode", return_value="term"), \
     check("空文本粘贴使用终端快捷键", st == 200 and json.loads(body)["ok"]
           and paste_key.call_args.args == ("ctrl+shift+v",), body[:100])
 
+with patch.object(srv_mod, "_resolve_mode", return_value="term"), \
+     patch.object(srv_mod, "_focus_key", return_value="xterm"), \
+     patch.object(srv_mod, "clip_get", return_value="现有剪贴板"), \
+     patch.object(srv_mod, "_paste_job", return_value=(True, "已发送 shift+Insert")) as paste_job:
+    st, _, body = req("POST", "/api/paste", "{}",
+                      {**CK, "Content-Type": "application/json"})
+    check("xterm 空文本粘贴同步现有剪贴板", st == 200 and json.loads(body)["ok"]
+          and paste_job.call_args.args == ("现有剪贴板", "shift+Insert"), body[:100])
+
 # ---- 3) DOM id 一致性 ----------------------------------------------------
 print("\n== vnc.js 查询的 DOM id vs 渲染出的 HTML ==")
 st, _, html = req("GET", "/vnc", headers=CK)

@@ -23,4 +23,16 @@ with patch.object(server, "load_config", return_value={"modeByClass": {"xterm": 
      patch.object(server, "_focus_key", return_value="xterm"):
     assert server._paste_combo(server._resolve_mode("auto")) == "shift+Insert"
 
+calls = []
+def set_selection(text, selection="clipboard"):
+    calls.append((text, selection))
+    return True, "ok"
+
+with patch.object(server, "clip_get", return_value="原选区"), \
+     patch.object(server, "clip_set", side_effect=set_selection), \
+     patch.object(server, "_combo_raw", return_value=(True, "ok")):
+    assert server._paste_job("新内容", "shift+Insert")[0]
+assert calls == [("新内容", "clipboard"), ("新内容", "primary"),
+                 ("原选区", "primary")]
+
 print("PASS: 普通窗口、终端、老 xterm 的粘贴键选择正确")
