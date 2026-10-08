@@ -71,6 +71,8 @@ let discoTimer = 0;        // 断线后延迟弹提示的计时器(抖动已恢�
 let everConnected = false; // 连上过一次之后, 重连过程就不再弹中央提示
 let reconnectTimer = 0;
 let hideTimer = 0;
+let autoSaver = false;
+let slowSamples = 0, fastSamples = 0;
 
 // ---- 图传实际帧率/码率 ----
 // 为什么要显示这个: "延迟 <50ms 但画面很卡"是很常见的情况 —— 延迟量的是
@@ -122,16 +124,19 @@ function connect() {
     window.WebSocket = NativeWS;
   }
   rfb = r;
-  // 数帧: noVNC 每处理一条 FramebufferUpdate 就调一次 _framebufferUpdate。
+  // 只计完整更新；分包时同一条更新会多次调用 _framebufferUpdate。
   // 属于内部方法, 版本换了可能失效 —— 所以套 try, 失效就只显示码率。
   try {
     const origFb = r._framebufferUpdate.bind(r);
-    r._framebufferUpdate = function () { fbFrames++; return origFb(); };
+    r._framebufferUpdate = function () {
+      const complete = origFb();
+      if (complete) fbFrames++;
+      return complete;
+    };
   } catch (e) { /* 无所谓 */ }
   r.scaleViewport = true;
   r.background = '#000000';
-  // 别让 noVNC 在点图传时把焦点抢到 canvas 上 —— 那会让隐藏输入框失焦、
-  // 手机软键盘直接收起, 表现为"打着字点一下图传键盘就没了"。
+  // 由页面统一管理软键盘收起，避免 noVNC 再把焦点抢到 canvas。
   r.focusOnClick = false;
   applyQuality();
 
@@ -185,6 +190,7 @@ function connect() {
 
 function scheduleReconnect() {
   clearTimeout(reconnectTimer);
+  if (navigator.onLine === false) { setStatus('网络已断开，等待恢复…'); return; }
   // 只有"连上并撑住 5 秒"才算成功, 才把间隔退回 1 秒。
   // 否则服务端一崩就是"连上->秒断->重置成1秒->再连"的死循环, 每秒轰炸一次
   // —— 手机看到的就是隔 1 秒闪一次重连, 桌面也被这些连接拖得更卡。
@@ -221,6 +227,16 @@ window.addEventListener('pagehide', () => {
   wantConnected = false;
   clearTimeout(reconnectTimer);
   if (rfb) { try { rfb.disconnect(); } catch (e) {} }
+});
+window.addEventListener('offline', () => {
+  clearTimeout(reconnectTimer);
+  setStatus('网络已断开，等待恢复…');
+});
+window.addEventListener('online', () => {
+  if (!wantConnected || document.hidden) return;
+  // 切网后旧 TCP 可能仍显示 OPEN；直接重建，避免等待服务端超时。
+  reconnectDelay = 1000;
+  connect();
 });
 
 // ================= 右上角实时延迟 =================
@@ -331,10 +347,12 @@ async function pingOnce() {
   pingBusy = true;
   const t0 = performance.now();
   try {
-    await fetchAbort('/api/health?t=' + Date.now(), 5000);
+    const response = await fetchAbort('/api/health?t=' + Date.now(), 10000);
+    if (!response.ok) throw new Error('健康检查失败');
     const ms = performance.now() - t0;
     pingEma = pingEma ? pingEma * 0.6 + ms * 0.4 : ms;
-    renderPing(pingEma);
+    updateAutoSaver(ms);
+    renderPing(S.showPing ? pingEma : null);
   } catch (e) {
     renderPing(null);
   } finally {
@@ -344,7 +362,7 @@ async function pingOnce() {
 
 function startPing() {
   stopPing();
-  if (!S.showPing) { renderPing(null); return; }
+  // 自动画质需要持续测量；关闭延迟显示只影响显示。
   pingOnce();
   pingTimer = setInterval(pingOnce, 5000);
 }
@@ -692,6 +710,15 @@ function setKb(open) {
   syncKbBtn();
 }
 $('vnc-kbbtn').addEventListener('click', () => setKb(!kbOpen));
+// 按钮会阻止自然失焦，因此触控板、滚轮和画面操作要显式收起软键盘。
+function dismissKbForInteraction(e) {
+  if (!kbOpen) return;
+  const target = e.target;
+  if (target === kb || target?.closest?.('#vnc-kbbtn, #keybar')) return;
+  setKb(false);
+}
+document.addEventListener('pointerdown', dismissKbForInteraction, { capture: true });
+document.addEventListener('wheel', dismissKbForInteraction, { capture: true, passive: true });
 kb.addEventListener('focus', () => { kbOpen = true; syncKbBtn(); });
 kb.addEventListener('blur', () => {
   kbOpen = false;
@@ -1256,13 +1283,25 @@ function onRemoteClipboard(text) {
 // ================= 设置面板 =================
 function applyQuality() {
   if (!rfb) return;
-  const q = S.dataSaver ? 3 : S.quality;
+  const q = S.dataSaver || autoSaver ? 3 : S.quality;
   rfb.qualityLevel = q;
   rfb.compressionLevel = QUALITY_MAP[q] ?? 2;
 }
 function applySaverUI() {
-  $('vnc-saver').classList.toggle('on', !!S.dataSaver);
-  $('vnc-saver').setAttribute('aria-pressed', S.dataSaver ? 'true' : 'false');
+  const enabled = S.dataSaver || autoSaver;
+  $('vnc-saver').classList.toggle('on', enabled);
+  $('vnc-saver').setAttribute('aria-pressed', enabled ? 'true' : 'false');
+  $('vnc-saver').textContent = autoSaver && !S.dataSaver ? '自动省流' : '省流';
+  $('vnc-saver').title = autoSaver ? '高延迟自动降低画质；网络恢复后还原' : '手动降低画质和传输量';
+}
+function updateAutoSaver(ms) {
+  slowSamples = ms >= 450 ? slowSamples + 1 : 0;
+  fastSamples = ms <= 200 ? fastSamples + 1 : 0;
+  const next = slowSamples >= 2 ? true : fastSamples >= 4 ? false : autoSaver;
+  if (next === autoSaver) return;
+  autoSaver = next;
+  applyQuality();
+  applySaverUI();
 }
 $('vnc-saver').addEventListener('click', () => {
   S.dataSaver = !S.dataSaver;
