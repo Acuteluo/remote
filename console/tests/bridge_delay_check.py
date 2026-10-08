@@ -18,7 +18,7 @@ def echo():
  finally:peer.close()
 threading.Thread(target=echo,daemon=True).start()
 def bridge():
- with patch.object(m.socket,'create_connection',return_value=backend),patch.object(m,'_vnc_register'),patch.object(m,'_vnc_unregister'),patch.object(m,'audit'):
+ with patch.object(m.socket,'create_connection',return_value=backend),patch.object(m,'_vnc_register'),patch.object(m,'_vnc_unregister'),patch.object(m,'audit'),patch.object(m,'VNC_PING_EVERY',20):
   m.ws_vnc_bridge(ws, 'delay-check')
 t=threading.Thread(target=bridge);t.start()
 def send(op,data=b''):

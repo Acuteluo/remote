@@ -27,6 +27,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -98,52 +99,68 @@ DEFAULT_CONFIG = {"typeMode": "auto", "typeBatch": 80, "typeDelayMs": 20,
                   # 但编辑器里 Ctrl+V 正常、集成终端里不行"的应用, 光看类名分不出来,
                   # 只能靠"用户手动选一次 -> 按类名记住"。
                   "modeByClass": {}}
-_cfg_mtime = -1.0
+_cfg_lock = threading.RLock()
+_cfg_mtime = -1
 _cfg_data = dict(DEFAULT_CONFIG)
 
 
 def load_config():
     global _cfg_mtime, _cfg_data
-    try:
-        mt = os.path.getmtime(CONFIG_FILE)
-    except OSError:
+    with _cfg_lock:
+        try:
+            mt = os.stat(CONFIG_FILE).st_mtime_ns
+        except OSError:
+            return dict(_cfg_data)
+        if mt == _cfg_mtime:
+            return dict(_cfg_data)
+        try:
+            with open(CONFIG_FILE) as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                merged = dict(DEFAULT_CONFIG)
+                for k in DEFAULT_CONFIG:
+                    if k in d and d[k] is not None:
+                        merged[k] = d[k]
+                _cfg_data = merged
+        except (OSError, ValueError) as e:
+            audit("cfg", f"读取 config.json 失败(沿用旧值): {e}")
+        _cfg_mtime = mt
         return dict(_cfg_data)
-    if mt == _cfg_mtime:
-        return dict(_cfg_data)
-    try:
-        with open(CONFIG_FILE) as f:
-            d = json.load(f)
-        if isinstance(d, dict):
-            merged = dict(DEFAULT_CONFIG)
-            for k in DEFAULT_CONFIG:
-                if k in d and d[k] is not None:
-                    merged[k] = d[k]
-            _cfg_data = merged
-    except (OSError, ValueError) as e:
-        audit("cfg", f"读取 config.json 失败(沿用旧值): {e}")
-    _cfg_mtime = mt
-    return dict(_cfg_data)
 
 
 def save_config(patch):
-    d = load_config()
-    for k, v in (patch or {}).items():
-        if k in DEFAULT_CONFIG and v is not None:
-            d[k] = v
-    try:
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(d, f, ensure_ascii=False, indent=2)
-    except OSError as e:
-        return False, str(e), d
-    # 两个都要声明: 漏了 _cfg_data 的话赋值只会写进函数局部变量, 缓存保持旧值,
-    # 于是 POST 返回的是新配置、再 GET 又变回旧的(实际踩过)。
     global _cfg_mtime, _cfg_data
-    try:
-        _cfg_mtime = os.path.getmtime(CONFIG_FILE)
-    except OSError:
-        _cfg_mtime = -1.0      # 拿不到就下次强制重读
-    _cfg_data = d
-    return True, "ok", d
+    with _cfg_lock:
+        d = load_config()
+        for k, v in (patch or {}).items():
+            if k in DEFAULT_CONFIG and v is not None:
+                d[k] = v
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=".config.", suffix=".tmp", dir=os.path.dirname(CONFIG_FILE))
+            with os.fdopen(fd, "w") as f:
+                json.dump(d, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, CONFIG_FILE)
+            tmp_path = None
+        except OSError as e:
+            return False, str(e), d
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        # Read-modify-write is serialized, and replacement makes readers see either
+        # the old complete JSON or the new complete JSON, never a partially written file.
+        try:
+            _cfg_mtime = os.stat(CONFIG_FILE).st_mtime_ns
+        except OSError:
+            _cfg_mtime = -1
+        _cfg_data = d
+        return True, "ok", d
 
 
 def _resolve_port(cli, env_key, cfg_key, default, lo=1024, hi=65535):
@@ -257,9 +274,20 @@ def set_credentials(user, pw):
     return auth
 
 
+_setup_lock = threading.Lock()
+
+
 def need_setup():
     """还没有凭据 -> 必须先走一次"首次设置"。"""
     return AUTH is None
+
+
+def setup_credentials(user, pw):
+    with _setup_lock:
+        if not need_setup():
+            return False
+        set_credentials(user, pw)
+        return True
 
 
 def ensure_config():
@@ -650,9 +678,28 @@ def clip_set(text, selection="clipboard"):
 # 所以所有往 X 注入输入的动作都必须**串行且保序**。这里用"专职线程 + FIFO
 # 队列"而不是"每个请求抢一把锁": 锁只能保证互斥, 挡不住后到的请求插到前面,
 # 而打字顺序错了比丢字更难发现。
-_XIN_Q = queue.Queue()
+_XIN_MAX_DEPTH = 20
+_XIN_Q = queue.Queue(maxsize=_XIN_MAX_DEPTH)
 _XIN_LOCK = threading.Lock()
 _XIN_WORKER = None
+
+
+class InputResult(tuple):
+    """保持二元返回值兼容性，同时标明失败后是否能安全改走键入。"""
+    def __new__(cls, ok, msg, retry_safe=False):
+        result = super().__new__(cls, (ok, msg))
+        result.retry_safe = retry_safe
+        return result
+
+
+class _InputJob:
+    def __init__(self, fn):
+        self.fn = fn
+        self.done = threading.Event()
+        self.lock = threading.Lock()
+        self.started = False
+        self.cancelled = False
+        self.result = None
 
 
 def _xin_worker_loop():
@@ -660,13 +707,17 @@ def _xin_worker_loop():
         job = _XIN_Q.get()
         if job is None:
             return
-        fn, done, box = job
+        with job.lock:
+            if job.cancelled:
+                job.done.set()
+                continue
+            job.started = True
         try:
-            box.append(fn())
+            job.result = job.fn()
         except Exception as e:                      # 绝不能让工作线程死掉
-            box.append((False, f"输入线程异常: {e}"))
+            job.result = InputResult(False, f"输入线程异常: {e}")
         finally:
-            done.set()
+            job.done.set()
 
 
 def _xin_ensure_worker():
@@ -678,7 +729,6 @@ def _xin_ensure_worker():
             _XIN_WORKER.start()
 
 
-_XIN_MAX_DEPTH = 20                 # 队列里最多压这么多活, 再多就拒绝
 _XIN_MAX_WAIT = 120.0               # 单个任务的最长等待, 防止 HTTP 线程无限堆积
 _last_ime_logged = "init"           # 输入法门禁结果只在变化时记一条
 
@@ -690,15 +740,21 @@ def _xin_submit(fn, budget):
     if depth >= _XIN_MAX_DEPTH:
         # 宁可明确报错, 也不能让 HTTP 线程无上限地堆下去 —— 那才是真的卡死
         return False, f"输入队列拥塞(积压 {depth} 个), 请稍后再试"
-    done = threading.Event()
-    box = []
-    _XIN_Q.put((fn, done, box))
+    job = _InputJob(fn)
+    try:
+        _XIN_Q.put_nowait(job)
+    except queue.Full:
+        return InputResult(False, "输入队列已满，请稍后再试")
     wait = min(_XIN_MAX_WAIT, max(budget, 10.0 + depth * 2.0))
-    if not done.wait(timeout=wait):
-        return False, f"输入队列超时(等了 {wait:.0f}s, 前面还有 {depth} 个任务)"
-    if not box:
+    if not job.done.wait(timeout=wait):
+        with job.lock:
+            if not job.started:
+                job.cancelled = True
+                return InputResult(False, "输入排队超时，已取消未执行的任务")
+        return InputResult(False, "输入执行超时，送达状态未知；请检查远端后再重试")
+    if job.result is None:
         return False, "输入线程无返回"
-    return box[0]
+    return job.result
 
 
 # ---------------------------------------------------------------- 输入法守卫
@@ -929,15 +985,39 @@ def _focus_is_terminal():
 _clip_rlock = threading.Lock()
 _clip_restore_timer = None
 _clip_original = None
+_clip_generation = 0
+_clip_session_active = False
 
 
-def _restore_clip_job():
-    global _clip_restore_timer, _clip_original
+def _restore_clip_job(generation=None):
+    global _clip_restore_timer, _clip_original, _clip_session_active
     with _clip_rlock:
+        if generation is not None and generation != _clip_generation:
+            return True, "已跳过过期的剪贴板还原"
         orig, _clip_original, _clip_restore_timer = _clip_original, None, None
-    if not orig:
+        _clip_session_active = False
+    if orig is None:
         return True, "无需还原"
     return clip_set(orig)
+
+
+def _cancel_clip_restore():
+    global _clip_restore_timer, _clip_original, _clip_generation, _clip_session_active
+    with _clip_rlock:
+        _clip_generation += 1
+        if _clip_restore_timer is not None:
+            _clip_restore_timer.cancel()
+        _clip_restore_timer, _clip_original, _clip_session_active = None, None, False
+
+
+def _set_clip_persistent(text):
+    _cancel_clip_restore()
+    return clip_set(text)
+
+
+def _paste_persistent(text, combo):
+    _cancel_clip_restore()
+    return _paste_job(text, combo)
 
 
 def _combo_raw(combo):
@@ -959,17 +1039,17 @@ def _paste_job(text, combo="ctrl+v"):
     """
     ok, msg = clip_set(text)
     if not ok:
-        return False, f"剪贴板写入失败: {msg}"
+        return InputResult(False, f"剪贴板写入失败: {msg}", retry_safe=True)
     if combo != "shift+Insert":
-        return _combo_raw(combo)
+        return InputResult(*_combo_raw(combo))
     # xterm 的 Shift+Insert 读 PRIMARY，不读 CLIPBOARD。保留原 PRIMARY，
     # 临时同步过去完成粘贴后再还原，避免覆盖用户当前选中的文本。
     original = clip_get(selection="primary")
     ok, msg = clip_set(text, selection="primary")
     if not ok:
-        return False, f"PRIMARY 写入失败: {msg}"
+        return InputResult(False, f"PRIMARY 写入失败: {msg}", retry_safe=True)
     try:
-        return _combo_raw(combo)
+        return InputResult(*_combo_raw(combo))
     finally:
         if original is not None:
             clip_set(original, selection="primary")
@@ -981,20 +1061,25 @@ def _paste_raw(text, combo="ctrl+v"):
     这是往 Chromium/Electron/GTK 应用里送文本**最可靠**的方式: 完全不碰键映射,
     也就绕开了"应用 keymap 缓存没更新 -> 同一个字反复出现"那个坑。
     """
-    global _clip_original, _clip_restore_timer
+    global _clip_original, _clip_restore_timer, _clip_generation, _clip_session_active
     with _clip_rlock:
-        if _clip_restore_timer is None:      # 一段连续输入的开头才记录原内容
+        _clip_generation += 1
+        generation = _clip_generation
+        if not _clip_session_active:      # 一段连续输入的开头才记录原内容
+            _clip_session_active = True
             _clip_original = clip_get(timeout=0.5)
-        else:
+        if _clip_restore_timer is not None:
             _clip_restore_timer.cancel()     # 取消上一个待还原, 下面重新排
     res = _xin_submit(lambda: _paste_job(text, combo), budget=20.0)
 
     with _clip_rlock:
+        if generation != _clip_generation:
+            return res
         if _clip_restore_timer is not None:
             _clip_restore_timer.cancel()
         # 空闲 1.5 秒才还原: 连续打字时不断被推迟, 所以绝不会插进两次粘贴之间
         _clip_restore_timer = threading.Timer(
-            1.5, lambda: _xin_submit(_restore_clip_job, budget=10.0))
+            1.5, lambda: _xin_submit(lambda: _restore_clip_job(generation), budget=10.0))
         _clip_restore_timer.daemon = True
         _clip_restore_timer.start()
     return res
@@ -1031,13 +1116,14 @@ def _remember_mode_for_class(mode):
     key = _focus_key()
     if not key:
         return
-    cfg = load_config()
-    mbc = dict(cfg.get("modeByClass") or {})
-    if mode == "auto":
-        mbc.pop(key, None)
-    else:
-        mbc[key] = mode
-    save_config({"modeByClass": mbc})
+    with _cfg_lock:
+        cfg = load_config()
+        mbc = dict(cfg.get("modeByClass") or {})
+        if mode == "auto":
+            mbc.pop(key, None)
+        else:
+            mbc[key] = mode
+        save_config({"modeByClass": mbc})
 
 
 def deliver_text(text, req_mode=None):
@@ -1056,15 +1142,21 @@ def deliver_text(text, req_mode=None):
     # kitty、alacritty、konsole、foot 用 Ctrl+Shift+V; 老 xterm 只能 Shift+Insert。
     if mode == "term":
         combo = _paste_combo(mode)
-        ok, msg = _paste_raw(text, combo)
+        result = _paste_raw(text, combo)
+        ok, msg = result
         if ok:
             return True, msg, f"粘贴({combo})"
+        if not getattr(result, "retry_safe", False):
+            return False, msg, f"粘贴({combo})"
         ok2, msg2 = type_text(text)
         return ok2, (msg2 if ok2 else f"{msg} / {msg2}"), "键入(终端粘贴失败)"
 
-    ok, msg = _paste_raw(text, "ctrl+v")
+    result = _paste_raw(text, "ctrl+v")
+    ok, msg = result
     if ok:
         return True, msg, "粘贴(Ctrl+V)"
+    if not getattr(result, "retry_safe", False):
+        return False, msg, "粘贴(Ctrl+V)"
     # 剪贴板这条路走不通(没装 xclip / 选区被占)就退回逐字键入
     ok2, msg2 = type_text(text)
     return ok2, (msg2 if ok2 else f"{msg} / {msg2}"), "键入(剪贴板不可用)"
@@ -1132,8 +1224,8 @@ class WSConn:
         # 数据发得出去(TCP 缓冲收着), 但对端早就不处理了。
         self.last_pong = time.time()
         self.ping_rtt_ms = None
-        self._ping_payload = None
-        self._ping_started = 0.0
+        self._pending_pings = {}
+        self._ping_lock = threading.Lock()
         self.send_started = None
         self.last_send_ms = 0.0
         self.last_send_at = 0.0
@@ -1162,9 +1254,13 @@ class WSConn:
     def ping(self):
         try:
             # 包括等待发送锁的耗时，反映画面通道实际拥堵。
-            self._ping_started = time.monotonic()
-            self._ping_payload = b"hb" + struct.pack(">d", self._ping_started)
-            self.send_frame(0x9, self._ping_payload)
+            started = time.monotonic()
+            payload = b"hb" + struct.pack(">d", started)
+            with self._ping_lock:
+                self._pending_pings[payload] = started
+                if len(self._pending_pings) > 8:
+                    del self._pending_pings[next(iter(self._pending_pings))]
+            self.send_frame(0x9, payload)
         except OSError:
             self.alive = False
 
@@ -1209,8 +1305,10 @@ class WSConn:
                 continue
             if opcode == 0xA:
                 self.last_pong = time.time()
-                if self._ping_payload is not None and data == self._ping_payload:
-                    self.ping_rtt_ms = (time.monotonic() - self._ping_started) * 1000
+                with self._ping_lock:
+                    started = self._pending_pings.pop(data, None)
+                if started is not None:
+                    self.ping_rtt_ms = (time.monotonic() - started) * 1000
                 continue
             if opcode in (0x1, 0x2):
                 if msg_op is not None:
@@ -1833,6 +1931,8 @@ def ws_term_bridge(ws):
             return
         _term_count += 1
     pid = fd = None
+    master = slave = None
+    p = pty_thread = None
     try:
         env = _term_env()
         senv = session_env()
@@ -1840,8 +1940,7 @@ def ws_term_bridge(ws):
             env.update({k: v for k, v in senv.items()
                         if k in ("DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS")})
 
-        # 用 Popen 而非 pty.fork: 多线程进程里 fork+exec 之间执行 Python 代码
-        # (execvpe 找 PATH 等)可能死锁; Popen 的 exec 在 C 层完成, 无此风险。
+        # 控制终端初始化放到独立解释器中，多线程服务不使用 preexec_fn。
         try:
             master, slave = os.openpty()
         except OSError as e:
@@ -1856,22 +1955,32 @@ def ws_term_bridge(ws):
             ws.close()
             return
 
-        def _child_init():
-            os.setsid()
+        try:
+            p = subprocess.Popen(
+                [sys.executable, os.path.join(BASE_DIR, "pty_shell.py")], stdin=slave, stdout=slave,
+                stderr=slave, cwd=env["HOME"], env=env,
+                start_new_session=True, close_fds=True)
+        except OSError as e:
+            audit("term", f"终端启动失败(Popen): {e}")
             try:
-                fcntl.ioctl(slave, 0x540E, 0)      # TIOCSCTTY: 设为控制终端
+                ws.send_text(json.dumps(
+                    {"t": "err", "d": f"无法启动终端: {e}"}))
             except OSError:
                 pass
-
-        p = subprocess.Popen(
-            ["bash", "--login", "-i"], stdin=slave, stdout=slave, stderr=slave,
-            cwd=env["HOME"], env=env, preexec_fn=_child_init, close_fds=True)
-        os.close(slave)
+            ws.close()
+            return
         pid, fd = p.pid, master
+        master = None
+        os.close(slave)
+        slave = None
 
         def pty_reader():
+            import select
             try:
-                while True:
+                while ws.alive:
+                    ready, _, _ = select.select([fd], [], [], 1)
+                    if not ready:
+                        continue
                     data = os.read(fd, 65536)
                     if not data:
                         break
@@ -1885,7 +1994,8 @@ def ws_term_bridge(ws):
                 except OSError:
                     pass
 
-        threading.Thread(target=pty_reader, daemon=True).start()
+        pty_thread = threading.Thread(target=pty_reader, daemon=True)
+        pty_thread.start()
         threading.Thread(target=lambda: _hb(ws), daemon=True).start()
 
         while ws.alive:
@@ -1895,6 +2005,8 @@ def ws_term_bridge(ws):
             try:
                 msg = json.loads(payload.decode())
             except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(msg, dict):
                 continue
             t = msg.get("t")
             if t == "i" and isinstance(msg.get("d"), str):
@@ -1908,21 +2020,40 @@ def ws_term_bridge(ws):
                     rows = max(2, min(int(msg.get("r", 24)), 200))
                     fcntl.ioctl(fd, 0x5414, struct.pack("HHHH", rows, cols, 0, 0))  # TIOCSWINSZ
                     os.kill(pid, signal.SIGWINCH)
-                except OSError:
+                except (OSError, TypeError, ValueError, OverflowError):
                     pass
     except (WSClosed, OSError):
         pass
     finally:
+        for pty_fd in (master, slave):
+            if pty_fd is not None:
+                try:
+                    os.close(pty_fd)
+                except OSError:
+                    pass
+        ws.alive = False
+        try:
+            ws.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         if pid is not None:
             try:
                 os.kill(pid, signal.SIGHUP)
             except (ProcessLookupError, OSError):
                 pass
+        if pty_thread is not None:
+            pty_thread.join(timeout=2)
         if fd is not None:
             try:
                 os.close(fd)
             except OSError:
                 pass
+        if p is not None:
+            try:
+                p.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        ws.close()
         with _term_lock:
             _term_count -= 1
 
@@ -1941,6 +2072,7 @@ def _hb(ws):
 # 最后所有人都卡。僵尸客户端(手机锁屏/切网留下的)尤其致命。
 # 这里登记所有活着的桥接, 超过上限就把最早的踢掉 —— 保证最多只有这么多个。
 MAX_VNC_BRIDGES = 2
+VNC_PING_EVERY = 5
 _vnc_lock = threading.Lock()
 _vnc_bridges = []            # [[创建时间, teardown, 本地端口], ...] 按时间升序
 _vnc_network = {}            # viewer id -> WSConn；桥接退出时移除
@@ -2127,7 +2259,7 @@ def ws_vnc_bridge(ws, viewer=""):
                 break
             if time.time() - ws.last_pong > 40:
                 break
-            if time.time() - last_ping >= 20:
+            if time.time() - last_ping >= VNC_PING_EVERY:
                 ws.ping()
                 last_ping = time.time()
                 if not ws.alive:
@@ -2391,11 +2523,11 @@ _CAM_SIZES = ("320x240", "640x480", "1280x720")
 # 「还有人在看吗」的**唯一判据是前端 JS 主动发来的心跳**, 不是 WebSocket 的 pong:
 # 浏览器/系统的网络栈会自动回 pong, 哪怕页面早就切到后台、JS 已经被挂起。
 # 所以 JS 心跳一停(切后台/锁屏/离开), 就当没人看, 关掉摄像头。
-CAM_IO_TIMEOUT = 10         # socket 读写超时: 卡死的客户端要在 10s 内被断掉
 # 下面两个允许用环境变量压小 —— 好让 console/tests/cam_check.py 几秒内就能
 # 把"心跳停了会不会自己停采"验完(生产环境保持默认)。
 CAM_PING_EVERY = float(os.environ.get("MEOW_CAM_PING_EVERY") or 5)
 CAM_VIEWER_TIMEOUT = float(os.environ.get("MEOW_CAM_VIEWER_TIMEOUT") or 20)
+CAM_IO_TIMEOUT = max(10, CAM_VIEWER_TIMEOUT)  # IO 超时不早于观看心跳宽限
 
 
 V4L2_CAP_VIDEO_CAPTURE = 0x00000001
@@ -3546,7 +3678,7 @@ def _audio_cmd(kind, src):
 # 谁; 最后一个人走了还留 AUDIO_LINGER 秒宽限, 期间重连等于**零空档**。
 AUDIO_LINGER = 2.5
 _hub = {"key": None, "proc": None, "chunks": None, "stop": None,
-        "subs": [], "first": b"", "bytes": 0, "gen": 0}
+        "subs": [], "first": b"", "bytes": 0, "gen": 0, "idle_epoch": 0}
 _hub_lock = threading.Lock()
 
 
@@ -3600,9 +3732,9 @@ def _hub_stop_locked():
             pass
 
 
-def _hub_stop_if_idle():
+def _hub_stop_if_idle(epoch):
     with _hub_lock:
-        if not _hub["subs"]:
+        if epoch == _hub["idle_epoch"] and not _hub["subs"]:
             _hub_stop_locked()
 
 
@@ -3611,36 +3743,48 @@ def _hub_detach(q):
         if q in _hub["subs"]:
             _hub["subs"].remove(q)
         idle = not _hub["subs"]
+        _hub["idle_epoch"] += 1
+        epoch = _hub["idle_epoch"]
     if idle:
-        threading.Timer(AUDIO_LINGER, _hub_stop_if_idle).start()
+        timer = threading.Timer(AUDIO_LINGER, _hub_stop_if_idle, args=(epoch,))
+        timer.daemon = True
+        timer.start()
 
 
-def _hub_ensure(src, kind):
-    """保证有一路 (src, kind) 采集在跑; 已在跑就直接复用。返回 (proc, err)。"""
+def _hub_ensure(src, kind, subscriber):
+    """在同一临界区内确保采集并订阅，返回 (proc, stop, err)。"""
     key = (src, kind)
 
     def usable():
         p = _hub["proc"]
         return _hub["key"] == key and p is not None and p.poll() is None
 
+    def attach():
+        _hub["idle_epoch"] += 1
+        if _hub["first"]:
+            subscriber.put_nowait(_hub["first"])
+        _hub["subs"].append(subscriber)
+        return _hub["proc"], _hub["stop"], ""
+
     with _hub_lock:
         if usable():
-            return _hub["proc"], ""
+            return attach()
     with _audio_lock:
         with _hub_lock:
             if usable():
-                return _hub["proc"], ""
+                return attach()
             _hub_stop_locked()
             proc, chunks, first, err = _audio_start(src, kind=kind)
             if proc is None:
-                return None, err
+                return None, None, err
             stop = threading.Event()
             _hub.update(key=key, proc=proc, chunks=chunks, stop=stop,
                         first=first, subs=[], bytes=0,
                         gen=_hub["gen"] + 1)     # 换了一路采集 -> 世代号 +1
+            result = attach()
         threading.Thread(target=_hub_fan, args=(proc, chunks, stop),
                          daemon=True).start()
-        return proc, ""
+        return result
 
 
 def _audio_start(src, first_timeout=4.0, kind="pulse"):
@@ -3866,8 +4010,8 @@ def _asset_v(m):
     """
     rel = m.group(1)
     try:
-        return "%s?v=%d" % (rel, int(os.path.getmtime(
-            os.path.join(STATIC_DIR, rel[len("/static/"):]))))
+        return "%s?v=%d" % (rel, os.stat(
+            os.path.join(STATIC_DIR, rel[len("/static/"):])).st_mtime_ns)
     except OSError:
         return rel
 
@@ -4044,21 +4188,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            f"(试过 {len(_tried)} 个候选)")
         if kind == "pulse" and src != "default":
             audio_unmute(src)          # 内置麦克风常被默认静音
-        proc, err = _hub_ensure(src, kind)
+        q = queue.Queue(maxsize=64)
+        proc, stop, err = _hub_ensure(src, kind, q)
         if proc is None:
             self._json({"ok": False,
                         "err": "采集声音失败: " + _audio_hint(err)})
             return
-        q = queue.Queue(maxsize=64)
-        with _hub_lock:
-            if _hub["first"]:              # 让新来的立刻有数据, 不用干等第一包
-                try:
-                    q.put_nowait(_hub["first"])
-                except queue.Full:
-                    pass
-            _hub["subs"].append(q)
-            stop = _hub["stop"]
-
         audit("audio", f"开始采集声音 {src} (pid={proc.pid})")
         try:
             self.send_response(200)
@@ -4138,7 +4273,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         # ETag 用 修改时间+大小 拼, 不用读文件内容 —— 够用且零成本
-        etag = f'"{int(st.st_mtime)}-{st.st_size}"'
+        etag = f'"{st.st_mtime_ns}-{st.st_size}"'
         # 第三方库(vendor)内容永不变 → 长期缓存, 重复进入**零请求**
         # 我们自己的文件必须能立刻生效 → no-cache + ETag(走 304, 只花一个往返)
         cache = ("public, max-age=31536000, immutable"
@@ -4163,7 +4298,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             extra["Vary"] = "Accept-Encoding"
         if (compressible and len(body) > 512
                 and "gzip" in self.headers.get("Accept-Encoding", "")):
-            key = (path, int(st.st_mtime), st.st_size)
+            key = (path, st.st_mtime_ns, st.st_size)
             with _gzip_lock:
                 gz = _gzip_cache.get(key)
             if gz is None:
@@ -4404,16 +4539,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._html(404, "<h1>404</h1>")
 
     # ---- POST
+    def _post_body(self, limit):
+        """拒绝负长度、过大或不完整的请求体，避免阻塞及后续请求错位。"""
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            if n < 0:
+                raise ValueError("请求体长度不能为负数")
+            if n > limit:
+                self.close_connection = True
+                self._json({"ok": False, "err": "请求内容过大"}, code=413)
+                return None
+            body = self.rfile.read(n)
+            if len(body) != n:
+                raise ValueError("请求内容不完整")
+            return body.decode("utf-8")
+        except (OSError, ValueError, UnicodeDecodeError) as e:
+            self.close_connection = True
+            self._json({"ok": False, "err": f"无法读取请求内容: {e}"}, code=400)
+            return None
+
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
         # 表单类接口(/login /setup)共用一个 body 读取, 别在各分支里各读一遍
         body = ""
         if path in ("/login", "/setup"):
-            try:
-                n = int(self.headers.get("Content-Length", 0))
-                body = self.rfile.read(n).decode()
-            except (OSError, ValueError, UnicodeDecodeError):
-                body = ""
+            body = self._post_body(16 * 1024)
+            if body is None:
+                return
         if path == "/login":
             ip = self.client_address[0]
             form = urllib.parse.parse_qs(body)
@@ -4457,7 +4609,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if pw != pw2:
                 self._login_page("两次输入的密码不一致")
                 return
-            set_credentials(user2, pw)
+            if not setup_credentials(user2, pw):
+                self._html(403, "已经设置过账号了, 不能重设")
+                return
             audit("init", f"首次设置完成 user={user2}")
             self._redirect("/home", extra={
                 "Set-Cookie": (f"{COOKIE_NAME}={make_token()}; Path=/; "
@@ -4466,11 +4620,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self._user():
             self._json({"ok": False, "err": "未登录"}, code=401)
             return
+        body = self._post_body(12 * 1024 * 1024 if path == "/api/bg" else 1024 * 1024)
+        if body is None:
+            return
         try:
-            n = int(self.headers.get("Content-Length", 0))
-            data = json.loads(self.rfile.read(n).decode() or "{}")
-        except (OSError, ValueError, UnicodeDecodeError):
-            data = {}
+            data = json.loads(body or "{}")
+            if not isinstance(data, dict):
+                raise ValueError("请求内容必须是 JSON 对象")
+        except ValueError as e:
+            self._json({"ok": False, "err": f"参数错误: {e}"}, code=400)
+            return
         if path == "/api/power":
             action = data.get("action", "")
             if not data.get("confirm") and action in ("suspend", "reboot", "poweroff"):
@@ -4685,7 +4844,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not isinstance(text, str):
                 self._json({"ok": False, "err": "参数错误"})
                 return
-            ok, msg = clip_set(text)
+            ok, msg = _xin_submit(lambda: _set_clip_persistent(text), budget=20.0)
             audit("clip", f"写入远程剪贴板 {len(text)} 字 {'OK' if ok else 'FAIL'}")
             self._json({"ok": ok, "msg": msg})
         elif path == "/api/type":
@@ -4717,8 +4876,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if isinstance(text, str) and text:
                 # 面板的“粘贴”原本会保留写入的远端剪贴板；只把设值与按键
                 # 合成一个队列任务，不改变这个语义。
-                ok, msg = _xin_submit(lambda: _paste_job(text, combo), budget=20.0)
+                result = _xin_submit(lambda: _paste_persistent(text, combo), budget=20.0)
+                ok, msg = result
                 if not ok:
+                    if not getattr(result, "retry_safe", False):
+                        self._json({"ok": False, "msg": msg})
+                        return
                     # 选区或粘贴键失败时退化成逐字键入。
                     # 但键入是每字 ~4ms, 8000 字要敲 40 秒 —— 期间界面一直停在
                     # "粘贴中…", 看着就跟卡死一样(实测到的"粘贴卡死"就是这个)。
@@ -4742,7 +4905,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     elif not current:
                         ok, msg = False, "远端剪贴板为空"
                     else:
-                        ok, msg = _xin_submit(lambda: _paste_job(current, combo),
+                        ok, msg = _xin_submit(lambda: _paste_persistent(current, combo),
                                              budget=20.0)
                 else:
                     ok, msg = send_paste_key(combo)

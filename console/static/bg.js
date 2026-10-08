@@ -90,16 +90,21 @@
   btnApply.addEventListener('click', () => {
     btnApply.disabled = true;
     setStatus('应用…');
-    const upload = file
-      ? toB64(file).then((b64) => fetch('/api/bg', {
+    const uploadFile = file;
+    const uploadUrl = objUrl;
+    const upload = uploadFile
+      ? toB64(uploadFile).then((b64) => fetch('/api/bg', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ img: b64, mime: file && file.type }),
+        body: JSON.stringify({ img: b64, mime: uploadFile.type }),
       })).then((r) => r.json()).then((j) => {
         if (!j || !j.ok) throw new Error((j && j.err) || '上传失败');
         hasImg = true; ver = j.ver || Date.now();
-        if (objUrl) { URL.revokeObjectURL(objUrl); objUrl = null; }
-        file = null;
+        if (file === uploadFile) file = null;
+        if (objUrl === uploadUrl && uploadUrl) {
+          URL.revokeObjectURL(uploadUrl);
+          objUrl = null;
+        }
       })
       : Promise.resolve();
 

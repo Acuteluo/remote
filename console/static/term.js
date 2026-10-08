@@ -29,30 +29,50 @@ const fit = new FitAddon.FitAddon();
 term.loadAddon(fit);
 term.open(document.getElementById('terminal'));
 
-let ws = null, manualClose = false;
+let ws = null, reconnectTimer = 0;
 
 function wsSend(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
 
 function connect() {
-  manualClose = false;
+  clearTimeout(reconnectTimer);
+  if (ws && ws.readyState < 2) {
+    ws.onclose = null;
+    try { ws.close(); } catch (e) {}
+  }
   statusEl.textContent = '连接中…';
-  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/term`);
-  ws.binaryType = 'arraybuffer';
-  ws.onopen = () => {
+  const socket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/term`);
+  ws = socket;
+  socket.binaryType = 'arraybuffer';
+  socket.onopen = () => {
+    if (ws !== socket) return;
     // 不写死家目录: 换台机器/换个用户就错了。bash 起来后自己会打印提示符, 这里不用多说。
     statusEl.textContent = '已连接';
     doFit();
     term.focus();
   };
-  ws.onmessage = (e) => {
+  socket.onmessage = (e) => {
+    if (ws !== socket) return;
     if (e.data instanceof ArrayBuffer) term.write(new Uint8Array(e.data));
-    else term.write(e.data);
+    else {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.t === 'err') {
+          statusEl.textContent = msg.d || '终端启动失败';
+          term.write('\r\n' + statusEl.textContent + '\r\n');
+          return;
+        }
+      } catch (e) { /* 普通文字原样显示 */ }
+      term.write(e.data);
+    }
   };
-  ws.onclose = () => {
+  socket.onclose = () => {
+    if (ws !== socket) return;
     statusEl.textContent = '连接断开';
-    if (!manualClose) setTimeout(connect, 2000);
+    reconnectTimer = setTimeout(connect, 2000);
   };
-  ws.onerror = () => { statusEl.textContent = '连接出错'; };
+  socket.onerror = () => {
+    if (ws === socket) statusEl.textContent = '连接出错';
+  };
 }
 
 function doFit() {
@@ -80,7 +100,7 @@ document.querySelectorAll('.qkbar button').forEach((b) => {
   });
 });
 document.getElementById('term-reconnect').addEventListener('click', () => {
-  if (ws) { manualClose = true; ws.close(); }
+  clearTimeout(reconnectTimer);
   term.reset();
   connect();
 });

@@ -10,16 +10,22 @@ const fmtUp = (s) => {
   return (d ? d + '天' : '') + (h ? h + '时' : '') + m + '分';
 };
 
-let ws = null, hist = [];
+let ws = null, reconnectTimer = 0, hist = [];
 
 function connect() {
   if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
-  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/status`);
-  ws.onmessage = (e) => { try { render(JSON.parse(e.data)); } catch (err) {} };
-  ws.onclose = () => {
+  clearTimeout(reconnectTimer);
+  const socket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/status`);
+  ws = socket;
+  socket.onmessage = (e) => {
+    if (ws !== socket) return;
+    try { render(JSON.parse(e.data)); } catch (err) {}
+  };
+  socket.onclose = () => {
+    if (ws !== socket) return;
     ws = null;
     $('clock').textContent = '连接断开, 重连中…';
-    if (!document.hidden) setTimeout(connect, 3000);
+    if (!document.hidden) reconnectTimer = setTimeout(connect, 3000);
   };
 }
 connect();
@@ -28,7 +34,8 @@ connect();
 // 手机把标签页挂后台时还在跑纯属白烧 CPU, 会和远程桌面的图传抢资源。
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
-    if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+    clearTimeout(reconnectTimer);
+    if (ws) { const old = ws; ws = null; try { old.close(); } catch (e) {} }
   } else {
     connect();
   }

@@ -295,7 +295,7 @@ function renderRate(fps, kbs) {
       el.textContent = streamRtt == null ? '图传 --' : `图传 ${Math.round(streamRtt)}ms`;
       el.title = `图传帧率 ${fps.toFixed(1)} fps，码率 ${kbs >= 1024
         ? (kbs / 1024).toFixed(2) + ' MB/s' : kbs.toFixed(0) + ' KB/s'}\n`
-        + '图传数值为 WebSocket 心跳往返，含排队耗时；每20秒测量一次，并非画面渲染延时。';
+        + '图传数值为 WebSocket 心跳往返，含排队耗时；每5秒测量一次，并非画面渲染延时。';
       el.className = 'ping ' + (streamRtt == null || streamRtt < 200
         ? 'ok' : streamRtt < 500 ? 'warn' : 'bad');
     }
@@ -479,8 +479,14 @@ function showTypeErr(msg) {
 function flushType() {
   clearTimeout(typeTimer);
   if (typeBusy) return;                  // 上一批还没落地; 回来时 .finally 会续上
-  const s = typeBuf.join('');
-  typeBuf = [];
+  // 文本和特殊按键共用顺序队列，回车不能抢在 HTTP 文本前抵达。
+  while (typeof typeBuf[0] === 'function') {
+    try { typeBuf.shift()(); }
+    catch (e) { typeBuf = []; showTypeErr(e.message); return; }
+  }
+  const text = [];
+  while (typeBuf.length && typeof typeBuf[0] === 'string') text.push(typeBuf.shift());
+  const s = text.join('');
   if (!s) return;
   typeBusy = true;
   const ac = new AbortController();
@@ -493,15 +499,17 @@ function flushType() {
   }).then((r) => r.json().then((j) => [r.status, j]).catch(() => [r.status, null]))
     .then(([st, j]) => {
       if (j && j.ok) { clearInputAlert(); return; }
+      typeBuf = [];
       // **绝不再静默回退到 RFB 直发。**
       // 那条路送出去的按键会被远端 fcitx 收进预编辑缓冲: 屏幕上什么都不显示,
       // 攒到某次提交时一次性冒出来 —— 用户看到的就是"打这个出来的是上次的内容"。
       // 中文回退过去更是直接变乱码。宁可明确报错, 也不要产出这种鬼影文字。
       const err = (j && (j.err || j.msg)) || `HTTP ${st}`;
-      showTypeErr(err);
+      showTypeErr(err + '；后续排队输入已停止');
     }).catch(() => {
       // 断网/超时后无法知道服务端是否已经处理。直接重发会让文字重复。
-      showTypeErr('网络异常，送达状态未知；请检查远端窗口后再重试');
+      typeBuf = [];
+      showTypeErr('网络异常，送达状态未知；后续排队输入已停止，请检查远端窗口后再重试');
     }).finally(() => {
     clearTimeout(to);
     typeBusy = false;
@@ -548,16 +556,17 @@ let compGuardTimer = 0;
 function kbSync() {
   const cur = cleanText(kb.value);
   if (cur === kbLast) return;          // 幂等: 内容没变就什么都不做
-  const prev = kbLast;
+  const prev = Array.from(kbLast);
   kbLast = cur;
   // 有些输入法提交完会把输入框清空。那不是"用户删光了"(真删除走 keydown 的
   // Backspace), 照差分算会补发一大串退格, 把刚上屏的字删掉 —— 直接当重置处理。
   if (!cur) { kbLast = ''; return; }
   let i = 0;
-  const n = Math.min(prev.length, cur.length);
-  while (i < n && prev[i] === cur[i]) i++;
+  const chars = Array.from(cur);
+  const n = Math.min(prev.length, chars.length);
+  while (i < n && prev[i] === chars[i]) i++;
   const removed = prev.length - i;
-  const added = cur.slice(i);
+  const added = chars.slice(i).join('');
   if (!removed && !added) return;
   // 退格要经 RFB, 断线时发不出去; 此时只补新增, 至少不把已上屏的内容弄乱
   if (canSend()) {
@@ -604,7 +613,17 @@ kb.addEventListener('keydown', (e) => {
 function sendSpecial(name) {
   const t = SPECIAL[name];
   if (!t) return;
-  tapKey(t[0], t[1]);
+  const target = rfb;
+  const held = MODS.filter((m) => modsActive[m.key]);
+  clearMods();
+  typeBuf.push(() => {
+    if (!canSend() || rfb !== target) throw new Error('按键未发送：画面连接已改变');
+    for (const m of held) target.sendKey(m.keysym, m.code, true);
+    target.sendKey(t[0], t[1], true);
+    target.sendKey(t[0], t[1], false);
+    for (const m of held.slice().reverse()) target.sendKey(m.keysym, m.code, false);
+  });
+  flushType();
 }
 
 // 快捷键条
@@ -651,10 +670,16 @@ document.querySelectorAll('#keybar [data-combo]').forEach((b) => {
 
     const hold = HOLD_COMBO[combo];
     if (!hold) {                                   // 普通 combo: 快按快放即可
-      for (const m of held) rfb.sendKey(m.keysym, m.code, true);
-      rfb.sendKey(ks, code, true);
-      rfb.sendKey(ks, code, false);
-      for (const m of held.slice().reverse()) rfb.sendKey(m.keysym, m.code, false);
+      const target = rfb;
+      clearMods();
+      typeBuf.push(() => {
+        if (!canSend() || rfb !== target) throw new Error('快捷键未发送：画面连接已改变');
+        for (const m of held) target.sendKey(m.keysym, m.code, true);
+        target.sendKey(ks, code, true);
+        target.sendKey(ks, code, false);
+        for (const m of held.slice().reverse()) target.sendKey(m.keysym, m.code, false);
+      });
+      flushType();
       return;
     }
 

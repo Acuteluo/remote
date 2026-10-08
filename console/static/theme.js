@@ -17,6 +17,7 @@
   let SIZE = 320;              // 圆盘逻辑边长(resize 时重算)
   let cur = DEFAULT;           // 当前颜色 #rrggbb
   let dragging = false, sentAt = 0, sayAt = 0, rt = null;
+  let userChangedColor = false;
 
   // ---- 画盘面 ----
   function draw() {
@@ -230,6 +231,7 @@
 
   // ---- 取色 ----
   function pickAt(clientX, clientY) {
+    userChangedColor = true;
     const r = cv.getBoundingClientRect(), hw = r.width / 2;
     const dx = clientX - (r.left + hw), dy = clientY - (r.top + hw);
     const dist = Math.hypot(dx, dy), rad = Math.min(1, dist / hw),
@@ -257,6 +259,7 @@
 
   // ---- 按钮 ----
   $('th-random').addEventListener('click', () => {
+    userChangedColor = true;
     // 半径取 sqrt 才面积均匀, 否则取色都挤在圆心
     const rad = Math.sqrt(Math.random()) * 0.97, ang = Math.random() * 360;
     const hex = T.toHex(T.colorAt(rad, ang)), p = polar(rad, ang);
@@ -266,6 +269,7 @@
     st.textContent = '随便挑了一个';
   });
   $('th-reset').addEventListener('click', () => {
+    userChangedColor = true;
     apply(DEFAULT, { say: true });
     post(true);
     st.textContent = '已恢复默认蓝';
@@ -297,8 +301,9 @@
   fetch('/api/theme', { cache: 'no-store' })
     .then((r) => r.json())
     .then((j) => {
+      if (userChangedColor) return;
       apply(j && j.ok ? j.acc : DEFAULT, { keepPos: false });
       st.textContent = '拖动圆盘试试';
     })
-    .catch(() => { apply(DEFAULT, { keepPos: false }); });
+    .catch(() => { if (!userChangedColor) apply(DEFAULT, { keepPos: false }); });
 })();

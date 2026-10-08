@@ -106,6 +106,12 @@ check("登录成功", cookie.startswith("meow_session="), cookie[:20] + "…")
 CK = {"Cookie": cookie}
 st, _, body = req("GET", "/api/vnc/network?viewer=missing", headers=CK)
 check("失效图传返回明确状态", st == 200 and json.loads(body) == {"ok": True, "active": False})
+st, _, body = req("POST", "/api/type", "[]", {**CK, "Content-Type": "application/json"})
+check("非对象 JSON 明确报错", st == 400 and not json.loads(body)["ok"])
+st, _, body = req("POST", "/api/type", headers={**CK, "Content-Length": "-1"})
+check("负请求长度被拒绝", st == 400)
+st, _, body = req("POST", "/api/type", headers={**CK, "Content-Length": str(2 * 1024 * 1024)})
+check("超大请求在读取前被拒绝", st == 413)
 
 st, _, body = req("GET", "/api/dock", headers=CK)
 j = json.loads(body)
