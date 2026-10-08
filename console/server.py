@@ -364,7 +364,9 @@ _session_env = None
 def session_env():
     """探测图形会话的 DISPLAY/XAUTHORITY 等, 供 wmctrl / xset / 终端使用。"""
     global _session_env
-    if _session_env is not None:
+    # 启动时 X11 可能还没就绪。缺少 DISPLAY 的探测结果不能缓存，
+    # 否则此后所有 /api/type 都会永久报 "Can't open display:"。
+    if _session_env is not None and _session_env.get("DISPLAY"):
         return _session_env
     env = {}
     try:
@@ -380,7 +382,7 @@ def session_env():
                         env[k] = v.decode()
     except (OSError, subprocess.SubprocessError):
         pass
-    if "DISPLAY" not in env and os.path.isdir("/tmp/.X11-unix"):
+    if not env.get("DISPLAY") and os.path.isdir("/tmp/.X11-unix"):
         xs = sorted(glob.glob("/tmp/.X11-unix/X*"))
         if xs:
             env["DISPLAY"] = ":" + os.path.basename(xs[0])[1:]
@@ -399,7 +401,8 @@ def session_env():
             env["XAUTHORITY"] = os.path.expanduser("~/.Xauthority")
     if not env:
         return None
-    _session_env = env
+    if env.get("DISPLAY"):
+        _session_env = env
     return env
 
 
