@@ -31,7 +31,6 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from input_receipts import InputReceipts
 from email.utils import formatdate
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -197,7 +196,6 @@ WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 # 而不是"探到 200 就算好了" —— 服务是延迟 ~1.2s 才重启的, 提前探到的 200 是
 # **旧进程**在应答, 那时 reload 会正好撞进重启窗口, 页面直接打不开(用户报的 bug)。
 BOOT_ID = secrets.token_hex(4)
-INPUT_RECEIPTS = InputReceipts(BOOT_ID)
 CLK_TCK = os.sysconf("SC_CLK_TCK") or 100
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 
@@ -4456,7 +4454,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/health":
             # boot: 本进程的启动标识, 前端靠它判断"服务是否真的换了进程"
             self._json({"ok": True, "app": "meow-console", "boot": BOOT_ID,
-                        "inputVersion": 3, "serverTimeMs": round(time.time() * 1000)})
+                        "inputVersion": 2})
             return
         if path.startswith("/static/"):
             # 静态资源不含敏感信息, 放在鉴权前 —— 否则登录页 CSS 会被重定向
@@ -4485,12 +4483,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # 本地扩展的私有路由(比如 /dsh)先接; 没扩展时这里等于不存在。
         if LOCAL_EXTRAS and LOCAL_EXTRAS.handle_route(path, self):
             return
-        if path == "/api/input/status":
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            code, result = INPUT_RECEIPTS.status(user, query.get("requestId", [""])[0],
-                                                 query.get("boot", [""])[0])
-            self._json(result, code=code)
-        elif path == "/home":
+        if path == "/home":
             net = self.access_host()
             self._html(200, render("home.html", user=user, host=net,
                                    extras=(LOCAL_EXTRAS.quick_links(net)
@@ -4953,13 +4946,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             mode = data.get("mode")
             if "requestId" in data:
-                def execute_input():
-                    ok, msg, how = deliver_text(text, mode if isinstance(mode, str) else None)
-                    audit("clip", f"{how} {len(text)} 字 {'OK' if ok else 'FAIL'}")
-                    return {"ok": ok, "msg": msg}
-                code, result = INPUT_RECEIPTS.submit(self._user(), data,
-                                                     {"text": text, "mode": mode}, execute_input)
-                self._json(result, code=code)
+                # 已打开的旧页面可能仍按回执协议重试，不能当普通输入执行。
+                self._json({"ok": False, "err": "输入确认功能已回退，请刷新页面"}, code=409)
                 return
             ok, msg, how = deliver_text(text, mode if isinstance(mode, str) else None)
             # 只记首字的码点, 不记整句(可能在输密码)。用来判断"到服务端时字对不对":
