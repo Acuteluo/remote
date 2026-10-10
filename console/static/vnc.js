@@ -829,7 +829,6 @@ $('vnc-keybtn').addEventListener('click', () => {
   S.keybar = !S.keybar;
   saveS();
   applyKeybar();
-  window.dispatchEvent(new Event('resize'));
 });
 
 // ================= 指针注入原语 =================
@@ -855,6 +854,28 @@ function canvasEl() { return document.querySelector('#screen canvas'); }
 let cRect = null, cRectAt = 0;
 
 function invalidateRect() { cRect = null; }
+
+// 等布局落地再重新适配。window.resize 本身不会调用 noVNC 的缩放逻辑。
+let screenFitFrame = 0;
+function scheduleScreenFit() {
+  invalidateRect();
+  if (screenFitFrame) return;
+  screenFitFrame = requestAnimationFrame(() => {
+    screenFitFrame = 0;
+    if (!rfb || !connected) return;
+    const screen = $('screen');
+    const transform = screen.style.transform;
+    try {
+      // 全屏捏合是视觉放大，不能把 transform 后的尺寸再当作适配尺寸。
+      screen.style.transform = '';
+      rfb.scaleViewport = true;   // 公共 setter 会按当前容器重新 autoscale
+    } finally {
+      screen.style.transform = transform;
+    }
+    zClamp(); zApply();
+    invalidateRect(); virtClamp(); placeCursor(); edgeUpdate();
+  });
+}
 
 function canvasRect() {
   const now = performance.now();
@@ -1027,17 +1048,25 @@ function placeCursor() {
 }
 
 window.addEventListener('resize', () => {
-  invalidateRect(); virtClamp(); placeCursor(); edgeUpdate();
+  scheduleScreenFit();
 });
 window.addEventListener('orientationchange', () => {
-  invalidateRect(); setTimeout(() => { invalidateRect(); virtClamp(); placeCursor(); }, 300);
+  scheduleScreenFit(); setTimeout(scheduleScreenFit, 300);
 });
+// 观察真正占用画面空间的外层容器，覆盖按键栏、触控板及提示条等显隐。
+if (typeof ResizeObserver !== 'undefined') {
+  new ResizeObserver(scheduleScreenFit).observe($('screen-wrap'));
+}
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', scheduleScreenFit);
+  window.visualViewport.addEventListener('scroll', scheduleScreenFit);
+}
 
 $('vnc-padbtn').addEventListener('click', () => {
-  // 触控板常驻(默认开); 收起时图传占满, 通知 noVNC 重新适配尺寸
+  // 触控板常驻(默认开); 收起后重新适配增加的画面空间。
   const hide = padPanel.classList.toggle('hide');
   $('vnc-padbtn').classList.toggle('on', !hide);
-  window.dispatchEvent(new Event('resize'));
+  scheduleScreenFit();
   if (!hide) virtInit();
 });
 
@@ -1440,6 +1469,7 @@ $('vnc-saver').addEventListener('click', () => {
 function applyPadH() {
   $('pad-area').style.height = S.padH + 'px';
   $('set-padh-v').textContent = S.padH + 'px';
+  scheduleScreenFit();
 }
 function applyHints() {
   document.querySelector('#pad-area .hint').style.display = S.hints ? '' : 'none';
@@ -1447,6 +1477,7 @@ function applyHints() {
 function applyKeybar() {
   $('keybar').classList.toggle('hide', !S.keybar);
   $('vnc-keybtn').classList.toggle('on', S.keybar);
+  scheduleScreenFit();
 }
 function applyScrollUI() {
   $('set-scroll').value = Math.round(S.scrollSpeed * 10);
@@ -1576,7 +1607,6 @@ $('set-padh').addEventListener('input', (e) => {
   S.padH = Number(e.target.value);
   $('set-padh-v').textContent = S.padH + 'px';
   applyPadH();
-  window.dispatchEvent(new Event('resize'));
   saveS();
 });
 $('set-scroll').addEventListener('input', (e) => {
@@ -2101,10 +2131,9 @@ function fsShowUi() {
   fsHideTimer = setTimeout(() => ui.classList.remove('show'), 3500);
 }
 
-// 布局变了要让 noVNC 重新按容器算画布尺寸。
-// noVNC 用的是 ResizeObserver, 但容器是 fixed 定位切换的, 补一次 resize 事件最稳。
+// 全屏切换后按实际容器重新适配，并更新放大状态的平移范围。
 function fsResize() {
-  try { window.dispatchEvent(new Event('resize')); } catch (e) { /* ignore */ }
+  scheduleScreenFit();
   // 画布重新适配容器之后, 放大状态的平移范围也要跟着更新(转屏 / 进出全屏)
   zClamp(); zApply();
 }
