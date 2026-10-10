@@ -31,6 +31,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+from input_receipts import InputReceipts
 from email.utils import formatdate
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -196,6 +197,7 @@ WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 # 而不是"探到 200 就算好了" —— 服务是延迟 ~1.2s 才重启的, 提前探到的 200 是
 # **旧进程**在应答, 那时 reload 会正好撞进重启窗口, 页面直接打不开(用户报的 bug)。
 BOOT_ID = secrets.token_hex(4)
+INPUT_RECEIPTS = InputReceipts(BOOT_ID)
 CLK_TCK = os.sysconf("SC_CLK_TCK") or 100
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 
@@ -2076,20 +2078,85 @@ VNC_PING_EVERY = 5
 _vnc_lock = threading.Lock()
 _vnc_bridges = []            # [[创建时间, teardown, 本地端口], ...] 按时间升序
 _vnc_network = {}            # viewer id -> WSConn；桥接退出时移除
+_TAILSCALE_PATH_TTL = 30.0
+_tailscale_path_lock = threading.Lock()
+_tailscale_path_cache = {"at": 0.0, "value": None, "refreshing": False}
+
+
+def _refresh_tailscale_path():
+    """后台读取 tailnet 路径；网络指标请求不等待此子进程。"""
+    try:
+        result = subprocess.run(["tailscale", "status", "--json"],
+                                capture_output=True, text=True, timeout=2)
+        try:
+            status = json.loads(result.stdout) if result.returncode == 0 else {}
+        except (TypeError, ValueError):
+            status = {}
+        peers = status.get("Peer") if isinstance(status, dict) else None
+        if not isinstance(peers, dict):
+            summary = {"state": "unknown", "peers": []}
+        else:
+            active = []
+            for peer in peers.values():
+                if not isinstance(peer, dict) or not peer.get("Active"):
+                    continue
+                relay = str(peer.get("Relay") or "").strip()
+                cur_addr = str(peer.get("CurAddr") or "").strip()
+                # CurAddr means a direct endpoint is currently selected. Relay can
+                # still name the peer's preferred DERP region, so check it second.
+                route = ("direct" if cur_addr else
+                         f"DERP relay ({relay})" if relay else
+                         "active; route unavailable")
+                active.append({
+                    "device": str(peer.get("HostName") or "unknown device"),
+                    "os": str(peer.get("OS") or "unknown"),
+                    "path": route,
+                })
+            summary = {"state": "ok" if active else "no_active_peer",
+                       "peers": active}
+    except (OSError, subprocess.SubprocessError):
+        summary = {"state": "unknown", "peers": []}
+    summary["scope"] = "tailnet active peers; not a confirmed route for this viewer"
+    with _tailscale_path_lock:
+        _tailscale_path_cache.update(at=time.monotonic(), value=summary,
+                                     refreshing=False)
+
+
+def _tailscale_path_summary():
+    """Return cached path immediately and schedule at most one stale refresh."""
+    with _tailscale_path_lock:
+        now = time.monotonic()
+        cached = _tailscale_path_cache["value"]
+        fresh = (cached is not None and
+                 now - _tailscale_path_cache["at"] < _TAILSCALE_PATH_TTL)
+        if not fresh and not _tailscale_path_cache["refreshing"]:
+            _tailscale_path_cache["refreshing"] = True
+            worker = threading.Thread(target=_refresh_tailscale_path,
+                                      name="tailscale-path-refresh", daemon=True)
+            try:
+                worker.start()
+            except RuntimeError:
+                _tailscale_path_cache["refreshing"] = False
+        if cached is not None:
+            return cached
+        return {"state": "unknown", "peers": [],
+                "scope": "tailnet active peers; not a confirmed route for this viewer"}
 
 
 def vnc_network_stats(viewer):
+    path_summary = _tailscale_path_summary()
     with _vnc_lock:
         ws = _vnc_network.get(viewer)
         if ws is None:
-            return {"active": False}
+            return {"active": False, "tailnetPath": path_summary}
         now = time.monotonic()
         started = ws.send_started
         pending_ms = (now - started) * 1000 if started is not None else 0
         recent_ms = ws.last_send_ms if now - ws.last_send_at < 10 else 0
         return {"active": ws.alive, "rttMs": ws.ping_rtt_ms,
                 "sendMs": max(pending_ms, recent_ms),
-                "pongAgeMs": (time.time() - ws.last_pong) * 1000}
+                "pongAgeMs": (time.time() - ws.last_pong) * 1000,
+                "tailnetPath": path_summary}
 
 
 def _vnc_register(teardown, port=None):
@@ -4389,7 +4456,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/health":
             # boot: 本进程的启动标识, 前端靠它判断"服务是否真的换了进程"
             self._json({"ok": True, "app": "meow-console", "boot": BOOT_ID,
-                        "inputVersion": 2})
+                        "inputVersion": 3, "serverTimeMs": round(time.time() * 1000)})
             return
         if path.startswith("/static/"):
             # 静态资源不含敏感信息, 放在鉴权前 —— 否则登录页 CSS 会被重定向
@@ -4418,7 +4485,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # 本地扩展的私有路由(比如 /dsh)先接; 没扩展时这里等于不存在。
         if LOCAL_EXTRAS and LOCAL_EXTRAS.handle_route(path, self):
             return
-        if path == "/home":
+        if path == "/api/input/status":
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            code, result = INPUT_RECEIPTS.status(user, query.get("requestId", [""])[0],
+                                                 query.get("boot", [""])[0])
+            self._json(result, code=code)
+        elif path == "/home":
             net = self.access_host()
             self._html(200, render("home.html", user=user, host=net,
                                    extras=(LOCAL_EXTRAS.quick_links(net)
@@ -4880,6 +4952,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                    f"请改用剪贴板粘贴"})
                 return
             mode = data.get("mode")
+            if "requestId" in data:
+                def execute_input():
+                    ok, msg, how = deliver_text(text, mode if isinstance(mode, str) else None)
+                    audit("clip", f"{how} {len(text)} 字 {'OK' if ok else 'FAIL'}")
+                    return {"ok": ok, "msg": msg}
+                code, result = INPUT_RECEIPTS.submit(self._user(), data,
+                                                     {"text": text, "mode": mode}, execute_input)
+                self._json(result, code=code)
+                return
             ok, msg, how = deliver_text(text, mode if isinstance(mode, str) else None)
             # 只记首字的码点, 不记整句(可能在输密码)。用来判断"到服务端时字对不对":
             # 手机上打的是"你好", 首字应是 U+4F60; 若对不上就是前端/手机输入法那头错了。

@@ -291,6 +291,7 @@ function renderPing(ms) {
 // ---- 图传帧率 / 码率 / 通道往返 ----
 // 每秒刷新一次。**卡不卡看帧率, 不看延迟**。
 let lastKbs = 0, lastFps = 0;
+let tailnetHint = '';
 
 function renderFsInfo() {
   const el = $('vnc-fs-info');
@@ -303,6 +304,7 @@ function renderFsInfo() {
   }
   parts.push(pingEma ? '网络 ' + Math.round(pingEma) + 'ms' : '网络 --');
   if (streamRtt != null) parts.push('图传往返 ' + Math.round(streamRtt) + 'ms');
+  if (tailnetHint) parts.push(tailnetHint);
   el.textContent = parts.join(' · ');
 }
 
@@ -360,6 +362,10 @@ async function pingOnce() {
     if (!response.ok) throw new Error(`连接检测失败（HTTP ${response.status}）`);
     const channel = await response.json();
     if (viewer !== viewerId) return;
+    const peers = channel.tailnetPath?.peers || [];
+    const direct = peers.some((p) => p.path === 'direct');
+    const relay = peers.some((p) => p.path.startsWith('DERP relay'));
+    tailnetHint = direct || relay ? '活跃设备路径：' + (direct && relay ? '直连/中继' : direct ? '直连' : '中继') : '';
     const ms = performance.now() - t0;
     pingEma = pingEma ? pingEma * 0.6 + ms * 0.4 : ms;
     streamRtt = typeof channel.rttMs === 'number' ? channel.rttMs : null;
@@ -474,6 +480,62 @@ function cleanText(s) { return String(s).replace(/[\r\n]/g, ''); }
 // 纯 ASCII 不受影响(实测 144/144 全到)。
 // 所以非 ASCII 改走服务端 xdotool type(它自己做重映射且带间隔), 实测 9/9 全到。
 let typeBuf = [], typeTimer = 0;
+let inputSession = null;
+
+function rememberInputSession(j) {
+  if (j?.ok && Number(j.inputVersion) >= 3 && typeof j.serverTimeMs === 'number') {
+    inputSession = { boot: j.boot, offset: j.serverTimeMs - Date.now() };
+  }
+}
+
+async function inputRequest(path, body, timeout = 6000) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeout);
+  try {
+    const response = await fetch(path, { method: body ? 'POST' : 'GET',
+      cache: 'no-store', headers: body ? { 'Content-Type': 'application/json' } : {},
+      body: body ? JSON.stringify(body) : undefined, signal: ac.signal });
+    if (response.redirected) return [401, { ok: false, err: '登录已失效，请重新登录' }];
+    return [response.status, await response.json()];
+  } finally { clearTimeout(timer); }
+}
+
+async function submitType(text, mode) {
+  if (!inputSession) {
+    const [status, j] = await inputRequest('/api/health');
+    if (status !== 200 || !j?.ok) throw new Error('无法确认输入服务版本，此次文字未发送');
+    rememberInputSession(j);
+    // 老进程只投递一次，不启用回执重试；升级后自动使用新协议。
+    if (!inputSession) return inputRequest('/api/type', { text, mode }, 15000);
+  }
+  const session = inputSession;
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  const requestId = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  const body = { text, mode, requestId, boot: session.boot,
+    issuedAt: Math.round(Date.now() + session.offset) };
+  const query = '/api/input/status?requestId=' + requestId + '&boot=' + encodeURIComponent(session.boot);
+  const deadline = Date.now() + 45000;
+  let first = true;
+  while (Date.now() < deadline) {
+    try {
+      let response;
+      if (first) { first = false; response = await inputRequest('/api/type', body); }
+      else {
+        response = await inputRequest(query);
+        // 同一进程确实没有该记录时，才以原ID提交；绝不生成新ID来重发。
+        if (response[0] === 404 && response[1]?.boot === session.boot) {
+          response = await inputRequest('/api/type', body);
+        }
+      }
+      const [status, result] = response;
+      if (status === 409) { inputSession = null; return response; }
+      if (status !== 202 || result?.state !== 'pending') return response;
+    } catch (e) { /* 查询或原ID重试，不走无回执的投递路径 */ }
+    showInputAlert('正在确认输入结果，请稍候；不会重复发送文字');
+    await sleep(1000);
+  }
+  throw new Error('输入确认超时，送达状态未知；请检查远端窗口');
+}
 
 // 同一时刻只允许一个 /api/type 在飞。
 // 服务端虽然已经把 xdotool 串行化了, 但前端若不自律, 后一批请求会在前一批
@@ -532,14 +594,7 @@ function flushType() {
   if (!s) return;
   releaseHold();                         // 切窗后再键入时不能仍按着 Alt
   typeBusy = true;
-  const ac = new AbortController();
-  // 15 秒足够本地 xdotool 敲完 normal 批次(5000 字约 10 秒)。别设太长 ——
-  // 一次卡住期间 typeBuf 会一直攒, 攒够了再一次性发出去, 就是"上次的内容"。
-  const to = setTimeout(() => ac.abort(), 15e3);
-  fetch('/api/type', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text: s, mode: S.typeMode || 'auto' }), signal: ac.signal,
-  }).then((r) => r.json().then((j) => [r.status, j]).catch(() => [r.status, null]))
+  submitType(s, S.typeMode || 'auto')
     .then(([st, j]) => {
       if (j && j.ok) { clearInputAlert(); return; }
       typeBuf = [];
@@ -549,12 +604,11 @@ function flushType() {
       // 中文回退过去更是直接变乱码。宁可明确报错, 也不要产出这种鬼影文字。
       const err = (j && (j.err || j.msg)) || `HTTP ${st}`;
       showTypeErr(err + '；后续排队输入已停止');
-    }).catch(() => {
+    }).catch((e) => {
       // 断网/超时后无法知道服务端是否已经处理。直接重发会让文字重复。
       typeBuf = [];
-      showTypeErr('网络异常，送达状态未知；后续排队输入已停止，请检查远端窗口后再重试');
+      showTypeErr((e.message || '网络异常，送达状态未知') + '；后续排队输入已停止，请检查远端窗口');
     }).finally(() => {
-    clearTimeout(to);
     typeBusy = false;
     // /api/type 在 GUI 应用里是走剪贴板投递的, 等于我们改了剪贴板
     selfClipUntil = Date.now() + 2500;
@@ -1897,6 +1951,7 @@ startPing();      // 右上角延迟: 不依赖 VNC 是否连上, 开机就测
   try {
     const r = await fetch('/api/health', { cache: 'no-store' });
     const j = await r.json();
+    rememberInputSession(j);
     if (Number(j.inputVersion) >= 2) return;
     const el = $('vnc-banner');
     el.classList.add('show');
