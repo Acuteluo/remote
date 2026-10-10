@@ -86,6 +86,7 @@ let rateAt = 0, rateBytes0 = 0, rateFrames0 = 0;
 
 function connect() {
   clearTimeout(reconnectTimer);
+  resetDragLock(true);
   if (rfb) { try { rfb.disconnect(); } catch (e) {} rfb = null; }
   connected = false;
   networkError = '';
@@ -181,6 +182,7 @@ function connect() {
   r.addEventListener('disconnect', (e) => {
     if (rfb !== r) return;
     connected = false;
+    resetDragLock(false);
     releaseHold();          // 断连时必须松开按住的 Alt, 否则远端修饰键卡死
     const clean = e.detail && e.detail.clean;
     // **先别弹中央提示**。手机锁屏/切网络/切后台常常只造成几秒抖动, 一断就在
@@ -923,7 +925,11 @@ function queueMove() {
 
 function press(b) { mask |= b; sendPointer(mask); }
 function release(b) { mask &= ~b; sendPointer(mask); }
-function click(b) { press(b); release(b); }
+function click(b) {
+  // 点击与持续锁定同一键时不发送“松开”，避免触控板点按解除拖动锁。
+  if (dragLock === b) return;
+  press(b); release(b);
+}
 
 function wheelStep(dirY, dirX) {
   if (!ready()) return;
@@ -973,9 +979,27 @@ const EDGE_ENTER = 6;                      // 进入边缘区(px) -> 锁死到�
 const EDGE_EXIT = 18;                      // 退出边缘区(px) -> 解锁(滞回, 防止抖动打断)
 let edgeLatch = 0;                         // 边缘锁 位掩码: 1=下 2=上 4=左 8=右
 const virt = { x: 0, y: 0, ok: false };
-let dragLock = false;                      // 拖动锁(按钮切换, 常驻)
+let dragLock = 0;                          // 0=关闭, BTN_LEFT/BTN_RIGHT=持续按住
 let tapDrag = false;                       // 双击后按住拖拽(手势, 自动释放)
 let lastTapAt = 0;
+
+function syncDragLockUI() {
+  const btn = $('pad-drag');
+  const labels = new Map([[0, '不拖动'], [BTN_LEFT, '左键锁定'], [BTN_RIGHT, '右键锁定']]);
+  btn.textContent = labels.get(dragLock);
+  btn.classList.toggle('on', dragLock !== 0);
+  btn.setAttribute('aria-pressed', dragLock !== 0 ? 'true' : 'false');
+  btn.setAttribute('aria-label', `拖动锁当前${labels.get(dragLock)}；点击切换`);
+}
+
+function resetDragLock(sendRelease) {
+  if (sendRelease && mask) sendPointer(0);
+  mask = 0;
+  tapDrag = false;
+  dragLock = 0;
+  lastTapAt = 0;
+  syncDragLockUI();
+}
 
 function virtInit() {
   invalidateRect();
@@ -1216,10 +1240,15 @@ holdRepeat($('pad-wu'), () => wheelStep(-1, 0));
 holdRepeat($('pad-wd'), () => wheelStep(1, 0));
 
 $('pad-drag').addEventListener('click', () => {
-  dragLock = !dragLock;
-  $('pad-drag').classList.toggle('on', dragLock);
-  if (dragLock) press(BTN_LEFT); else release(BTN_LEFT);
+  const next = dragLock === 0 ? BTN_LEFT : dragLock === BTN_LEFT ? BTN_RIGHT : 0;
+  if (tapDrag) { tapDrag = false; release(BTN_LEFT); }
+  lastTapAt = 0;
+  if (dragLock) release(dragLock);
+  dragLock = next;
+  if (dragLock) press(dragLock);
+  syncDragLockUI();
 });
+syncDragLockUI();
 $('pad-speed').addEventListener('click', () => {
   speedIdx = (speedIdx + 1) % SPEEDS.length;
   S.speed = speedIdx; saveS();
