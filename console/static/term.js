@@ -1,6 +1,7 @@
 // Web 终端: xterm.js <-> /ws/term
 'use strict';
 const statusEl = document.getElementById('term-status');
+if (window.LoadTip) LoadTip.start(['页面', '样式', '终端就绪']);
 const FONT_KEY = 'meow_term_font';
 // 主题色: 终端的光标、以及 ANSI 蓝, 都跟着它走(原来写死成默认蓝 #4da3ff)。
 // 页面里 render() 注入的 :root{--acc} 已经生效, 所以这里读得到。
@@ -12,10 +13,16 @@ const term = new Terminal({
   fontFamily: '"Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace',
   cursorBlink: true,
   scrollback: 5000,
+  // 背景跟着全局的自定义背景走(原来是写死的 #0b0f14 -> 整屏全黑)。
+  // 画布透明 + 页面那层半透明面板(#terminal, 见 app.css) = 底图透出来,
+  // 文字又不会被照片晃得看不清; 透出多少由设置里"背景透明度"统一控制。
+  // allowTransparency 是 xterm 允许画布透明的开关, 不开的话某些渲染器仍会
+  // 自己铺一层不透明底色。
+  allowTransparency: true,
   theme: {
-    background: '#0b0f14', foreground: '#dce6f2', cursor: ACC,
+    background: 'rgba(0,0,0,0)', foreground: '#dce6f2', cursor: ACC,
     selectionBackground: '#264f78',
-    black: '#0b0f14', red: '#ff6b6b', green: '#3ecf8e', yellow: '#ffb454',
+    black: '#5a6a7d', red: '#ff6b6b', green: '#3ecf8e', yellow: '#ffb454',
     blue: ACC, magenta: '#c792ea', cyan: '#56d4dd', white: '#dce6f2',
   },
 });
@@ -23,30 +30,55 @@ const fit = new FitAddon.FitAddon();
 term.loadAddon(fit);
 term.open(document.getElementById('terminal'));
 
-let ws = null, manualClose = false;
+let ws = null, reconnectTimer = 0;
 
 function wsSend(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
 
 function connect() {
-  manualClose = false;
+  clearTimeout(reconnectTimer);
+  if (ws && ws.readyState < 2) {
+    ws.onclose = null;
+    try { ws.close(); } catch (e) {}
+  }
   statusEl.textContent = '连接中…';
-  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/term`);
-  ws.binaryType = 'arraybuffer';
-  ws.onopen = () => {
+  const socket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/term`);
+  ws = socket;
+  socket.binaryType = 'arraybuffer';
+  socket.onopen = () => {
+    if (ws !== socket) return;
     // 不写死家目录: 换台机器/换个用户就错了。bash 起来后自己会打印提示符, 这里不用多说。
     statusEl.textContent = '已连接';
     doFit();
     term.focus();
   };
-  ws.onmessage = (e) => {
-    if (e.data instanceof ArrayBuffer) term.write(new Uint8Array(e.data));
-    else term.write(e.data);
+  socket.onmessage = (e) => {
+    if (ws !== socket) return;
+    if (e.data instanceof ArrayBuffer) {
+      term.write(new Uint8Array(e.data));
+      // 第一坨输出到了 = shell 提示符出来了, 才算真的能用(WS onopen 只是连上)
+      if (window.LoadTip) LoadTip.step('终端就绪');
+    }
+    else {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.t === 'err') {
+          if (window.LoadTip) LoadTip.fail('终端就绪', msg.d || '终端启动失败');
+          statusEl.textContent = msg.d || '终端启动失败';
+          term.write('\r\n' + statusEl.textContent + '\r\n');
+          return;
+        }
+      } catch (e) { /* 普通文字原样显示 */ }
+      term.write(e.data);
+    }
   };
-  ws.onclose = () => {
+  socket.onclose = () => {
+    if (ws !== socket) return;
     statusEl.textContent = '连接断开';
-    if (!manualClose) setTimeout(connect, 2000);
+    reconnectTimer = setTimeout(connect, 2000);
   };
-  ws.onerror = () => { statusEl.textContent = '连接出错'; };
+  socket.onerror = () => {
+    if (ws === socket) statusEl.textContent = '连接出错';
+  };
 }
 
 function doFit() {
@@ -74,7 +106,7 @@ document.querySelectorAll('.qkbar button').forEach((b) => {
   });
 });
 document.getElementById('term-reconnect').addEventListener('click', () => {
-  if (ws) { manualClose = true; ws.close(); }
+  clearTimeout(reconnectTimer);
   term.reset();
   connect();
 });

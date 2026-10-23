@@ -42,6 +42,7 @@ function setStatus(text) {
 // ================= 设置(存 localStorage) =================
 // scrollDir: 1 = 双指上滑 -> 内容上移(继续往下读文档); -1 = 反之
 const DEFAULTS = { quality: 6, padH: 195, hints: true, scrollDir: 1, scrollSpeed: 1.0,
+                   dataSaver: false,
                    edgeNudge: false, dockFixVer: 0, keybar: false, showPing: true,
                    // 输入: 投递方式 + 攒批时间(越大=每次请求带的字越多=越省流量, 但手感稍迟)
                    typeMode: 'auto', typeBatch: 80,
@@ -70,19 +71,70 @@ let discoTimer = 0;        // 断线后延迟弹提示的计时器(抖动已恢�
 let everConnected = false; // 连上过一次之后, 重连过程就不再弹中央提示
 let reconnectTimer = 0;
 let hideTimer = 0;
+let autoSaver = false;
+let slowSamples = 0, fastSamples = 0;
+let viewerId = '', streamRtt = null;
+// 进远程桌面的加载进度: 页面 -> 建立连接 -> 首帧画面(见 loadtip.js)
+if (window.LoadTip) LoadTip.start(['页面', '样式', '建立连接', '首帧画面']);
+let networkError = '';
 
 // ---- 图传实际帧率/码率 ----
 // 为什么要显示这个: "延迟 <50ms 但画面很卡"是很常见的情况 —— 延迟量的是
 // HTTP 往返(几毫秒级), 而卡不卡取决于**每秒真正收到多少帧、多少数据**。
 // 两者是完全不同的指标, 只显示延迟会让人误判。
+// ---- 画面延时(帧龄) ----
+// 服务端每推一块画面前会先发一条 {"t":"f","s":<服务端毫秒>} 的**文本**帧,
+// s 是它**从 x11vnc 收到这块字节**的时刻。配合 /api/time 的时钟对齐,
+// 就能算出"屏幕上这一帧是多少秒以前的"。
+//
+// 注意这和 noVNC 自己的协议无关: noVNC 只吃二进制 RFB 字节流, 文本帧会把协议
+// 顶乱 —— 所以下面 CountingWS 里那层监听会把它拦掉(stopImmediatePropagation)。
+let clockOff = 0, clockOk = false, frameSentAt = 0, frameArrivedAt = 0;
+let curFrameAge = null;      // 最近一帧**到达时**的"年龄"(ms)
+
+// 延时显示(约定): **<1s 用整数毫秒**(3ms / 999ms), **>=1s 用秒**
+// (1.005s / 10.12s / 100.1s —— 秒这一档小数位随量级自适应, 宽度基本恒定)。
+// 采集模块 / 远程桌面 / 一键自检三处同一套, 改的时候一起改。
+const fmtLag = (ms) => {
+if (ms == null || !isFinite(ms) || ms < 0) return '--';
+if (ms < 1000) return Math.round(ms) + 'ms';
+const sec = ms / 1000;
+return sec.toFixed(sec < 10 ? 3 : sec < 100 ? 2 : 1) + 's';
+};
+// 红黄绿(自己定的门槛):
+//   画面延时  绿 <0.3s   黄 <1s   红 >=1s
+//   帧率      绿 >=15fps 黄 >=5fps 红 <5fps
+//             帧率 0 不上色 —— 桌面没变化时 x11vnc 本来就不发帧, 那不是故障。
+const lvLagVnc = (ms) => (ms == null ? '' : ms < 300 ? 'ok' : ms < 1000 ? 'warn' : 'bad');
+const lvFpsVnc = (f) => (!f ? '' : f >= 15 ? 'ok' : f >= 5 ? 'warn' : 'bad');
+
+async function syncClock() {
+  const c0 = Date.now();
+  const rs = await Promise.all([0, 1, 2].map(() =>
+    fetch('/api/time', { cache: 'no-store' })
+      .then((r) => r.json()).then((j) => ({ j, t: Date.now() }))
+      .catch(() => null)));
+  let best = null;
+  for (const x of rs) {
+    if (!x || typeof x.j.s !== 'number') continue;
+    const rtt = x.t - c0;
+    if (!best || rtt < best.rtt) best = { rtt, off: x.j.s - (c0 + rtt / 2) };
+  }
+  if (best) { clockOff = best.off; clockOk = true; }
+}
+syncClock();
+setInterval(syncClock, 30000);      // 手机网络会变, 定期重新对一次
+
 let wsRxBytes = 0;          // 收到的总字节(累加)
 let fbFrames = 0;           // FramebufferUpdate 次数(累加)
 let rateAt = 0, rateBytes0 = 0, rateFrames0 = 0;
 
 function connect() {
   clearTimeout(reconnectTimer);
+  resetDragLock(true);
   if (rfb) { try { rfb.disconnect(); } catch (e) {} rfb = null; }
   connected = false;
+  networkError = '';
   if (!everConnected) {
     // 首次连接才在中央提示; 重连时不弹 —— 否则每次抖动都会闪一下中央文字
     overlay.style.display = 'flex';
@@ -96,6 +148,8 @@ function connect() {
   releaseOverlay();
 
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  viewerId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+  streamRtt = null;
   // 统计码率: 临时包一层 WebSocket 数收到的字节数 —— noVNC 在构造 RFB 时
   // 就会建连, 所以只在这几行里替换, 建完立刻还原, 不影响别的地方。
   const NativeWS = window.WebSocket;
@@ -103,7 +157,18 @@ function connect() {
     const w = new NativeWS(...a);
     w.addEventListener('message', (ev) => {
       const d = ev.data;
-      if (typeof d === 'string') wsRxBytes += d.length;
+      if (typeof d === 'string') {
+        wsRxBytes += d.length;
+        // 服务端只在这条 RFB 流之外发错误提示; 画面时间戳走的是**旁路通道**
+        // (见下面 openTimeChannel), 所以这里不再需要拦文本帧。
+        try {
+          const msg = JSON.parse(d);
+          if (msg.t === 'err') {
+            networkError = msg.d || '远程桌面连接失败';
+            showInputAlert(networkError, 'network');
+          }
+        } catch (e) { /* 不是 JSON, 交给 noVNC */ }
+      }
       else if (d && d.byteLength) wsRxBytes += d.byteLength;
     });
     return w;
@@ -116,33 +181,58 @@ function connect() {
   let r;
   try {
     window.WebSocket = CountingWS;
-    r = new RFB($('screen'), `${proto}://${location.host}/ws/vnc`, { shared: true });
+    r = new RFB($('screen'), `${proto}://${location.host}/ws/vnc?viewer=${viewerId}`, { shared: true });
   } finally {
     window.WebSocket = NativeWS;
   }
   rfb = r;
-  // 数帧: noVNC 每处理一条 FramebufferUpdate 就调一次 _framebufferUpdate。
+  lastFbPointer = null;
+  // 普通画布由 noVNC 直接发鼠标，触控板走 sendPointer；两条路径统一记录。
+  const origMouse = r._sendMouse.bind(r);
+  r._sendMouse = function (x, y, buttons) {
+    if (rfb === r && r._rfbConnectionState === 'connected' && !r._viewOnly) {
+      lastFbPointer = { x: r._display.absX(x), y: r._display.absY(y) };
+    }
+    return origMouse(x, y, buttons);
+  };
+  // 只计完整更新；分包时同一条更新会多次调用 _framebufferUpdate。
   // 属于内部方法, 版本换了可能失效 —— 所以套 try, 失效就只显示码率。
   try {
     const origFb = r._framebufferUpdate.bind(r);
-    r._framebufferUpdate = function () { fbFrames++; return origFb(); };
+    r._framebufferUpdate = function () {
+      const complete = origFb();
+      if (complete) {
+        fbFrames++;
+        if (window.LoadTip) LoadTip.step('首帧画面');   // 第一帧真的画出来才算加载完
+        // 和采集模块同一个口径: 记的是**帧到达那一刻**, 延时在显示时才算。
+        // 为什么要分开: /api/time 的时钟对齐是异步的, 首帧常常在它完成之前
+        // 就到了 —— 那时算不了。桌面静止时又不会再来新帧, 于是那一栏会永远
+        // 停在 "--"。先记到达时刻, 等时钟对齐好再回头算, 就没这个问题。
+        frameArrivedAt = Date.now();
+      }
+      return complete;
+    };
   } catch (e) { /* 无所谓 */ }
   r.scaleViewport = true;
   r.background = '#000000';
-  // 别让 noVNC 在点图传时把焦点抢到 canvas 上 —— 那会让隐藏输入框失焦、
-  // 手机软键盘直接收起, 表现为"打着字点一下图传键盘就没了"。
+  // 由页面统一管理软键盘收起，避免 noVNC 再把焦点抢到 canvas。
   r.focusOnClick = false;
   applyQuality();
 
   r.addEventListener('connect', () => {
     if (rfb !== r) return;
+    if (window.LoadTip) LoadTip.step('建立连接');
     connected = true;
+    // 先按真实鼠标位置摆好 ○; 拿不到再退回居中(virtInit)
+    virtInitFromServer().then((ok) => { if (!ok) virtInit(); });
+    openTimeChannel();
     connectedAt = Date.now();
     everConnected = true;
     clearTimeout(discoTimer);          // 抖动已恢复, 不用弹提示了
     overlay.style.display = 'none';
     $('vnc-reconnect').style.display = 'none';
     setStatus('已连接');
+    if ($('vnc-input-alert').dataset.kind === 'network') clearInputAlert();
     virtInit();
     $('pad-cursor').style.display = 'block';
     startPing();                       // 右上角实时延迟
@@ -151,6 +241,7 @@ function connect() {
   r.addEventListener('disconnect', (e) => {
     if (rfb !== r) return;
     connected = false;
+    resetDragLock(false);
     releaseHold();          // 断连时必须松开按住的 Alt, 否则远端修饰键卡死
     const clean = e.detail && e.detail.clean;
     // **先别弹中央提示**。手机锁屏/切网络/切后台常常只造成几秒抖动, 一断就在
@@ -164,7 +255,8 @@ function connect() {
       if (connected) return;
       overlay.style.display = 'flex';
       overlayMsg.className = clean ? '' : 'err';
-      overlayMsg.textContent = clean ? '已断开' : '连接断开(远程桌面服务可能未启动)';
+      overlayMsg.textContent = networkError || (navigator.onLine === false
+        ? '本机网络不可用，等待网络恢复' : '连接中断，正在自动重连');
       $('vnc-reconnect').style.display = 'inline-block';
       setStatus('未连接');
     }, 5000);
@@ -184,6 +276,7 @@ function connect() {
 
 function scheduleReconnect() {
   clearTimeout(reconnectTimer);
+  if (navigator.onLine === false) { setStatus('网络已断开，等待恢复…'); return; }
   // 只有"连上并撑住 5 秒"才算成功, 才把间隔退回 1 秒。
   // 否则服务端一崩就是"连上->秒断->重置成1秒->再连"的死循环, 每秒轰炸一次
   // —— 手机看到的就是隔 1 秒闪一次重连, 桌面也被这些连接拖得更卡。
@@ -221,11 +314,20 @@ window.addEventListener('pagehide', () => {
   clearTimeout(reconnectTimer);
   if (rfb) { try { rfb.disconnect(); } catch (e) {} }
 });
+window.addEventListener('offline', () => {
+  clearTimeout(reconnectTimer);
+  setStatus('网络已断开，等待恢复…');
+});
+window.addEventListener('online', () => {
+  if (!wantConnected || document.hidden) return;
+  // 切网后旧 TCP 可能仍显示 OPEN；直接重建，避免等待服务端超时。
+  reconnectDelay = 1000;
+  connect();
+});
 
 // ================= 右上角实时延迟 =================
 // 用 /api/health 做一次极小请求测往返(HTTP RTT)。
-// 为什么不测 VNC 那条 WebSocket: 它是原始 RFB 字节流, 塞自定义消息会污染协议;
-// 而延迟的大头本来就是网络往返, HTTP RTT 完全能代表, 顺带还验证了服务端活着。
+// HTTP 测请求往返；服务端另外测 WebSocket 控制帧往返，不向 RFB 字节流塞消息。
 // 5s 一次 + 指数平滑(避免数字乱跳); 点一下立刻重测。
 let pingEma = 0, pingTimer = 0, pingBusy = false;
 
@@ -241,69 +343,94 @@ function renderPing(ms) {
     el.textContent = '网络 ' + Math.round(ms) + 'ms';
     el.className = 'ping ' + (ms < 80 ? 'ok' : ms < 200 ? 'warn' : 'bad');
   }
-  el.title = '网络延迟(HTTP 往返)。画面延时还要加上服务端变更检测和手机解码, '
-    + '看旁边那一栏';
+  el.title = '网络数值为 HTTP 往返；旁边图传数值为画面连接的 WebSocket 心跳往返。';
   renderFsInfo();
 }
 
-// ---- 图传帧率 / 码率 / 画面延时 ----
+// ---- 图传帧率 / 码率 / 通道往返 ----
 // 每秒刷新一次。**卡不卡看帧率, 不看延迟**。
 let lastKbs = 0, lastFps = 0;
-
-// 画面延时是**估算**, 不是实测 —— 只有网络那一段是真量出来的:
-//   网络单程            = HTTP RTT/2                         实测
-//   服务端变更检测      = x11vnc -wait 5 -defer 5, 最坏 10ms  由服务单元参数决定
-//   编码 + 手机解码渲染 = 约 15ms                             经验值, 没有接口可测
-// 常数 25ms = 10 + 15。它只保证"量级对"(几十毫秒), 不是标定过的真值:
-// 换台手机、换个码率, 那 15ms 就会变。真值只能拿高速摄像机拍屏幕。
-const PIC_SERVER_MS = 10;      // x11vnc -wait 5 -defer 5 的上界
-const PIC_CLIENT_MS = 15;      // JPEG 编码 + 手机解码合成, 经验值
-const PIC_FIXED_MS = PIC_SERVER_MS + PIC_CLIENT_MS;
-
-function picLatency() {
-  return pingEma ? Math.round(pingEma / 2 + PIC_FIXED_MS) : null;
-}
+let tailnetHint = '';
 
 function renderFsInfo() {
   const el = $('vnc-fs-info');
   if (!el) return;
   const parts = [];
   if (connected) parts.push(lastFps.toFixed(0) + 'fps');
+  if (connected) parts.push('画面 ' + fmtLag(curFrameAge) + ' 前');
   if (lastKbs) {
     parts.push(lastKbs >= 1024 ? (lastKbs / 1024).toFixed(1) + 'MB/s'
                                : lastKbs.toFixed(0) + 'KB/s');
   }
   parts.push(pingEma ? '网络 ' + Math.round(pingEma) + 'ms' : '网络 --');
-  const pic = picLatency();
-  if (pic != null) parts.push('画面 ' + pic + 'ms');
+  if (streamRtt != null) parts.push('图传往返 ' + Math.round(streamRtt) + 'ms');
+  if (tailnetHint) parts.push(tailnetHint);
   el.textContent = parts.join(' · ');
 }
 
-function renderRate(fps, kbs) {
+// 用户要求这一栏显示**本地帧率**和**画面延时(=最新一帧是多少秒以前的)**。
+// 以前显示的是 WebSocket 心跳往返 —— 那量的是控制帧 RTT, 不是画面有多旧
+// (心跳很快但画面卡住的情况完全存在), 两回事。
+// 帧率 0 不上色: 桌面静止时 x11vnc 本来就不发帧, 那不是故障。
+function paintRate() {
   const el = $('vnc-rate');
+  if (!el) return;
+  // 帧龄 = 这一帧**到达时**有多旧(不含 noVNC 解码/绘制那几毫秒)。
+  // 屏幕静止时没有新帧, 数字就停在上一次的值 —— 那正是"你看到的画面有多旧"。
+  // 夹到 0 以上: 同采集模块 —— 画面延时和时钟对齐误差(±RTT/2)是同一个量级,
+  // 直接相减经常是负数。负数表示"低于测量分辨率", 不是没数据。
+  curFrameAge = (clockOk && frameSentAt && frameArrivedAt)
+    ? Math.max(0, frameArrivedAt + clockOff - frameSentAt) : null;
+  if (!connected) {
+    el.textContent = '画面 --';
+    el.className = 'ping bad';
+    return;
+  }
+  el.textContent = `${lastFps.toFixed(0)}fps · ${fmtLag(curFrameAge)} 前`;
+  el.title = `本地帧率 ${lastFps.toFixed(1)} fps(每秒真正收到的画面帧数)`
+    + `，码率 ${lastKbs >= 1024 ? (lastKbs / 1024).toFixed(2) + ' MB/s'
+                               : lastKbs.toFixed(0) + ' KB/s'}\n`
+    + `画面延时 ${fmtLag(curFrameAge)}：从服务端收到 x11vnc 的画面数据, 算到你这边`
+    + '显示出来。\n桌面静止时不会有新帧, 这个数就停在上一次的值。';
+  el.className = 'ping ' + lvLagVnc(curFrameAge);
+}
+
+// 画面时间戳的旁路通道。
+// 为什么不塞进 /ws/vnc: 那条是**纯 RFB 字节流**, 插文本帧会把 noVNC 顶乱,
+// 而且裸 RFB 的测试客户端会直接报"不是 RFB 版本"。单独一条谁也不影响。
+let timeWs = null;
+function openTimeChannel() {
+  closeTimeChannel();
+  try {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    timeWs = new WebSocket(`${proto}://${location.host}/ws/vnc-time?viewer=${encodeURIComponent(viewerId)}`);
+    timeWs.onmessage = (ev) => {
+      if (typeof ev.data !== 'string') return;
+      try {
+        const j = JSON.parse(ev.data);
+        if (j.t === 'f') frameSentAt = j.s || 0;
+      } catch (e) { /* 忽略 */ }
+    };
+    timeWs.onclose = () => { if (timeWs === this) timeWs = null; };
+  } catch (e) { timeWs = null; }
+}
+function closeTimeChannel() {
+  if (!timeWs) return;
+  const w = timeWs;
+  timeWs = null;
+  try { w.onclose = null; w.close(); } catch (e) { /* ignore */ }
+}
+
+function renderRate(fps, kbs) {
   lastFps = fps;
   lastKbs = kbs;
-  if (el) {
-    if (!connected) {
-      el.textContent = '画面 --';
-      el.className = 'ping bad';
-    } else {
-      const f = fps >= 10 ? 0 : (fps >= 5 ? 1 : 2);
-      const pic = picLatency();
-      // 顶栏只放"画面 xx ms"。手机顶栏只有 ~390px, 原来那句
-      // "41fps · 画面 33ms" 会把"返回/远程桌面"挤成**竖排单字**。
-      // 帧率/码率不丢, 挪到 tooltip 和全屏信息栏里(那边一整行, 够宽)。
-      el.textContent = pic == null ? '画面 --' : `画面 ${pic}ms`;
-      el.title = `图传帧率 ${fps.toFixed(1)} fps，码率 ${kbs >= 1024
-        ? (kbs / 1024).toFixed(2) + ' MB/s' : kbs.toFixed(0) + ' KB/s'}\n`
-        + `画面延时估算 ≈ 网络单程 + ${PIC_FIXED_MS}ms`
-        + `（服务端变更检测≤${PIC_SERVER_MS}ms + 编码/手机解码约${PIC_CLIENT_MS}ms，`
-        + '后两项是经验值，不是实测）';
-      el.className = 'ping ' + (f === 0 ? 'ok' : f === 1 ? 'warn' : 'bad');
-    }
-  }
+  paintRate();
   renderFsInfo();
 }
+
+// 帧率要 1 秒的窗口才准, 但延时数字没必要跟着等 —— 单独快刷一下,
+// 手感跟采集模块那边(100ms)一致。
+setInterval(paintRate, 300);
 
 setInterval(() => {
   const now = Date.now();
@@ -329,12 +456,40 @@ async function pingOnce() {
   if (pingBusy) return;
   pingBusy = true;
   const t0 = performance.now();
+  const viewer = viewerId;
   try {
-    await fetchAbort('/api/health?t=' + Date.now(), 5000);
+    let response = await fetchAbort('/api/vnc/network?viewer=' + viewer, 10000);
+    // 兼容尚未重载的服务端；前端补丁可先刷新使用。
+    if (response.status === 404) response = await fetchAbort('/api/health?t=' + Date.now(), 10000);
+    if (response.status === 401 || response.redirected) throw new Error('登录已失效，请重新登录');
+    if (!response.ok) throw new Error(`连接检测失败（HTTP ${response.status}）`);
+    const channel = await response.json();
+    if (viewer !== viewerId) return;
+    const peers = channel.tailnetPath?.peers || [];
+    const direct = peers.some((p) => p.path === 'direct');
+    const relay = peers.some((p) => p.path.startsWith('DERP relay'));
+    tailnetHint = direct || relay ? '活跃设备路径：' + (direct && relay ? '直连/中继' : direct ? '直连' : '中继') : '';
     const ms = performance.now() - t0;
     pingEma = pingEma ? pingEma * 0.6 + ms * 0.4 : ms;
-    renderPing(pingEma);
+    streamRtt = typeof channel.rttMs === 'number' ? channel.rttMs : null;
+    const congestion = Math.max(ms, streamRtt ?? 0, channel.sendMs ?? 0);
+    updateAutoSaver(congestion);
+    if (connected && channel.active === false) {
+      setStatus('画面连接失效，重连中…');
+      connect();
+      return;
+    }
+    if (connected) setStatus(congestion >= 1000
+      ? (autoSaver ? '图传拥堵 · 自动省流' : '图传拥堵') : '已连接');
+    if ($('vnc-input-alert').dataset.kind === 'network') clearInputAlert();
+    renderPing(S.showPing ? pingEma : null);
   } catch (e) {
+    if (viewer !== viewerId) return;
+    updateAutoSaver(10000);
+    const reason = e.name === 'AbortError' ? '网络请求超时（10秒）'
+      : e instanceof TypeError ? '网络请求失败，请检查网络连接' : e.message;
+    if (connected) setStatus(reason);
+    showInputAlert(reason, 'network');
     renderPing(null);
   } finally {
     pingBusy = false;
@@ -343,14 +498,17 @@ async function pingOnce() {
 
 function startPing() {
   stopPing();
-  if (!S.showPing) { renderPing(null); return; }
+  // 自动画质需要持续测量；关闭延迟显示只影响显示。
   pingOnce();
   pingTimer = setInterval(pingOnce, 5000);
 }
 function stopPing() {
   if (pingTimer) { clearInterval(pingTimer); pingTimer = 0; }
 }
-$('vnc-ping').addEventListener('click', () => { pingEma = 0; pingOnce(); });
+// 顶栏那个「网络」胶囊已按用户要求去掉(只保留帧率+延时); 全屏信息行里还留着。
+// 元素没了就别绑 —— 否则这一行会抛错, 后面的代码全不执行。
+const pingEl = $('vnc-ping');
+if (pingEl) pingEl.addEventListener('click', () => { pingEma = 0; pingOnce(); });
 
 // ================= 键盘 =================
 // 2026-09-14 修复的 5 个问题:
@@ -428,29 +586,6 @@ function cleanText(s) { return String(s).replace(/[\r\n]/g, ''); }
 // 纯 ASCII 不受影响(实测 144/144 全到)。
 // 所以非 ASCII 改走服务端 xdotool type(它自己做重映射且带间隔), 实测 9/9 全到。
 let typeBuf = [], typeTimer = 0;
-
-// 服务端键入失败时的兜底。
-// **必须限长**: 这条路径是逐字经 RFB 发 keyEvent, 一次 8000 字就是 16000 条事件
-// 灌进 x11vnc —— 服务端扛不住、客户端也会卡死(实测就是这么把机器拖死的)。
-// 而且它对中文本来就有损(x11vnc 侧重映射跟不上), 长文本兜底毫无意义, 直接报错。
-const FALLBACK_MAX = 40;
-
-function keysymFallback(s) {
-  // 纯 ASCII 经 RFB 发是"不可靠但不会污染", 且没有中文那种重映射问题,
-  // 所以上限放宽些; 含非 ASCII 的一律严格限长, 发过去也只会变成乱码。
-  const max = /[^\x20-\x7e]/.test(s) ? FALLBACK_MAX : 200;
-  if (s.length > max) {
-    if (typeof clipStatus === 'function') {
-      clipStatus(`键入失败(${s.length} 字太长, 已放弃)`, true);
-    }
-    return;
-  }
-  for (const ch of s) {
-    const ks = keysymFor(ch.codePointAt(0));
-    if (ks) tapKey(ks, 'VoidSymbol');
-  }
-}
-
 // 同一时刻只允许一个 /api/type 在飞。
 // 服务端虽然已经把 xdotool 串行化了, 但前端若不自律, 后一批请求会在前一批
 // 还没被处理时就入队 —— 队列里堆着的批次越多, 屏幕上出现得越晚, 手感就是
@@ -464,8 +599,16 @@ let selfClipUntil = 0;
 // 键入失败一定要让用户看见。否则他以为自己没打上, 会反复重打, 越打越乱;
 // 更糟的是旧代码会偷偷改走 RFB, 产出"上辈子打的字", 完全无法归因。
 let typeErrTimer = 0;
+function showInputAlert(msg, kind = 'input') {
+  $('vnc-input-alert-text').textContent = msg;
+  $('vnc-input-alert').classList.add('show');
+  $('vnc-input-alert').dataset.kind = kind;
+}
+function clearInputAlert() { $('vnc-input-alert').classList.remove('show'); }
+$('vnc-input-alert-close').addEventListener('click', clearInputAlert);
 function showTypeErr(msg) {
   const text = '键入失败: ' + msg;
+  showInputAlert(text);
   try { setStatus(text); } catch (e) { /* 页面还没初始化 */ }
   if (typeof clipStatus === 'function') clipStatus(text, true);
   clearTimeout(typeErrTimer);
@@ -477,9 +620,28 @@ function showTypeErr(msg) {
 function flushType() {
   clearTimeout(typeTimer);
   if (typeBusy) return;                  // 上一批还没落地; 回来时 .finally 会续上
-  const s = typeBuf.join('');
-  typeBuf = [];
+  // 文本和特殊按键共用顺序队列，回车不能抢在 HTTP 文本前抵达。
+  while (typeof typeBuf[0] === 'function') {
+    try {
+      const pending = typeBuf.shift()();
+      if (pending && typeof pending.then === 'function') {
+        typeBusy = true;
+        Promise.resolve(pending).catch((e) => {
+          releaseHold(); typeBuf = []; showTypeErr(e.message);
+        }).finally(() => {
+          typeBusy = false;
+          if (typeBuf.length) flushType();
+        });
+        return;
+      }
+    }
+    catch (e) { typeBuf = []; showTypeErr(e.message); return; }
+  }
+  const text = [];
+  while (typeBuf.length && typeof typeBuf[0] === 'string') text.push(typeBuf.shift());
+  const s = text.join('');
   if (!s) return;
+  releaseHold();                         // 切窗后再键入时不能仍按着 Alt
   typeBusy = true;
   const ac = new AbortController();
   // 15 秒足够本地 xdotool 敲完 normal 批次(5000 字约 10 秒)。别设太长 ——
@@ -490,19 +652,18 @@ function flushType() {
     body: JSON.stringify({ text: s, mode: S.typeMode || 'auto' }), signal: ac.signal,
   }).then((r) => r.json().then((j) => [r.status, j]).catch(() => [r.status, null]))
     .then(([st, j]) => {
-      if (j && j.ok) return;
+      if (j && j.ok) { clearInputAlert(); return; }
+      typeBuf = [];
       // **绝不再静默回退到 RFB 直发。**
       // 那条路送出去的按键会被远端 fcitx 收进预编辑缓冲: 屏幕上什么都不显示,
       // 攒到某次提交时一次性冒出来 —— 用户看到的就是"打这个出来的是上次的内容"。
       // 中文回退过去更是直接变乱码。宁可明确报错, 也不要产出这种鬼影文字。
       const err = (j && (j.err || j.msg)) || `HTTP ${st}`;
-      showTypeErr(err);
-      // 唯一的例外: 完全没收到响应(网络断了, 服务端根本没处理), 且是纯 ASCII
-      // 且很短 —— 这时 RFB 直发至少还有机会是对的。
-      if (!j && !st && s.length <= 40 && !/[^\x20-\x7e]/.test(s)) keysymFallback(s);
+      showTypeErr(err + '；后续排队输入已停止');
     }).catch(() => {
-      showTypeErr('网络异常, 未送达');
-      if (s.length <= 40 && !/[^\x20-\x7e]/.test(s)) keysymFallback(s);
+      // 断网/超时后无法知道服务端是否已经处理。直接重发会让文字重复。
+      typeBuf = [];
+      showTypeErr('网络异常，送达状态未知；后续排队输入已停止，请检查远端窗口后再重试');
     }).finally(() => {
     clearTimeout(to);
     typeBusy = false;
@@ -549,16 +710,17 @@ let compGuardTimer = 0;
 function kbSync() {
   const cur = cleanText(kb.value);
   if (cur === kbLast) return;          // 幂等: 内容没变就什么都不做
-  const prev = kbLast;
+  const prev = Array.from(kbLast);
   kbLast = cur;
   // 有些输入法提交完会把输入框清空。那不是"用户删光了"(真删除走 keydown 的
   // Backspace), 照差分算会补发一大串退格, 把刚上屏的字删掉 —— 直接当重置处理。
   if (!cur) { kbLast = ''; return; }
   let i = 0;
-  const n = Math.min(prev.length, cur.length);
-  while (i < n && prev[i] === cur[i]) i++;
+  const chars = Array.from(cur);
+  const n = Math.min(prev.length, chars.length);
+  while (i < n && prev[i] === chars[i]) i++;
   const removed = prev.length - i;
-  const added = cur.slice(i);
+  const added = chars.slice(i).join('');
   if (!removed && !added) return;
   // 退格要经 RFB, 断线时发不出去; 此时只补新增, 至少不把已上屏的内容弄乱
   if (canSend()) {
@@ -605,7 +767,18 @@ kb.addEventListener('keydown', (e) => {
 function sendSpecial(name) {
   const t = SPECIAL[name];
   if (!t) return;
-  tapKey(t[0], t[1]);
+  const target = rfb;
+  const held = MODS.filter((m) => modsActive[m.key]);
+  clearMods();
+  typeBuf.push(() => {
+    if (!canSend() || rfb !== target) throw new Error('按键未发送：画面连接已改变');
+    releaseHold();
+    for (const m of held) target.sendKey(m.keysym, m.code, true);
+    target.sendKey(t[0], t[1], true);
+    target.sendKey(t[0], t[1], false);
+    for (const m of held.slice().reverse()) target.sendKey(m.keysym, m.code, false);
+  });
+  flushType();
 }
 
 // 快捷键条
@@ -624,7 +797,7 @@ document.querySelectorAll('#keybar [data-key]').forEach((b) => {
 // 旧实现 Alt↓ Tab↓ Tab↑ Alt↑ 一股脑连发, 切换器常常还没被抓住就结束了 ——
 // 表现就是"点 Alt+Tab 没反应, 或者闪一下就没了"。
 const HOLD_COMBO = { 'alt+tab': 900 };
-const holdState = { combo: null, timer: 0 };
+const holdState = { combo: null, timer: 0, target: null, token: 0, key: null };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function releaseHold() {
@@ -633,17 +806,26 @@ function releaseHold() {
   clearTimeout(st.timer);
   const [modk] = st.combo.split('+');
   const m = MODS.find((x) => x.key === modk);
+  const target = st.target;
+  const key = st.key;
   st.combo = null;
-  if (m && canSend()) rfb.sendKey(m.keysym, m.code, false);   // 松开 = 提交切换
+  st.target = null;
+  st.key = null;
+  st.token++;
+  if (canSend() && rfb === target) {
+    if (key) target.sendKey(key[0], key[1], false);
+    if (m) target.sendKey(m.keysym, m.code, false);
+  }
 }
 
 document.querySelectorAll('#keybar [data-combo]').forEach((b) => {
   b.addEventListener('click', async () => {
     if (!canSend()) return;
     const combo = b.dataset.combo;
-    const [mod, key] = combo.split('+');
-    const m = MODS.find((x) => x.key === mod);
-    if (!m) return;
+    const parts = combo.split('+');
+    const key = parts.pop();
+    const held = parts.map((mod) => MODS.find((x) => x.key === mod));
+    if (!held.length || held.some((m) => !m)) return;
     let ks, code;
     if (SPECIAL[key]) { [ks, code] = SPECIAL[key]; }   // alt+tab / ctrl+esc 这类
     else { ks = keysymFor(key.codePointAt(0)); code = 'VoidSymbol'; }
@@ -651,25 +833,45 @@ document.querySelectorAll('#keybar [data-combo]').forEach((b) => {
 
     const hold = HOLD_COMBO[combo];
     if (!hold) {                                   // 普通 combo: 快按快放即可
-      rfb.sendKey(m.keysym, m.code, true);
-      rfb.sendKey(ks, code, true);
-      rfb.sendKey(ks, code, false);
-      rfb.sendKey(m.keysym, m.code, false);
+      const target = rfb;
+      clearMods();
+      typeBuf.push(() => {
+        if (!canSend() || rfb !== target) throw new Error('快捷键未发送：画面连接已改变');
+        releaseHold();
+        for (const m of held) target.sendKey(m.keysym, m.code, true);
+        target.sendKey(ks, code, true);
+        target.sendKey(ks, code, false);
+        for (const m of held.slice().reverse()) target.sendKey(m.keysym, m.code, false);
+      });
+      flushType();
       return;
     }
 
+    const m = held[0];
+    const target = rfb;
     clearMods();                                   // 别让粘滞修饰键混进来
-    if (holdState.combo !== combo) {               // 首次按下: 按住修饰键
+    typeBuf.push(async () => {
+    if (!canSend() || rfb !== target) throw new Error('切窗键未发送：画面连接已改变');
+    if (holdState.combo !== combo || holdState.target !== target) {
       if (holdState.combo) releaseHold();
       holdState.combo = combo;
-      rfb.sendKey(m.keysym, m.code, true);
+      holdState.target = target;
+      target.sendKey(m.keysym, m.code, true);
+      const token = holdState.token;
       await sleep(50);                             // 让 X 先认下 Alt
+      if (!canSend() || rfb !== target || holdState.token !== token) throw new Error('切窗操作已取消：连接或页面状态已改变');
     }
-    rfb.sendKey(ks, code, true);                   // 再点一次就再往后切一个
+    const token = holdState.token;
+    holdState.key = [ks, code];
+    target.sendKey(ks, code, true);                   // 再点一次就再往后切一个
     await sleep(60);
-    rfb.sendKey(ks, code, false);
+    if (!canSend() || rfb !== target || holdState.token !== token) throw new Error('切窗操作已取消：连接或页面状态已改变');
+    target.sendKey(ks, code, false);
+    holdState.key = null;
     clearTimeout(holdState.timer);
     holdState.timer = setTimeout(releaseHold, hold);
+    });
+    flushType();
   });
 });
 
@@ -707,6 +909,15 @@ function setKb(open) {
   syncKbBtn();
 }
 $('vnc-kbbtn').addEventListener('click', () => setKb(!kbOpen));
+// 按钮会阻止自然失焦，因此触控板、滚轮和画面操作要显式收起软键盘。
+function dismissKbForInteraction(e) {
+  if (!kbOpen) return;
+  const target = e.target;
+  if (target === kb || target?.closest?.('#vnc-kbbtn, #keybar')) return;
+  setKb(false);
+}
+document.addEventListener('pointerdown', dismissKbForInteraction, { capture: true });
+document.addEventListener('wheel', dismissKbForInteraction, { capture: true, passive: true });
 kb.addEventListener('focus', () => { kbOpen = true; syncKbBtn(); });
 kb.addEventListener('blur', () => {
   kbOpen = false;
@@ -729,7 +940,6 @@ $('vnc-keybtn').addEventListener('click', () => {
   S.keybar = !S.keybar;
   saveS();
   applyKeybar();
-  window.dispatchEvent(new Event('resize'));
 });
 
 // ================= 指针注入原语 =================
@@ -738,6 +948,7 @@ const BTN_LEFT = 0x1, BTN_RIGHT = 0x4;
 const WHEEL_UP = 0x8, WHEEL_DOWN = 0x10, WHEEL_LEFT = 0x20, WHEEL_RIGHT = 0x40;
 
 let mask = 0;                    // 当前按住的按钮(不含滚轮瞬时位)
+let lastFbPointer = null;        // 远端坐标，不受全屏/缩放/旋转后的 CSS 布局影响
 
 const padPanel = $('pad-panel');
 const padArea = $('pad-area');
@@ -754,6 +965,28 @@ function canvasEl() { return document.querySelector('#screen canvas'); }
 let cRect = null, cRectAt = 0;
 
 function invalidateRect() { cRect = null; }
+
+// 等布局落地再重新适配。window.resize 本身不会调用 noVNC 的缩放逻辑。
+let screenFitFrame = 0;
+function scheduleScreenFit() {
+  invalidateRect();
+  if (screenFitFrame) return;
+  screenFitFrame = requestAnimationFrame(() => {
+    screenFitFrame = 0;
+    if (!rfb || !connected) return;
+    const screen = $('screen');
+    const transform = screen.style.transform;
+    try {
+      // 全屏捏合是视觉放大，不能把 transform 后的尺寸再当作适配尺寸。
+      screen.style.transform = '';
+      rfb.scaleViewport = true;   // 公共 setter 会按当前容器重新 autoscale
+    } finally {
+      screen.style.transform = transform;
+    }
+    zClamp(); zApply();
+    invalidateRect(); virtClamp(); placeCursor(); edgeUpdate();
+  });
+}
 
 function canvasRect() {
   const now = performance.now();
@@ -810,6 +1043,7 @@ function sendPointer(m) {
   if (!ready()) return;
   const p = toFb();
   if (!p) return;
+  lastFbPointer = p;
   RFB.messages.pointerEvent(rfb._sock, p.x, p.y, m & 0xff);
 }
 
@@ -823,7 +1057,11 @@ function queueMove() {
 
 function press(b) { mask |= b; sendPointer(mask); }
 function release(b) { mask &= ~b; sendPointer(mask); }
-function click(b) { press(b); release(b); }
+function click(b) {
+  // 点击与持续锁定同一键时不发送“松开”，避免触控板点按解除拖动锁。
+  if (dragLock === b) return;
+  press(b); release(b);
+}
 
 function wheelStep(dirY, dirX) {
   if (!ready()) return;
@@ -831,6 +1069,14 @@ function wheelStep(dirY, dirX) {
   if (dirY < 0) bit = WHEEL_UP; else if (dirY > 0) bit = WHEEL_DOWN;
   else if (dirX < 0) bit = WHEEL_LEFT; else if (dirX > 0) bit = WHEEL_RIGHT;
   if (!bit) return;
+  if (fsOn()) {
+    // RFB 滚轮包也带坐标；重新换算普通视图 virt 会把鼠标送到错误窗口。
+    const p = lastFbPointer;
+    if (!p) return;
+    RFB.messages.pointerEvent(rfb._sock, p.x, p.y, mask | bit);
+    RFB.messages.pointerEvent(rfb._sock, p.x, p.y, mask);
+    return;
+  }
   sendPointer(mask | bit);
   sendPointer(mask);
 }
@@ -865,9 +1111,57 @@ const EDGE_ENTER = 6;                      // 进入边缘区(px) -> 锁死到�
 const EDGE_EXIT = 18;                      // 退出边缘区(px) -> 解锁(滞回, 防止抖动打断)
 let edgeLatch = 0;                         // 边缘锁 位掩码: 1=下 2=上 4=左 8=右
 const virt = { x: 0, y: 0, ok: false };
-let dragLock = false;                      // 拖动锁(按钮切换, 常驻)
+let dragLock = 0;                          // 0=关闭, BTN_LEFT/BTN_RIGHT=持续按住
+let dragButton = BTN_LEFT, dragClickTimer = 0;
+let padButtonPress = null;                 // pad-l/r: pointerId + 0.5s lock timer
 let tapDrag = false;                       // 双击后按住拖拽(手势, 自动释放)
 let lastTapAt = 0;
+
+function syncDragLockUI() {
+  const btn = $('pad-drag');
+  const side = dragButton === BTN_LEFT ? '左键' : '右键';
+  btn.textContent = `按住${side}`;
+  const modeHeld = dragLock === dragButton;
+  btn.classList.toggle('on', modeHeld);
+  btn.setAttribute('aria-pressed', modeHeld ? 'true' : 'false');
+  btn.setAttribute('aria-label', `${side}模式；单击按住或松开，双击切换左右键`);
+  for (const [id, bit, label] of [['pad-l', BTN_LEFT, '左键'], ['pad-r', BTN_RIGHT, '右键']]) {
+    const padBtn = $(id);
+    const held = dragLock === bit;
+    padBtn.textContent = held ? `按住${label}` : label;
+    padBtn.classList.toggle('on', held);
+    padBtn.setAttribute('aria-pressed', held ? 'true' : 'false');
+  }
+}
+
+function resetDragLock(sendRelease) {
+  clearTimeout(dragClickTimer); dragClickTimer = 0;
+  cancelPadButtonHold();
+  cancelPadGesture();
+  if (sendRelease && mask) sendPointer(0);
+  mask = 0;
+  tapDrag = false;
+  dragLock = 0;
+  lastTapAt = 0;
+  syncDragLockUI();
+}
+
+// 进页面时把虚拟光标定位到**电脑上鼠标的真实位置**(用户要求)。
+// 服务端给的是 0~1 的比例, 乘画布宽高就行 —— 这样不用知道 x11vnc 用了什么缩放。
+async function virtInitFromServer() {
+  try {
+    const j = await (await fetch('/api/activity', { cache: 'no-store' })).json();
+    const m = j && j.mouse;
+    const d = rfb && rfb._display;
+    const r = canvasRect();
+    if (!m || m.fx == null || !d || !d.width || !r) return false;
+    virt.x = r.left + m.fx * r.width;
+    virt.y = r.top + m.fy * r.height;
+    virt.ok = true;
+    virtClamp(); placeCursor();
+    return true;
+  } catch (e) { return false; }
+}
 
 function virtInit() {
   invalidateRect();
@@ -878,6 +1172,19 @@ function virtInit() {
   virt.ok = true;
   placeCursor();
 }
+
+// 直接点/拖画面时, 把虚拟光标同步到手指/鼠标的位置。
+// 不做这个的话: noVNC 会把远端鼠标真的移过去, 而那个 ○ 还停在原地 ——
+// 用户报的就是"圆圈不会移动"。
+function syncVirtFromEvent(e) {
+  virt.ok = true;
+  virt.x = e.clientX; virt.y = e.clientY;
+  virtClamp(); placeCursor();
+}
+['pointerdown', 'pointermove'].forEach((t) => {
+  const el = $('screen');
+  if (el) el.addEventListener(t, syncVirtFromEvent, { passive: true });
+});
 
 function virtClamp() {
   const r = canvasRect();
@@ -895,17 +1202,25 @@ function placeCursor() {
 }
 
 window.addEventListener('resize', () => {
-  invalidateRect(); virtClamp(); placeCursor(); edgeUpdate();
+  scheduleScreenFit();
 });
 window.addEventListener('orientationchange', () => {
-  invalidateRect(); setTimeout(() => { invalidateRect(); virtClamp(); placeCursor(); }, 300);
+  scheduleScreenFit(); setTimeout(scheduleScreenFit, 300);
 });
+// 观察真正占用画面空间的外层容器，覆盖按键栏、触控板及提示条等显隐。
+if (typeof ResizeObserver !== 'undefined') {
+  new ResizeObserver(scheduleScreenFit).observe($('screen-wrap'));
+}
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', scheduleScreenFit);
+  window.visualViewport.addEventListener('scroll', scheduleScreenFit);
+}
 
 $('vnc-padbtn').addEventListener('click', () => {
-  // 触控板常驻(默认开); 收起时图传占满, 通知 noVNC 重新适配尺寸
+  // 触控板常驻(默认开); 收起后重新适配增加的画面空间。
   const hide = padPanel.classList.toggle('hide');
   $('vnc-padbtn').classList.toggle('on', !hide);
-  window.dispatchEvent(new Event('resize'));
+  scheduleScreenFit();
   if (!hide) virtInit();
 });
 
@@ -952,13 +1267,12 @@ function cancelMomentum() {
 
 function startMomentum() {
   cancelMomentumKeepAcc();
-  const v = SCROLL.vel, vx = SCROLL.velX;
-  if (Math.abs(v) < 0.12 && Math.abs(vx) < 0.12) { SCROLL.acc = 0; SCROLL.accX = 0; return; }
+  if (Math.abs(SCROLL.vel) < 0.12 && Math.abs(SCROLL.velX) < 0.12) { SCROLL.acc = 0; SCROLL.accX = 0; return; }
   let last = performance.now();
   const tick = (now) => {
     const dt = Math.min(now - last, 40); last = now;
-    SCROLL.acc += v * dt;
-    SCROLL.accX += vx * dt;
+    SCROLL.acc += SCROLL.vel * dt;
+    SCROLL.accX += SCROLL.velX * dt;
     drainScroll();
     SCROLL.vel *= Math.pow(0.93, dt / 16.7);
     SCROLL.velX *= Math.pow(0.93, dt / 16.7);
@@ -980,6 +1294,25 @@ function cancelMomentumKeepAcc() {
 // 2 指: 上下滑=滚轮 / 左右滑=横向滚轮 / 双指点按=右键
 const pts = new Map();            // pointerId -> {x, y}
 let gesture = null;               // {maxPts, move, t0, scrolled}
+let scrollFrame = 0, scrollDX = 0, scrollDY = 0;
+function flushPadScroll() {
+  if (scrollFrame) { cancelAnimationFrame(scrollFrame); scrollFrame = 0; }
+  if (!scrollDX && !scrollDY) return;
+  const now = performance.now(), dt = Math.max(8, now - SCROLL.lastT);
+  SCROLL.lastT = now;
+  const dx = scrollDX, dy = scrollDY;
+  scrollDX = 0; scrollDY = 0;
+  if (!gesture) return;
+  gesture.scrollMove = (gesture.scrollMove || 0) + Math.hypot(dx, dy);
+  if (!gesture.scrolled && gesture.scrollMove < 3) return;
+  gesture.scrolled = true;
+  const y = -dy * S.scrollDir, x = -dx * S.scrollDir;
+  SCROLL.acc += y; SCROLL.accX += x;
+  const blend = 1 - Math.exp(-dt / 35);
+  SCROLL.vel += (y / dt - SCROLL.vel) * blend;
+  SCROLL.velX += (x / dt - SCROLL.velX) * blend;
+  drainScroll();
+}
 
 padArea.addEventListener('pointerdown', (e) => {
   if (padPanel.classList.contains('hide')) return;
@@ -1015,27 +1348,15 @@ padArea.addEventListener('pointermove', (e) => {
   if (!gesture) return;
 
   if (pts.size >= 2) {
-    // 只认第一根手指的位移。
-    // 双指时每根手指都会各自派发 pointermove, 两根一起累加 = 滚动量翻倍, 而且
-    // 两根手指不可能完全同步, 逐帧差值一抖一抖 —— 表现就是"双指滑动一顿一顿的"。
-    const firstId = pts.keys().next().value;
-    if (e.pointerId !== firstId) return;
-    // 双指滚动: 累积 + 估算速度供抬手后做惯性
-    const now = performance.now();
-    const dt = Math.max(1, now - SCROLL.lastT);
-    SCROLL.lastT = now;
-    const dir = S.scrollDir;
-    const dAcc = (-dy * dir) * S.scrollSpeed;
-    const dAccX = (-dx) * S.scrollSpeed;
-    SCROLL.acc += dAcc;
-    SCROLL.accX += dAccX;
-    SCROLL.vel = SCROLL.vel * 0.6 + (dAcc / dt) * 0.4;
-    SCROLL.velX = SCROLL.velX * 0.6 + (dAccX / dt) * 0.4;
-    gesture.scrolled = true;
-    gesture.move += Math.abs(dx) + Math.abs(dy);
+    // 两指中心位移：每根手指贡献一半，不依赖哪根先落下。
+    scrollDX += dx / pts.size; scrollDY += dy / pts.size;
+    gesture.move += (Math.abs(dx) + Math.abs(dy)) / pts.size;
     cancelMomentumKeepAcc();
-    scheduleDrain();
+    if (!scrollFrame) scrollFrame = requestAnimationFrame(() => {
+      scrollFrame = 0; flushPadScroll();
+    });
   } else {
+    if (gesture.maxPts >= 2) return; // 双指结束前不把剩余手指变成鼠标移动
     gesture.move += Math.abs(dx) + Math.abs(dy);
     if (!virt.ok) virtInit();
     // 指针加速: 慢速微调用基准增益, 快速甩动按比例放大。
@@ -1057,11 +1378,10 @@ padArea.addEventListener('pointermove', (e) => {
 
 function padUp(e) {
   if (!pts.has(e.pointerId)) return;
+  flushPadScroll();
   pts.delete(e.pointerId);
   if (pts.size > 0) {
-    // 抬起一根手指后重新基线, 避免剩下那根手指把残余位移当成移动
-    if (gesture) { gesture.move = 0; gesture.t0 = Date.now(); }
-    SCROLL.lastT = performance.now();
+    // 等到所有手指抬起；保留最后移动时间以识别停顿后松手。
     return;
   }
   if (!gesture) return;
@@ -1073,6 +1393,7 @@ function padUp(e) {
     tapDrag = false;
     release(BTN_LEFT);
   } else if (g.scrolled) {
+    if (performance.now() - SCROLL.lastT > 80) cancelMomentum();
     startMomentum();                      // 双指滚动抬手 -> 惯性继续
   } else if (g.maxPts === 1 && g.move < TAP_MAX_MOVE && quick && !dragLock) {
     click(BTN_LEFT);                      // 轻点=左键
@@ -1084,11 +1405,72 @@ function padUp(e) {
   }
 }
 padArea.addEventListener('pointerup', padUp);
-padArea.addEventListener('pointercancel', padUp);
+function cancelPadGesture() {
+  if (scrollFrame) cancelAnimationFrame(scrollFrame);
+  scrollFrame = 0; scrollDX = 0; scrollDY = 0;
+  pts.clear(); gesture = null; lastTapAt = 0;
+  cancelMomentum(); SCROLL.acc = 0; SCROLL.accX = 0;
+  if (tapDrag) { tapDrag = false; release(BTN_LEFT); }
+}
+padArea.addEventListener('pointercancel', cancelPadGesture);
+window.addEventListener('blur', () => resetDragLock(true));
 
 // ================= 触控板下方按键 =================
-$('pad-l').addEventListener('pointerdown', (e) => { e.preventDefault(); click(BTN_LEFT); });
-$('pad-r').addEventListener('pointerdown', (e) => { e.preventDefault(); click(BTN_RIGHT); });
+function cancelPadButtonHold(pointerId = null) {
+  if (!padButtonPress || (pointerId !== null && padButtonPress.pointerId !== pointerId)) return;
+  if (padButtonPress.timer) clearTimeout(padButtonPress.timer);
+  padButtonPress = null;
+}
+
+function beginPadButtonHold(button, pointerId) {
+  cancelPadButtonHold();
+  const pressState = { button, pointerId, timer: 0, fired: false };
+  padButtonPress = pressState;
+  pressState.timer = setTimeout(() => {
+    if (padButtonPress !== pressState) return;
+    pressState.timer = 0;
+    pressState.fired = true;
+    if (!ready()) return;
+    clearTimeout(dragClickTimer); dragClickTimer = 0;
+    if (tapDrag) { tapDrag = false; release(BTN_LEFT); }
+    lastTapAt = 0;
+    if (dragLock !== button) {
+      if (dragLock) release(dragLock);
+      dragLock = button;
+      press(button);
+    }
+    dragButton = button;
+    syncDragLockUI();
+    showPadToast(`已按住${button === BTN_LEFT ? '左键' : '右键'}`);
+  }, 500);
+}
+
+function endPadButtonHold(pointerId, canceled = false) {
+  const pressState = padButtonPress;
+  if (!pressState || pressState.pointerId !== pointerId) return;
+  cancelPadButtonHold(pointerId);
+  if (canceled || pressState.fired) return;
+  if (dragLock === pressState.button) {
+    release(pressState.button);
+    dragLock = 0;
+    syncDragLockUI();
+    showPadToast(`已松开${pressState.button === BTN_LEFT ? '左键' : '右键'}`);
+  } else {
+    click(pressState.button);
+  }
+}
+
+for (const [id, button] of [['pad-l', BTN_LEFT], ['pad-r', BTN_RIGHT]]) {
+  const padBtn = $(id);
+  padBtn.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    try { padBtn.setPointerCapture(e.pointerId); } catch (err) {}
+    beginPadButtonHold(button, e.pointerId);
+  });
+  for (const ev of ['pointerup', 'pointercancel', 'pointerleave']) {
+    padBtn.addEventListener(ev, (e) => endPadButtonHold(e.pointerId, ev !== 'pointerup'));
+  }
+}
 
 // 滚轮键支持长按连发(翻长文档不用一直戳)
 function holdRepeat(el, fn) {
@@ -1107,11 +1489,39 @@ function holdRepeat(el, fn) {
 holdRepeat($('pad-wu'), () => wheelStep(-1, 0));
 holdRepeat($('pad-wd'), () => wheelStep(1, 0));
 
+function toggleDragLock() {
+  if (tapDrag) { tapDrag = false; release(BTN_LEFT); }
+  lastTapAt = 0;
+  if (dragLock) { release(dragLock); dragLock = 0; }
+  else if (ready()) { dragLock = dragButton; press(dragLock); }
+  syncDragLockUI();
+}
+function switchDragButton() {
+  if (tapDrag) { tapDrag = false; release(BTN_LEFT); }
+  if (dragLock) release(dragLock);
+  dragLock = 0; lastTapAt = 0;
+  dragButton = dragButton === BTN_LEFT ? BTN_RIGHT : BTN_LEFT;
+  syncDragLockUI();
+  showPadToast((dragButton === BTN_LEFT ? '左键' : '右键') + '模式：单击按住 / 松开');
+}
+function showPadToast(msg) {
+  const toast = $('pad-mode-toast');
+  toast.textContent = msg;
+  toast.classList.remove('show');
+  void toast.offsetWidth;
+  toast.classList.add('show');
+}
 $('pad-drag').addEventListener('click', () => {
-  dragLock = !dragLock;
-  $('pad-drag').classList.toggle('on', dragLock);
-  if (dragLock) press(BTN_LEFT); else release(BTN_LEFT);
+  if (dragClickTimer) {
+    clearTimeout(dragClickTimer); dragClickTimer = 0;
+    switchDragButton();
+  } else {
+    dragClickTimer = setTimeout(() => {
+      dragClickTimer = 0; toggleDragLock();
+    }, DBLTAP_MS);
+  }
 });
+syncDragLockUI();
 $('pad-speed').addEventListener('click', () => {
   speedIdx = (speedIdx + 1) % SPEEDS.length;
   S.speed = speedIdx; saveS();
@@ -1178,6 +1588,7 @@ const clipMsg = $('clip-msg');
 function clipStatus(msg, bad) {
   clipMsg.textContent = msg;
   clipMsg.style.color = bad ? 'var(--bad)' : 'var(--dim)';
+  if (bad) showInputAlert(msg);
 }
 
 async function clipApi(path, body) {
@@ -1209,8 +1620,9 @@ async function clipRun(label, path, body, done) {
   try {
     const j = await clipApi(path, body);
     clipStatus(j.ok ? done : ('失败: ' + (j.err || j.msg || '未知错误')), !j.ok);
+    if (j.ok) clearInputAlert();
   } catch (e) {
-    clipStatus('失败: 服务未响应', true);
+    clipStatus('服务未响应，操作状态未知；请检查远端窗口后再重试', true);
   }
 }
 
@@ -1243,7 +1655,7 @@ $('clip-set').addEventListener('click', () => {
 
 $('clip-paste').addEventListener('click', () => {
   const text = clipText.value;
-  clipRun('粘贴中', '/api/paste', text ? { text } : {}, '已发送 Ctrl+V');
+  clipRun('粘贴中', '/api/paste', text ? { text } : {}, '已发送粘贴快捷键');
 });
 
 $('clip-type').addEventListener('click', () => {
@@ -1269,12 +1681,39 @@ function onRemoteClipboard(text) {
 // ================= 设置面板 =================
 function applyQuality() {
   if (!rfb) return;
-  rfb.qualityLevel = S.quality;
-  rfb.compressionLevel = QUALITY_MAP[S.quality] ?? 2;
+  const q = S.dataSaver || autoSaver ? 3 : S.quality;
+  rfb.qualityLevel = q;
+  rfb.compressionLevel = QUALITY_MAP[q] ?? 2;
 }
+function applySaverUI() {
+  const enabled = S.dataSaver || autoSaver;
+  $('vnc-saver').classList.toggle('on', enabled);
+  $('vnc-saver').setAttribute('aria-pressed', enabled ? 'true' : 'false');
+  $('vnc-saver').textContent = autoSaver && !S.dataSaver ? '自动省流' : '省流';
+  $('vnc-saver').title = autoSaver ? '高延迟自动降低画质；网络恢复后还原' : '手动降低画质和传输量';
+  document.querySelectorAll('#set-panel .seg.q button').forEach((b) => {
+    b.title = enabled ? '省流中实际画质为低档；此处保留网络恢复后的画质选择' : '';
+  });
+}
+function updateAutoSaver(ms) {
+  slowSamples = ms >= 450 ? slowSamples + 1 : 0;
+  fastSamples = ms <= 200 ? fastSamples + 1 : 0;
+  const next = slowSamples >= 2 ? true : fastSamples >= 4 ? false : autoSaver;
+  if (next === autoSaver) return;
+  autoSaver = next;
+  applyQuality();
+  applySaverUI();
+}
+$('vnc-saver').addEventListener('click', () => {
+  S.dataSaver = !S.dataSaver;
+  saveS();
+  applyQuality();
+  applySaverUI();
+});
 function applyPadH() {
   $('pad-area').style.height = S.padH + 'px';
   $('set-padh-v').textContent = S.padH + 'px';
+  scheduleScreenFit();
 }
 function applyHints() {
   document.querySelector('#pad-area .hint').style.display = S.hints ? '' : 'none';
@@ -1282,6 +1721,7 @@ function applyHints() {
 function applyKeybar() {
   $('keybar').classList.toggle('hide', !S.keybar);
   $('vnc-keybtn').classList.toggle('on', S.keybar);
+  scheduleScreenFit();
 }
 function applyScrollUI() {
   $('set-scroll').value = Math.round(S.scrollSpeed * 10);
@@ -1294,6 +1734,7 @@ applyPadH();
 applyHints();
 applyScrollUI();
 applyKeybar();
+applySaverUI();
 $('set-padh').value = S.padH;
 $('set-hints').checked = S.hints;
 $('set-ping').checked = S.showPing;
@@ -1301,7 +1742,6 @@ $('set-edge').checked = S.edgeNudge;
 $('set-awake').checked = S.keepAwake;
 $('set-bgkeep').checked = S.bgKeep;
 applyTypeUI();
-applyAwake();                       // 异步, 不 await; 失败也不影响其它初始化
 document.querySelectorAll('#set-panel .seg.q button').forEach((b) => {
   b.classList.toggle('on', Number(b.dataset.q) === S.quality);
 });
@@ -1394,7 +1834,9 @@ $('set-close').addEventListener('click', () => { $('set-panel').style.display = 
 document.querySelectorAll('#set-panel .seg.q button').forEach((b) => {
   b.addEventListener('click', () => {
     S.quality = Number(b.dataset.q);
+    S.dataSaver = false;
     saveS(); applyQuality();
+    applySaverUI();
     document.querySelectorAll('#set-panel .seg.q button').forEach((x) =>
       x.classList.toggle('on', x === b));
   });
@@ -1409,7 +1851,6 @@ $('set-padh').addEventListener('input', (e) => {
   S.padH = Number(e.target.value);
   $('set-padh-v').textContent = S.padH + 'px';
   applyPadH();
-  window.dispatchEvent(new Event('resize'));
   saveS();
 });
 $('set-scroll').addEventListener('input', (e) => {
@@ -1425,6 +1866,7 @@ $('set-scroll').addEventListener('input', (e) => {
 const elVol = $('set-vol');
 const elVolV = $('set-vol-v');
 let volTimer = null;
+let volRevision = 0;
 
 function volLabel(pct) {
   const over = pct > 100;
@@ -1435,10 +1877,11 @@ function volLabel(pct) {
 
 async function refreshVolume() {
   if (!elVol) return;
+  const revision = volRevision;
   try {
     const r = await fetch('/api/volume', { cache: 'no-store' });
     const j = await r.json();
-    if (j && j.ok && typeof j.vol === 'number') {
+    if (revision === volRevision && j && j.ok && typeof j.vol === 'number') {
       elVol.value = String(Math.max(0, Math.min(150, j.vol)));
       volLabel(Number(elVol.value));
     }
@@ -1447,16 +1890,13 @@ async function refreshVolume() {
 
 if (elVol) {
   elVol.addEventListener('input', (e) => {
+    volRevision++;
     const pct = Number(e.target.value);
     volLabel(pct);
     // 滑动中别每个 tick 都发包 —— 攒 250ms 再发(手感更跟手, 请求也更少)
     if (volTimer) clearTimeout(volTimer);
     volTimer = setTimeout(() => {
-      fetch('/api/volume', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ vol: pct }),
-      }).catch(() => {});
+      saveSetting('电脑音量', '/api/volume', { vol: pct });
     }, 250);
   });
 }
@@ -1466,6 +1906,7 @@ if (elVol) {
 const elBri = $('set-bri');
 const elBriV = $('set-bri-v');
 let briTimer = null;
+let briRevision = 0;
 
 function briLabel(pct) {
   if (elBriV) elBriV.textContent = pct + '%';
@@ -1473,10 +1914,11 @@ function briLabel(pct) {
 
 async function refreshBrightness() {
   if (!elBri) return;
+  const revision = briRevision;
   try {
     const r = await fetch('/api/brightness', { cache: 'no-store' });
     const j = await r.json();
-    if (j && j.ok && typeof j.pct === 'number') {
+    if (revision === briRevision && j && j.ok && typeof j.pct === 'number') {
       elBri.value = String(Math.max(5, Math.min(100, j.pct)));
       briLabel(Number(elBri.value));
     }
@@ -1485,16 +1927,13 @@ async function refreshBrightness() {
 
 if (elBri) {
   elBri.addEventListener('input', (e) => {
+    briRevision++;
     const pct = Number(e.target.value);
     briLabel(pct);
     // 和音量一样攒 250ms 再发: 拖动过程中别把请求打满(每次都要起一个 xrandr)
     if (briTimer) clearTimeout(briTimer);
     briTimer = setTimeout(() => {
-      fetch('/api/brightness', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pct: pct }),
-      }).catch(() => {});
+      saveSetting('屏幕亮度', '/api/brightness', { pct });
     }, 250);
   });
 }
@@ -1518,12 +1957,34 @@ function applyTypeUI() {
 // 「输入方式 / 输入响应」是**跟电脑有关**的设置(切的是电脑上的投递方式),
 // 换手机也该一样, 所以真正的家是电脑上的 config.json, localStorage 只当本地缓存。
 // 开机先拉服务端的为准; 改的时候两边都写。
-function saveCfg(patch) { clipApi('/api/config', patch).catch(() => {}); }
+const settingQueues = new Map();
+function saveSetting(label, path, patch) {
+  // 同一设置按点击顺序保存，避免弱网下旧请求后完成覆盖新值。
+  const pending = (settingQueues.get(path) || Promise.resolve()).then(async () => {
+    try {
+      const j = await clipApi(path, patch);
+      if (!j || !j.ok) throw new Error(j?.err || j?.msg || '服务未确认保存');
+      return j;
+    } catch (e) {
+      showInputAlert(label + '保存失败：' + (e.name === 'AbortError'
+        ? '请求超时，结果未知；请重新读取确认' : e.message), 'setting');
+      return null;
+    }
+  });
+  settingQueues.set(path, pending);
+  return pending;
+}
+let inputCfgRevision = 0;
+function saveCfg(patch) {
+  inputCfgRevision++;
+  return saveSetting('输入设置', '/api/config', patch);
+}
 
 async function loadServerConfig() {
+  const revision = inputCfgRevision;
   try {
     const j = await clipApi('/api/config');
-    if (j && j.ok && j.config) {
+    if (revision === inputCfgRevision && j && j.ok && j.config) {
       if (j.config.typeMode) S.typeMode = j.config.typeMode;
       if (j.config.typeBatch) S.typeBatch = Number(j.config.typeBatch);
       saveS(); applyTypeUI();
@@ -1548,22 +2009,42 @@ document.querySelectorAll('#set-typebatch button').forEach((b) => {
 // 用手机控电脑时屏幕动不动就熄, 非常烦。Wake Lock API 只在 HTTPS / localhost 下
 // 可用, 且切后台会被系统自动释放 —— 所以每次回到前台都要重新申请。
 let wakeLock = null;
-async function applyAwake() {
-  if (!('wakeLock' in navigator)) return;
+let wakeRequest = null;
+async function applyAwake(notify = false) {
+  if (!('wakeLock' in navigator)) {
+    if (notify && S.keepAwake) showInputAlert('当前浏览器或连接不支持屏幕常亮；请使用支持此功能的浏览器和 HTTPS', 'setting');
+    return;
+  }
   try {
     if (S.keepAwake && document.visibilityState === 'visible') {
       if (!wakeLock) {
-        wakeLock = await navigator.wakeLock.request('screen');
-        wakeLock.addEventListener('release', () => { wakeLock = null; });
+        if (wakeRequest) { await wakeRequest; return; }
+        wakeRequest = (async () => {
+          const acquired = await navigator.wakeLock.request('screen');
+          // 申请期间可能关开关或切后台；迟到的锁不能重新开启常亮。
+          if (!S.keepAwake || document.visibilityState !== 'visible') {
+            await acquired.release();
+            return;
+          }
+          wakeLock = acquired;
+          acquired.addEventListener('release', () => {
+            if (wakeLock === acquired) wakeLock = null;
+          });
+        })();
+        try { await wakeRequest; } finally { wakeRequest = null; }
       }
     } else if (wakeLock) {
-      await wakeLock.release();
+      const previous = wakeLock;
       wakeLock = null;
+      await previous.release();
     }
-  } catch (e) { /* 不支持或用户拒绝, 默默跳过 */ }
+  } catch (e) {
+    if (notify) showInputAlert('屏幕常亮申请失败：' + e.message, 'setting');
+  }
 }
+applyAwake();
 $('set-awake').addEventListener('change', (e) => {
-  S.keepAwake = e.target.checked; saveS(); applyAwake();
+  S.keepAwake = e.target.checked; saveS(); applyAwake(true);
 });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') applyAwake();
@@ -1583,6 +2064,7 @@ async function refreshDockState() {
   const el = $('dock-state');
   try {
     const j = await (await fetch('/api/dock')).json();
+    $('set-dock').disabled = false;
     $('set-dock').checked = !j.pressure;
     // 标出当前延迟档位(系统里可能是别的值, 那就都不高亮, 不撒谎)
     document.querySelectorAll('#set-dockdelay button').forEach((b) => {
@@ -1654,18 +2136,16 @@ document.querySelectorAll('#set-dockdelay button').forEach((b) => {
 noFocusSteal();   // 所有按钮都不抢焦点(否则点一下键, 软键盘就收起)
 startPing();      // 右上角延迟: 不依赖 VNC 是否连上, 开机就测
 
-// 服务端版本自检: static/ 与 templates/ 是每次请求都从磁盘读的, 所以前端改动
-// 刷新即生效; 但 server.py 改了必须重启服务。新接口返回 404 就说明跑的还是旧进程,
-// 直接告诉用户该敲什么命令 —— 不然只会静默失败, 让人以为代码没起作用。
+// 静态资源刷新即生效，server.py 必须重启。用输入能力版本明确区分新旧进程。
 (async function checkServerVersion() {
   try {
-    const r = await fetch('/api/screen');
-    if (r.status !== 404) return;
+    const r = await fetch('/api/health', { cache: 'no-store' });
+    const j = await r.json();
+    if (Number(j.inputVersion) >= 2) return;
     const el = $('vnc-banner');
     el.classList.add('show');
-    el.innerHTML = '服务端仍是旧版本: <b>剪贴板 / 直接键入</b> 还没生效。'
-      + '请在电脑上执行 <b>systemctl --user restart meow-console meow-vnc</b> 再刷新本页。'
-      + '(触控板、键盘、Dock 贴边弹出属于前端改动, 已经生效)';
+    el.textContent = '控制台服务仍是旧进程：终端自动粘贴和输入修复尚未生效。'
+      + '请在合适时机执行 systemctl --user restart meow-console，再刷新本页。';
   } catch (e) {}
 })();
 
@@ -1809,9 +2289,25 @@ function startPlainAudio() {
   }
 }
 
+// 音频开着的时候定期报一次"这个页面还活着"。
+//
+// 为什么需要: 服务端 /api/audio 有个判据 —— 开流那一刻如果最近有页面心跳过,
+// 就把这条流**绑到那个心跳**上, 之后 20 秒收不到心跳就停(没人听就别占着设备)。
+// 采集模块一直在发这个心跳, 远程桌面原来**从来不发** —— 于是"刚在采集模块用过
+// 麦克风, 20 秒内切到远程桌面开声音"会被误判成"人走了", 声音播着播着就断。
+let audioHbTimer = 0;
+function audioHb() {
+  if (!audioOn) return;
+  fetch('/api/audio/hb', { cache: 'no-store' }).catch(() => {});
+}
+
 function setAudio(on) {
   audioOn = on;
+  clearInterval(audioHbTimer);
+  audioHbTimer = 0;
   if (on) {
+    audioHb();                          // 立刻报一次(要早于服务端开流判断)
+    audioHbTimer = setInterval(audioHb, 5000);
     audioEl.volume = 1;                 // 音量交给手机音量键(见文件上方说明)
     audioEl.pause();
     if (mseSupported()) {
@@ -1895,16 +2391,16 @@ function fsShowUi() {
   fsHideTimer = setTimeout(() => ui.classList.remove('show'), 3500);
 }
 
-// 布局变了要让 noVNC 重新按容器算画布尺寸。
-// noVNC 用的是 ResizeObserver, 但容器是 fixed 定位切换的, 补一次 resize 事件最稳。
+// 全屏切换后按实际容器重新适配，并更新放大状态的平移范围。
 function fsResize() {
-  try { window.dispatchEvent(new Event('resize')); } catch (e) { /* ignore */ }
+  scheduleScreenFit();
   // 画布重新适配容器之后, 放大状态的平移范围也要跟着更新(转屏 / 进出全屏)
   zClamp(); zApply();
 }
 
 async function fsEnter() {
   const wrap = $('screen-wrap');
+  if (!lastFbPointer && ready()) lastFbPointer = toFb();
   fsFake = false;
   try {
     if (wrap.requestFullscreen) {
@@ -2126,17 +2622,18 @@ document.addEventListener('webkitfullscreenchange', fsSync);
     btns.forEach((b) => b.classList.toggle('on', b.dataset.ao === mode));
     labels(mode);
   }
+  let revision = 0;
   fetch('/api/audio/out', { cache: 'no-store' })
     .then((r) => r.json())
-    .then((j) => { if (j && j.ok) mark(j.mode); })
+    .then((j) => { if (!revision && j && j.ok) mark(j.mode); })
     .catch(() => {});
-  btns.forEach((b) => b.addEventListener('click', () => {
-    mark(b.dataset.ao);
-    fetch('/api/audio/out', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: b.dataset.ao }),
-    }).catch(() => {});
-    if (typeof refreshVolume === 'function') setTimeout(refreshVolume, 400);
+  btns.forEach((b) => b.addEventListener('click', async () => {
+    revision++;
+    btns.forEach((x) => { x.disabled = true; });
+    const j = await saveSetting('声音去向', '/api/audio/out', { mode: b.dataset.ao });
+    if (j) mark(j.mode || b.dataset.ao);
+    btns.forEach((x) => { x.disabled = false; });
+    if (typeof refreshVolume === 'function') refreshVolume();
   }));
 })();
 
@@ -2144,18 +2641,20 @@ document.addEventListener('webkitfullscreenchange', fsSync);
 (function bindScreenMode() {
   const sel = document.getElementById('set-mode');
   if (!sel) return;
+  let confirmedMode = '';
   fetch('/api/screen/modes', { cache: 'no-store' }).then((r) => r.json()).then((j) => {
     if (!j || !j.ok || !j.modes) return;
+    confirmedMode = j.current;
     sel.innerHTML = j.modes.map((m) =>
       '<option value="' + m.name + '"' + (m.name === j.current ? ' selected' : '') + '>'
       + m.name + ' @' + m.hz + 'Hz</option>').join('');
   }).catch(() => {});
-  sel.addEventListener('change', () => {
-    fetch('/api/screen/mode', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: sel.value }),
-    }).then((r) => r.json()).then((j) => {
-      if (j && !j.ok) alert('切换失败: ' + (j.err || ''));
-    }).catch(() => {});
+  sel.addEventListener('change', async () => {
+    const mode = sel.value;
+    sel.disabled = true;
+    const j = await saveSetting('分辨率', '/api/screen/mode', { mode });
+    if (j) confirmedMode = mode;
+    else if (confirmedMode) sel.value = confirmedMode;
+    sel.disabled = false;
   });
 })();

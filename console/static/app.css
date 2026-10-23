@@ -1,6 +1,9 @@
 /* MEOW控制台 - 手机优先深色主题 */
 :root {
   --bg: #0b0f14; --card: #131a23; --card2: #0f151d; --line: #223042;
+  /* 实心卡片色。bg_css() 会把 --card 覆盖成半透明的(跟随「更换背景」的
+     透明度设置), 但弹窗这种必须看得清的地方要用它, 不能被透掉。 */
+  --card-solid: #131a23;
   --fg: #dce6f2; --dim: #7d8fa6; --acc: #4da3ff; --ok: #3ecf8e;
   --warn: #ffb454; --bad: #ff6b6b; --r: 14px;
 }
@@ -118,7 +121,15 @@ table.tbl td.num, table.tbl th.num { text-align: right; }
 /* ---- 终端页 ---- */
 body.term-page { display: flex; flex-direction: column; height: 100dvh; overflow: hidden; }
 body.term-page .topbar { flex: none; }
-#terminal { flex: 1; min-height: 0; padding: 4px 6px; }
+/* 终端: 画布透明(xterm 主题已改成透明), 这里垫一层和别的面板同样的半透明卡片 ——
+   底图透出来, 纯文字又不会压在照片上看不清; 透出多少由"背景透明度"统一控制
+   (--panel-a, 见 server.py 的 bg_css)。 */
+#terminal { flex: 1; min-height: 0; padding: 4px 6px; margin: 6px 8px;
+  background: var(--card); border: 1px solid var(--line); border-radius: var(--r); }
+/* xterm.css 把这两处写死成 #000 了(它自己排在 app.css 后面, 所以这里必须显式盖);
+   不盖的话整块还是黑的, 底图看不见。 */
+.xterm .xterm-viewport, .xterm .xterm-screen { background-color: transparent; }
+.xterm .composition-view { background: transparent; }
 #term-status { font-size: 12px; color: var(--dim); }
 .qkbar { flex: none; display: flex; gap: 6px; padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
   overflow-x: auto; background: var(--card); border-top: 1px solid var(--line); }
@@ -188,3 +199,148 @@ button:disabled { transform: none; opacity: .5 }
    统一在这里兜一道, 免得以后新加的开关按钮忘了写 .on 样式。 */
 .topbar button.on, .vnc-toolbar button.on {
   background: var(--acc); color: #04121f; border-color: transparent; font-weight: 700 }
+
+/* ---- 一键自检按钮: 紧跟在「更换背景」下面, 和它同一套观感(全宽一行) ---- */
+.sc-open { display: block; width: 100%; margin-top: 10px; padding: 11px;
+  border: 0; border-radius: 10px; background: var(--card2); color: var(--fg);
+  text-align: center; font-size: 14px; font-weight: 600; cursor: pointer;
+  font-family: inherit; }
+.sc-open:active { color: var(--acc); }
+.sc-open:disabled { opacity: .55; cursor: default; }
+
+/* ---- 一键自检的弹窗 ---- */
+.sc-mask { position: fixed; inset: 0; z-index: 200; background: rgba(4,7,11,.82);
+  display: flex; align-items: center; justify-content: center; padding: 14px; }
+.sc-mask[hidden] { display: none; }
+.sc-card { width: 100%; max-width: 560px; max-height: 86vh; display: flex;
+  flex-direction: column; background: var(--card-solid); border: 1px solid var(--line);
+  border-radius: var(--r); overflow: hidden; }
+.sc-head { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; padding: 11px 14px;
+  border-bottom: 1px solid var(--line); }
+.sc-head b { flex: 1; font-size: 15px; }
+.sc-head button { background: transparent; border: 0; color: var(--fg);
+  font-size: 19px; line-height: 1; padding: 2px 8px; cursor: pointer; }
+.sc-body { flex: 1 1 auto; min-height: 0; overflow: auto;
+  padding: 8px 14px 12px; -webkit-overflow-scrolling: touch; }
+.sc-foot { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+  border-top: 1px solid var(--line); }
+.sc-foot .sc-note { flex: 1; color: var(--dim); font-size: 11.5px; line-height: 1.5; }
+.sc-foot button { background: var(--card2); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 8px; padding: 7px 14px; font-size: 13px; white-space: nowrap; cursor: pointer; }
+.sc-foot button:disabled { opacity: .5; }
+.sc-grp { margin: 12px 0 2px; font-size: 11.5px; color: var(--dim);
+  letter-spacing: 1.5px; font-weight: 600; }
+.sc-it { display: flex; gap: 8px; padding: 5px 0; font-size: 13px;
+  border-bottom: 1px solid #1b2531; align-items: baseline; }
+.sc-it:last-child { border-bottom: 0; }
+.sc-it .lv { flex: 0 0 auto; width: 14px; text-align: center; font-weight: 700; }
+.sc-it .nm { flex: 0 0 auto; color: var(--fg); }
+.sc-it .dt { flex: 1; color: var(--dim); font-size: 11.5px; text-align: right;
+  word-break: break-all; }
+.sc-it.ok .lv { color: var(--ok); }
+.sc-it.warn .lv { color: var(--warn); }
+.sc-it.bad .lv { color: var(--bad); }
+.sc-it.run .lv { color: var(--dim); }
+.sc-sum { font-size: 13px; padding: 10px 0 0; border-top: 1px solid var(--line);
+  margin-top: 10px; }
+.sc-sum b { font-weight: 700; }
+.sc-sum b.ok { color: var(--ok); } .sc-sum b.warn { color: var(--warn); }
+.sc-sum b.bad { color: var(--bad); }
+
+/* ---- 进入页面时的加载进度小框 ----
+   观感沿用远程桌面那个"已按住左键"提示框: 半透明圆角、白字、pointer-events:none。
+   区别是**做成一个小胶囊**, 只显示百分比; 当前在等哪一步在 title 里(长按可见)。
+   到 100% 后 1 秒渐隐(见 loadtip.js)。 */
+.load-tip { position: fixed; z-index: 10060; right: 12px;
+  top: calc(52px + env(safe-area-inset-top));
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 5px 11px 7px; border-radius: 999px; max-width: 62vw;
+  background: rgb(32 55 78 / .86); color: #fff; text-align: center;
+  pointer-events: none; opacity: 0; overflow: hidden;
+  transform: translateY(-5px) scale(.96);
+  transition: opacity .2s ease-out, transform .2s ease-out;
+  font-size: 12.5px; font-weight: 600; line-height: 1.25;
+  font-variant-numeric: tabular-nums; box-shadow: 0 3px 12px #0006; }
+.load-tip.on { opacity: 1; transform: none; }
+.load-tip.gone { opacity: 0; transition: opacity .45s ease-out; }
+.load-tip .lt-nm { color: #cfe3f5; font-weight: 500;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.load-tip .lt-num { font-weight: 700; }
+.load-tip .lt-bar { position: absolute; left: 0; right: 0; bottom: 0; height: 2px;
+  background: #ffffff26; }
+.load-tip .lt-bar > i { display: block; height: 100%; width: 0;
+  background: #7fd1ff; transition: width .2s ease-out; }
+.load-tip.good .lt-bar > i { background: var(--ok); }
+.load-tip.bad { background: rgb(74 37 48 / .92); }
+.load-tip.bad .lt-bar > i { background: var(--bad); }
+
+/* ---- 主页: CPU 卡的补充信息 ---- */
+.card h3 .h3r { float: right; font-weight: 400; letter-spacing: 0;
+  font-size: 10.5px; color: var(--dim); max-width: 62%; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.card .big .bigr { float: right; font-size: 11px; font-weight: 500;
+  color: var(--dim); letter-spacing: 0; padding-top: 9px; }
+
+/* 每核一个格子: 底色按负载深浅(热力图), 中间写百分比数字 ——
+   以前只有一根几乎看不见的细条, 什么都读不出来。 */
+.cores .c { height: 30px; border-radius: 4px; background: #1b2531;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 10px; font-variant-numeric: tabular-nums; color: var(--dim);
+  transition: background .4s; }
+.cores .c.hi { color: #fff; font-weight: 600; }
+.cores .grp { grid-column: 1 / -1; font-size: 10.5px; color: var(--dim);
+  margin: 3px 0 -1px; letter-spacing: .5px; }
+
+/* ---- 窗口 / 前台窗口: 图标 + 应用名 + 窗口标题 ---- */
+.win-row { display: flex; align-items: center; gap: 8px; padding: 5px 0;
+  min-width: 0; overflow: hidden;
+  border-bottom: 1px solid #1b2531; }
+.win-row:last-child { border-bottom: 0; }
+.win-ic { flex: 0 0 auto; width: 22px; height: 22px; border-radius: 5px;
+  object-fit: contain; }
+.win-ic.badge { display: flex; align-items: center; justify-content: center;
+  background: #1b2531; color: var(--dim); font-size: 11px; font-weight: 700; }
+.win-txt { flex: 1; min-width: 0; }
+/* 必须 display:block —— 行内元素上 text-overflow 不生效, 长标题会一路撑出去,
+   把整页宽度顶开(实测 420px 的视口被撑到 730px, 页面能横向滚)。 */
+.win-app, .win-title { display: block; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.win-app { font-size: 13px; color: var(--fg); }
+.win-title { font-size: 11px; color: var(--dim); }
+.win-id { flex: 0 0 auto; font-size: 10px; color: #4a5a6e;
+  font-variant-numeric: tabular-nums; }
+
+/* ---- 信息面板的折叠 ----
+   右上角一个倒三角, 点一下收起、再点展开。状态存服务端 config.json 的
+   `collapsed`(见 server.py 的 DEFAULT_CONFIG), 换设备也一致。 */
+.card > h3 .fold { float: right; border: 0; background: transparent;
+  color: var(--dim); font-size: 11px; line-height: 1; padding: 2px 0 2px 8px;
+  cursor: pointer; transition: transform .18s ease-out; }
+.card.collapsed > h3 .fold { transform: rotate(-90deg); }
+.card.collapsed > h3 { margin-bottom: 0; }
+/* 折叠 = 只留标题那一行 */
+.card.collapsed > *:not(h3) { display: none !important; }
+/* 折叠后 h3 里的浮动元素仍然要跟标题同一行 */
+.card > h3 { overflow: hidden; }
+/* 卡片底部的一行小字说明 */
+.card .note { margin-top: 8px; font-size: 10.5px; line-height: 1.45;
+  color: #5b6b80; border-top: 1px solid #1b2531; padding-top: 6px; }
+
+/* ---- 折叠三角的定位(修正) ----
+   原来用 float + line-height:1, 三角比标题行矮 -> 贴到顶部, 看着"偏上"。
+   改成 flex + align-items:center, 垂直居中; 三角永远在最右
+   (CPU 卡里型号 .h3r 也在右边, 它排在三角**前面**)。 */
+.card > h3 { display: flex; align-items: center; }
+.card > h3 .h3r { float: none; margin-left: auto; min-width: 0; }
+.card > h3 .fold { float: none; margin-left: auto; padding: 2px 0 2px 8px; }
+/* 有型号时, 三角紧跟它右边; 没有时三角自己靠 auto 推到最右 */
+.card > h3 .h3r + .fold { margin-left: 6px; }
+/* 折叠键: **固定 18x18 + flex 居中**。
+   为什么必须固定尺寸: 原来靠 padding 撑, 折叠时按钮被撑到 18px 而 SVG 还贴在
+   顶部, rotate(-90deg) 之后 SVG 的中心就比标题低/高 4px(实测展开时三者中心
+   都是 1289.44, 折叠后 SVG 变成 1285.44)。固定尺寸后旋转前后中心一致。 */
+.card > h3 .fold { width: 18px; height: 18px; padding: 0;
+  display: flex; align-items: center; justify-content: center; }
+.card > h3 .fold svg { display: block; }
+/* 整行都能点(手机上 18px 太小); 标题没有别的可点元素, 不会误触 */
+.card > h3 { cursor: pointer; }

@@ -20,7 +20,7 @@
   <div class="quick">
     <a href="/term"><span class="ic">⌨️</span><span class="ti">终端</span><span class="de">bash · 干一切</span></a>
     <a href="/vnc"><span class="ic">🖥️</span><span class="ti">远程桌面</span><span class="de">实时图传 · 可操控</span></a>
-    <a href="/cam"><span class="ic">📷</span><span class="ti">摄像头</span><span class="de">后台采集 · 电脑不弹窗</span></a>
+    <a href="/cam"><span class="ic">📷</span><span class="ti">采集模块</span><span class="de">画面 + 声音 · 电脑不弹窗</span></a>
     {{extras}}
     <!-- 主题色固定排在**最后一个**: 放在上面那个私有入口占位符之后, 所以本机
          (文件管理/DSH 在它前面)它是第 6 个, 从仓库拉取的纯净版它是第 4 个。
@@ -34,56 +34,66 @@
   <div class="chips" id="chips"></div>
 
   <div class="grid">
-    <div class="card">
-      <h3>CPU</h3>
-      <div class="big"><span id="cpu-total">--</span><small style="font-size:13px;color:var(--dim)"> %</small></div>
+    <div class="card" data-card="cpu">
+      <h3>CPU <span class="h3r" id="cpu-model">--</span></h3>
+      <div class="big"><span id="cpu-total">--</span><small style="font-size:13px;color:var(--dim)"> %</small><span class="bigr" id="cpu-topo"></span></div>
       <div class="bar"><i id="cpu-bar"></i></div>
       <canvas id="cpu-hist" width="440" height="40" style="width:100%;height:40px"></canvas>
       <div class="cores" id="cpu-cores"></div>
       <div class="kv"><span class="d">负载均值</span><span id="load">--</span></div>
+      <div class="kv"><span class="d">折算占用</span><span id="load-pct">--</span></div>
+      <div class="kv"><span class="d">当前频率</span><span id="cpu-mhz">--</span></div>
     </div>
-    <div class="card">
+    <div class="card" data-card="mem">
       <h3>内存 / 交换</h3>
       <div class="big"><span id="mem-used">--</span><small style="font-size:13px;color:var(--dim)"> / <span id="mem-total">--</span></small></div>
       <div class="bar"><i id="mem-bar"></i></div>
       <div class="kv"><span class="d">Swap</span><span id="swap">--</span></div>
       <div class="kv"><span class="d">运行时长</span><span id="uptime">--</span></div>
     </div>
-    <div class="card">
+    <div class="card" data-card="temp">
       <h3>温度</h3>
       <div id="temps"></div>
     </div>
-    <div class="card">
+    <div class="card" data-card="net">
       <h3>网络</h3>
       <div id="net"></div>
     </div>
-    <div class="card">
+    <div class="card" data-card="disk">
       <h3>磁盘</h3>
       <div id="disks"></div>
     </div>
-    <div class="card">
+    <div class="card" data-card="bat">
       <h3>电池 / GPU</h3>
       <div id="batgpu"></div>
     </div>
-    <div class="card">
+    <div class="card" data-card="topcpu">
       <h3>进程 TOP(CPU)</h3>
       <table class="tbl" id="tbl-cpu"></table>
     </div>
-    <div class="card">
+    <div class="card" data-card="topmem">
       <h3>进程 TOP(内存)</h3>
       <table class="tbl" id="tbl-mem"></table>
     </div>
-    <div class="card">
+    <div class="card" data-card="active">
+      <h3>前台窗口 / 活动</h3>
+      <div id="active-win"></div>
+      <div class="kv" style="margin-top:6px"><span class="d">上次键鼠操作</span><span id="idle">--</span></div>
+      <div class="kv"><span class="d">鼠标位置</span><span id="mouse-pos">--</span></div>
+      <div class="note">只算键盘 / 鼠标 / 滚轮的真实输入。后台跑任务、放视频、
+        程序自己换前台窗口都不会算成"有人在用"。</div>
+    </div>
+    <div class="card" data-card="win">
       <h3>窗口(桌面)</h3>
       <div id="windows" style="font-size:12.5px"></div>
     </div>
-    <div class="card">
+    <div class="card" data-card="peers">
       <h3>Tailscale 设备</h3>
       <div id="peers" style="font-size:12.5px"></div>
     </div>
   </div>
 
-  <div class="card" style="margin-top:10px">
+  <div class="card" data-card="power" style="margin-top:10px">
     <h3>电源控制</h3>
     <div class="power">
       <button data-act="screen-off">熄屏</button>
@@ -96,7 +106,7 @@
     <div class="kv" style="margin-top:8px"><span class="d" id="power-msg">危险操作需二次确认</span></div>
   </div>
 
-  <div class="card" style="margin-top:10px">
+  <div class="card" data-card="pw" style="margin-top:10px">
     <h3>修改密码</h3>
     <div class="pwform">
       <input type="password" id="pw-old" placeholder="原密码" autocomplete="current-password">
@@ -111,11 +121,28 @@
   <a href="/bg" style="display:block;margin-top:10px;padding:11px;border-radius:10px;
      border:0;background:var(--card2);color:var(--fg);text-align:center;font-size:14px;
      font-weight:600">🖼️ 更换背景</a>
+
+  <!-- 一键自检: 紧跟在「更换背景」下面(用户要求放这儿), 观感也保持一致 -->
+  <button id="sc-open" class="sc-open" type="button">🩺 一键自检 · 查全部含延时</button>
   </div>
 
   <div class="foot">MEOW Console · 数据每 1s 推送<br>
     <a href="/log">审计日志</a> · 谁在什么时候连过、做了什么</div>
 </div>
+
+<!-- 一键自检的弹窗(见 home.js)。遮罩上点一下不关 —— 免得误触关掉正在跑的结果 -->
+<div class="sc-mask" id="sc-mask" hidden>
+  <div class="sc-card">
+    <div class="sc-head"><b id="sc-title">一键自检</b>
+      <button id="sc-close" type="button" title="关闭" aria-label="关闭">✕</button></div>
+    <div class="sc-body" id="sc-body"></div>
+    <div class="sc-foot">
+      <span class="sc-note" id="sc-note"></span>
+      <button id="sc-again" type="button">重跑</button>
+    </div>
+  </div>
+</div>
+
 <script src="/static/home.js"></script>
 </body>
 </html>

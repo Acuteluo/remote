@@ -9,6 +9,7 @@
 import atexit
 import base64
 import collections
+import ctypes
 import concurrent.futures
 import fcntl
 import glob
@@ -27,6 +28,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -91,6 +93,10 @@ DEFAULT_CONFIG = {"typeMode": "auto", "typeBatch": 80, "typeDelayMs": 20,
                   "bgTrans": 35, "bgDim": 45, "bgBlur": 0,
                   # 声音去向: pc=电脑也响(默认) / silent=只发手机(电脑静音, 走虚拟输出)
                   "audioOut": "pc",
+                  # 主页各信息面板的折叠状态: {卡片id: true=已折叠}。
+                  # 存服务端(而不是 localStorage)是为了换设备也一致 —— 和主题色/
+                  # 背景一样属于"这台电脑的偏好"。
+                  "collapsed": {},
                   # 端口也归配置管(命令行 --port / 环境变量 MEOW_PORT 优先级更高):
                   # port = 控制台对外端口; vncPort = x11vnc 的内部 RFB 端口。
                   "port": DEFAULT_PORT, "vncPort": DEFAULT_VNC_PORT,
@@ -98,52 +104,68 @@ DEFAULT_CONFIG = {"typeMode": "auto", "typeBatch": 80, "typeDelayMs": 20,
                   # 但编辑器里 Ctrl+V 正常、集成终端里不行"的应用, 光看类名分不出来,
                   # 只能靠"用户手动选一次 -> 按类名记住"。
                   "modeByClass": {}}
-_cfg_mtime = -1.0
+_cfg_lock = threading.RLock()
+_cfg_mtime = -1
 _cfg_data = dict(DEFAULT_CONFIG)
 
 
 def load_config():
     global _cfg_mtime, _cfg_data
-    try:
-        mt = os.path.getmtime(CONFIG_FILE)
-    except OSError:
+    with _cfg_lock:
+        try:
+            mt = os.stat(CONFIG_FILE).st_mtime_ns
+        except OSError:
+            return dict(_cfg_data)
+        if mt == _cfg_mtime:
+            return dict(_cfg_data)
+        try:
+            with open(CONFIG_FILE) as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                merged = dict(DEFAULT_CONFIG)
+                for k in DEFAULT_CONFIG:
+                    if k in d and d[k] is not None:
+                        merged[k] = d[k]
+                _cfg_data = merged
+        except (OSError, ValueError) as e:
+            audit("cfg", f"读取 config.json 失败(沿用旧值): {e}")
+        _cfg_mtime = mt
         return dict(_cfg_data)
-    if mt == _cfg_mtime:
-        return dict(_cfg_data)
-    try:
-        with open(CONFIG_FILE) as f:
-            d = json.load(f)
-        if isinstance(d, dict):
-            merged = dict(DEFAULT_CONFIG)
-            for k in DEFAULT_CONFIG:
-                if k in d and d[k] is not None:
-                    merged[k] = d[k]
-            _cfg_data = merged
-    except (OSError, ValueError) as e:
-        audit("cfg", f"读取 config.json 失败(沿用旧值): {e}")
-    _cfg_mtime = mt
-    return dict(_cfg_data)
 
 
 def save_config(patch):
-    d = load_config()
-    for k, v in (patch or {}).items():
-        if k in DEFAULT_CONFIG and v is not None:
-            d[k] = v
-    try:
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(d, f, ensure_ascii=False, indent=2)
-    except OSError as e:
-        return False, str(e), d
-    # 两个都要声明: 漏了 _cfg_data 的话赋值只会写进函数局部变量, 缓存保持旧值,
-    # 于是 POST 返回的是新配置、再 GET 又变回旧的(实际踩过)。
     global _cfg_mtime, _cfg_data
-    try:
-        _cfg_mtime = os.path.getmtime(CONFIG_FILE)
-    except OSError:
-        _cfg_mtime = -1.0      # 拿不到就下次强制重读
-    _cfg_data = d
-    return True, "ok", d
+    with _cfg_lock:
+        d = load_config()
+        for k, v in (patch or {}).items():
+            if k in DEFAULT_CONFIG and v is not None:
+                d[k] = v
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=".config.", suffix=".tmp", dir=os.path.dirname(CONFIG_FILE))
+            with os.fdopen(fd, "w") as f:
+                json.dump(d, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, CONFIG_FILE)
+            tmp_path = None
+        except OSError as e:
+            return False, str(e), d
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        # Read-modify-write is serialized, and replacement makes readers see either
+        # the old complete JSON or the new complete JSON, never a partially written file.
+        try:
+            _cfg_mtime = os.stat(CONFIG_FILE).st_mtime_ns
+        except OSError:
+            _cfg_mtime = -1
+        _cfg_data = d
+        return True, "ok", d
 
 
 def _resolve_port(cli, env_key, cfg_key, default, lo=1024, hi=65535):
@@ -179,6 +201,7 @@ WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 # 而不是"探到 200 就算好了" —— 服务是延迟 ~1.2s 才重启的, 提前探到的 200 是
 # **旧进程**在应答, 那时 reload 会正好撞进重启窗口, 页面直接打不开(用户报的 bug)。
 BOOT_ID = secrets.token_hex(4)
+_BOOT_AT = time.time()          # 进程起来的大致时刻(自检里报"已跑多久"用)
 CLK_TCK = os.sysconf("SC_CLK_TCK") or 100
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 
@@ -257,9 +280,20 @@ def set_credentials(user, pw):
     return auth
 
 
+_setup_lock = threading.Lock()
+
+
 def need_setup():
     """还没有凭据 -> 必须先走一次"首次设置"。"""
     return AUTH is None
+
+
+def setup_credentials(user, pw):
+    with _setup_lock:
+        if not need_setup():
+            return False
+        set_credentials(user, pw)
+        return True
 
 
 def ensure_config():
@@ -364,7 +398,9 @@ _session_env = None
 def session_env():
     """探测图形会话的 DISPLAY/XAUTHORITY 等, 供 wmctrl / xset / 终端使用。"""
     global _session_env
-    if _session_env is not None:
+    # 启动时 X11 可能还没就绪。缺少 DISPLAY 的探测结果不能缓存，
+    # 否则此后所有 /api/type 都会永久报 "Can't open display:"。
+    if _session_env is not None and _session_env.get("DISPLAY"):
         return _session_env
     env = {}
     try:
@@ -380,7 +416,7 @@ def session_env():
                         env[k] = v.decode()
     except (OSError, subprocess.SubprocessError):
         pass
-    if "DISPLAY" not in env and os.path.isdir("/tmp/.X11-unix"):
+    if not env.get("DISPLAY") and os.path.isdir("/tmp/.X11-unix"):
         xs = sorted(glob.glob("/tmp/.X11-unix/X*"))
         if xs:
             env["DISPLAY"] = ":" + os.path.basename(xs[0])[1:]
@@ -399,7 +435,8 @@ def session_env():
             env["XAUTHORITY"] = os.path.expanduser("~/.Xauthority")
     if not env:
         return None
-    _session_env = env
+    if env.get("DISPLAY"):
+        _session_env = env
     return env
 
 
@@ -417,6 +454,63 @@ def x_env():
         env["LC_ALL"] = "C.UTF-8"
         env["LANG"] = "C.UTF-8"
     return env
+
+
+# ---- ffmpeg: 按**能力**挑, 不按 PATH 挑 ----
+# 踩过的大坑(2026-10-23): 本机 ~/.local/bin/ffmpeg 是给 Rerun Viewer 用的
+# imageio 静态构建(v7.0.2, johnvansickle), 它**没有编 pulse 输入设备**, 也不认
+# -fragment_size; 而 systemd 用户环境的 PATH 里 ~/.local/bin 排在 /usr/bin 前面
+# (见 systemctl --user show-environment), 于是服务一重启就吃到这个阉割版 ——
+# **画面照常**(它有 v4l2), **麦克风整条路全废**: 探测 5 个候选全在 3ms 内失败,
+# 页面上点开麦毫无反应, 服务端连一个 /api/audio 都收不到。
+# 更阴的是: 开发时在 shell 里手跑 ffmpeg 一切正常(那个 PATH 里没有 ~/.local/bin),
+# 只有服务进程才复现 —— 所以必须显式挑, 不能 `shutil.which("ffmpeg")` 了事。
+FFMPEG_NEEDS = ("pulse", "v4l2")     # 收音要 pulse, 摄像头要 v4l2
+
+
+def _ffmpeg_devices(path):
+    """这个 ffmpeg 支持的设备名集合(解析 `ffmpeg -devices`)。"""
+    try:
+        r = subprocess.run([path, "-hide_banner", "-devices"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    names = set()
+    for line in (r.stdout or "").splitlines():
+        if not line.startswith(" "):
+            continue                       # 设备行都以空格开头, 表头不是
+        parts = line.split()
+        if len(parts) < 2 or parts[1] == "=":
+            continue                       # " D. = Demuxing supported" 这种表头
+        for n in parts[1].split(","):
+            if n:
+                names.add(n.strip())
+    return names
+
+
+def _pick_ffmpeg():
+    """第一个**同时支持 pulse 和 v4l2** 的 ffmpeg; 都没有就退回第一个能跑的。
+
+    先看发行版自带的完整构建(/usr/bin), 再看 PATH —— 顺序很重要: PATH 里那个
+    可能正是被用户自己装的精简构建盖住的。
+    """
+    cands = ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg",
+             shutil.which("ffmpeg") or "ffmpeg"]
+    fallback = None
+    for p in cands:
+        if not p or (p != "ffmpeg" and not os.path.exists(p)):
+            continue
+        devs = _ffmpeg_devices(p)
+        if not devs:
+            continue                       # 跑不起来, 跳过
+        if fallback is None:
+            fallback = p
+        if all(n in devs for n in FFMPEG_NEEDS):
+            return p
+    return fallback or "ffmpeg"
+
+
+FFMPEG = _pick_ffmpeg()
 
 
 # ---- 真实屏幕几何(缓存 30s) ----
@@ -582,8 +676,8 @@ def _decode_clip(raw):
     return raw.decode("latin-1")
 
 
-def clip_get(timeout=3):
-    """读 X CLIPBOARD; 失败返回 None。"""
+def clip_get(timeout=3, selection="clipboard"):
+    """读 X 选区; 失败返回 None。"""
     if not shutil.which("xclip"):
         return None
     env = x_env()
@@ -591,7 +685,7 @@ def clip_get(timeout=3):
     # 先明确要 UTF8_STRING; 选区持有者不认这个靶子时再退回默认(让 xclip 自己挑)
     for args in (["-target", "UTF8_STRING", "-o"], ["-o"]):
         try:
-            r = subprocess.run(["xclip", "-selection", "clipboard", *args],
+            r = subprocess.run(["xclip", "-selection", selection, *args],
                                env=env, capture_output=True, timeout=timeout)
         except (OSError, subprocess.SubprocessError):
             continue
@@ -604,8 +698,8 @@ def clip_get(timeout=3):
     return "" if ran_ok else None      # 跑通了但没内容 = 剪贴板是空的
 
 
-def clip_set(text):
-    """把文本写进 X CLIPBOARD, 轮询确认真的生效。
+def clip_set(text, selection="clipboard"):
+    """把文本写进 X 选区, 轮询确认真的生效。
 
     xclip 会 fork 一个子进程常驻持有选区 —— 必须把 stdout/stderr 指向 DEVNULL
     且不 wait, 否则管道不关, HTTP 请求会一直挂着。
@@ -613,13 +707,14 @@ def clip_set(text):
     if not shutil.which("xclip"):
         return False, "xclip 未安装"
     try:
-        with open(CLIP_TMP, "w", encoding="utf-8") as f:
+        path = CLIP_TMP if selection == "clipboard" else CLIP_TMP + ".primary"
+        with open(path, "w", encoding="utf-8") as f:
             f.write(text)
     except OSError as e:
         return False, str(e)
     _reap_clip()
     try:
-        p = subprocess.Popen(["xclip", "-selection", "clipboard", "-i", CLIP_TMP],
+        p = subprocess.Popen(["xclip", "-selection", selection, "-i", path],
                              env=x_env(), stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              start_new_session=True)
@@ -628,7 +723,7 @@ def clip_set(text):
     _clip_procs.append(p)
     # xclip 要跟当前选区持有者握手, 不是瞬时生效, 所以读回确认
     for _ in range(12):
-        if clip_get(timeout=0.6) == text:
+        if clip_get(timeout=0.6, selection=selection) == text:
             return True, "ok"
         time.sleep(0.07)
     return False, "写入后读回不一致(远端可能有程序占着选区)"
@@ -646,9 +741,28 @@ def clip_set(text):
 # 所以所有往 X 注入输入的动作都必须**串行且保序**。这里用"专职线程 + FIFO
 # 队列"而不是"每个请求抢一把锁": 锁只能保证互斥, 挡不住后到的请求插到前面,
 # 而打字顺序错了比丢字更难发现。
-_XIN_Q = queue.Queue()
+_XIN_MAX_DEPTH = 20
+_XIN_Q = queue.Queue(maxsize=_XIN_MAX_DEPTH)
 _XIN_LOCK = threading.Lock()
 _XIN_WORKER = None
+
+
+class InputResult(tuple):
+    """保持二元返回值兼容性，同时标明失败后是否能安全改走键入。"""
+    def __new__(cls, ok, msg, retry_safe=False):
+        result = super().__new__(cls, (ok, msg))
+        result.retry_safe = retry_safe
+        return result
+
+
+class _InputJob:
+    def __init__(self, fn):
+        self.fn = fn
+        self.done = threading.Event()
+        self.lock = threading.Lock()
+        self.started = False
+        self.cancelled = False
+        self.result = None
 
 
 def _xin_worker_loop():
@@ -656,13 +770,17 @@ def _xin_worker_loop():
         job = _XIN_Q.get()
         if job is None:
             return
-        fn, done, box = job
+        with job.lock:
+            if job.cancelled:
+                job.done.set()
+                continue
+            job.started = True
         try:
-            box.append(fn())
+            job.result = job.fn()
         except Exception as e:                      # 绝不能让工作线程死掉
-            box.append((False, f"输入线程异常: {e}"))
+            job.result = InputResult(False, f"输入线程异常: {e}")
         finally:
-            done.set()
+            job.done.set()
 
 
 def _xin_ensure_worker():
@@ -674,7 +792,6 @@ def _xin_ensure_worker():
             _XIN_WORKER.start()
 
 
-_XIN_MAX_DEPTH = 20                 # 队列里最多压这么多活, 再多就拒绝
 _XIN_MAX_WAIT = 120.0               # 单个任务的最长等待, 防止 HTTP 线程无限堆积
 _last_ime_logged = "init"           # 输入法门禁结果只在变化时记一条
 
@@ -686,15 +803,21 @@ def _xin_submit(fn, budget):
     if depth >= _XIN_MAX_DEPTH:
         # 宁可明确报错, 也不能让 HTTP 线程无上限地堆下去 —— 那才是真的卡死
         return False, f"输入队列拥塞(积压 {depth} 个), 请稍后再试"
-    done = threading.Event()
-    box = []
-    _XIN_Q.put((fn, done, box))
+    job = _InputJob(fn)
+    try:
+        _XIN_Q.put_nowait(job)
+    except queue.Full:
+        return InputResult(False, "输入队列已满，请稍后再试")
     wait = min(_XIN_MAX_WAIT, max(budget, 10.0 + depth * 2.0))
-    if not done.wait(timeout=wait):
-        return False, f"输入队列超时(等了 {wait:.0f}s, 前面还有 {depth} 个任务)"
-    if not box:
+    if not job.done.wait(timeout=wait):
+        with job.lock:
+            if not job.started:
+                job.cancelled = True
+                return InputResult(False, "输入排队超时，已取消未执行的任务")
+        return InputResult(False, "输入执行超时，送达状态未知；请检查远端后再重试")
+    if job.result is None:
         return False, "输入线程无返回"
-    return box[0]
+    return job.result
 
 
 # ---------------------------------------------------------------- 输入法守卫
@@ -925,15 +1048,39 @@ def _focus_is_terminal():
 _clip_rlock = threading.Lock()
 _clip_restore_timer = None
 _clip_original = None
+_clip_generation = 0
+_clip_session_active = False
 
 
-def _restore_clip_job():
-    global _clip_restore_timer, _clip_original
+def _restore_clip_job(generation=None):
+    global _clip_restore_timer, _clip_original, _clip_session_active
     with _clip_rlock:
+        if generation is not None and generation != _clip_generation:
+            return True, "已跳过过期的剪贴板还原"
         orig, _clip_original, _clip_restore_timer = _clip_original, None, None
-    if not orig:
+        _clip_session_active = False
+    if orig is None:
         return True, "无需还原"
     return clip_set(orig)
+
+
+def _cancel_clip_restore():
+    global _clip_restore_timer, _clip_original, _clip_generation, _clip_session_active
+    with _clip_rlock:
+        _clip_generation += 1
+        if _clip_restore_timer is not None:
+            _clip_restore_timer.cancel()
+        _clip_restore_timer, _clip_original, _clip_session_active = None, None, False
+
+
+def _set_clip_persistent(text):
+    _cancel_clip_restore()
+    return clip_set(text)
+
+
+def _paste_persistent(text, combo):
+    _cancel_clip_restore()
+    return _paste_job(text, combo)
 
 
 def _combo_raw(combo):
@@ -955,8 +1102,20 @@ def _paste_job(text, combo="ctrl+v"):
     """
     ok, msg = clip_set(text)
     if not ok:
-        return False, f"剪贴板写入失败: {msg}"
-    return _combo_raw(combo)
+        return InputResult(False, f"剪贴板写入失败: {msg}", retry_safe=True)
+    if combo != "shift+Insert":
+        return InputResult(*_combo_raw(combo))
+    # xterm 的 Shift+Insert 读 PRIMARY，不读 CLIPBOARD。保留原 PRIMARY，
+    # 临时同步过去完成粘贴后再还原，避免覆盖用户当前选中的文本。
+    original = clip_get(selection="primary")
+    ok, msg = clip_set(text, selection="primary")
+    if not ok:
+        return InputResult(False, f"PRIMARY 写入失败: {msg}", retry_safe=True)
+    try:
+        return InputResult(*_combo_raw(combo))
+    finally:
+        if original is not None:
+            clip_set(original, selection="primary")
 
 
 def _paste_raw(text, combo="ctrl+v"):
@@ -965,20 +1124,25 @@ def _paste_raw(text, combo="ctrl+v"):
     这是往 Chromium/Electron/GTK 应用里送文本**最可靠**的方式: 完全不碰键映射,
     也就绕开了"应用 keymap 缓存没更新 -> 同一个字反复出现"那个坑。
     """
-    global _clip_original, _clip_restore_timer
+    global _clip_original, _clip_restore_timer, _clip_generation, _clip_session_active
     with _clip_rlock:
-        if _clip_restore_timer is None:      # 一段连续输入的开头才记录原内容
+        _clip_generation += 1
+        generation = _clip_generation
+        if not _clip_session_active:      # 一段连续输入的开头才记录原内容
+            _clip_session_active = True
             _clip_original = clip_get(timeout=0.5)
-        else:
+        if _clip_restore_timer is not None:
             _clip_restore_timer.cancel()     # 取消上一个待还原, 下面重新排
     res = _xin_submit(lambda: _paste_job(text, combo), budget=20.0)
 
     with _clip_rlock:
+        if generation != _clip_generation:
+            return res
         if _clip_restore_timer is not None:
             _clip_restore_timer.cancel()
         # 空闲 1.5 秒才还原: 连续打字时不断被推迟, 所以绝不会插进两次粘贴之间
         _clip_restore_timer = threading.Timer(
-            1.5, lambda: _xin_submit(_restore_clip_job, budget=10.0))
+            1.5, lambda: _xin_submit(lambda: _restore_clip_job(generation), budget=10.0))
         _clip_restore_timer.daemon = True
         _clip_restore_timer.start()
     return res
@@ -1001,18 +1165,28 @@ def _resolve_mode(mode):
     return "term" if _focus_is_terminal() else "paste"
 
 
+def _paste_combo(mode):
+    """按当前窗口选择粘贴键；老 xterm 使用 Shift+Insert。"""
+    if mode != "term":
+        return "ctrl+v"
+    cls = _focus_key()
+    return "shift+Insert" if "xterm" in cls and "gnome" not in cls \
+        else "ctrl+shift+v"
+
+
 def _remember_mode_for_class(mode):
     """把用户这次的选择记到当前窗口类名上, 下次自动用。"""
     key = _focus_key()
     if not key:
         return
-    cfg = load_config()
-    mbc = dict(cfg.get("modeByClass") or {})
-    if mode == "auto":
-        mbc.pop(key, None)
-    else:
-        mbc[key] = mode
-    save_config({"modeByClass": mbc})
+    with _cfg_lock:
+        cfg = load_config()
+        mbc = dict(cfg.get("modeByClass") or {})
+        if mode == "auto":
+            mbc.pop(key, None)
+        else:
+            mbc[key] = mode
+        save_config({"modeByClass": mbc})
 
 
 def deliver_text(text, req_mode=None):
@@ -1029,19 +1203,23 @@ def deliver_text(text, req_mode=None):
 
     # 终端**不认 Ctrl+V**。VTE(gnome-terminal/kgx/tilix/terminator/xfce4-terminal)、
     # kitty、alacritty、konsole、foot 用 Ctrl+Shift+V; 老 xterm 只能 Shift+Insert。
-    if mode == "term" or (mode == "auto" and _focus_is_terminal()):
-        cls = _focus_key()
-        combo = "shift+Insert" if "xterm" in cls and "gnome" not in cls \
-            else "ctrl+shift+v"
-        ok, msg = _paste_raw(text, combo)
+    if mode == "term":
+        combo = _paste_combo(mode)
+        result = _paste_raw(text, combo)
+        ok, msg = result
         if ok:
             return True, msg, f"粘贴({combo})"
+        if not getattr(result, "retry_safe", False):
+            return False, msg, f"粘贴({combo})"
         ok2, msg2 = type_text(text)
         return ok2, (msg2 if ok2 else f"{msg} / {msg2}"), "键入(终端粘贴失败)"
 
-    ok, msg = _paste_raw(text, "ctrl+v")
+    result = _paste_raw(text, "ctrl+v")
+    ok, msg = result
     if ok:
         return True, msg, "粘贴(Ctrl+V)"
+    if not getattr(result, "retry_safe", False):
+        return False, msg, "粘贴(Ctrl+V)"
     # 剪贴板这条路走不通(没装 xclip / 选区被占)就退回逐字键入
     ok2, msg2 = type_text(text)
     return ok2, (msg2 if ok2 else f"{msg} / {msg2}"), "键入(剪贴板不可用)"
@@ -1084,23 +1262,11 @@ def type_text(text):
     return _xin_submit(lambda: _type_raw(text), budget=20.0 + len(text) * 0.02)
 
 
-def _ctrl_v_raw():
-    # 同步等它敲完再返回: 队列的意义就在于"前一个动作真的落地了才做下一个",
-    # 这里若 fire-and-forget, 后面的键入就可能插到 Ctrl+V 之前。
-    try:
-        p = subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+v"],
-                           env=x_env(), capture_output=True, timeout=20)
-    except (OSError, subprocess.SubprocessError) as e:
-        return False, str(e)
-    return p.returncode == 0, ("已发送 Ctrl+V" if p.returncode == 0
-                               else p.stderr.decode("utf-8", "replace")[:200])
-
-
-def send_ctrl_v():
-    """发 Ctrl+V。同样进队列: --clearmodifiers 会改修饰键状态, 不能和键入交错。"""
+def send_paste_key(combo):
+    """只发粘贴键；与文本投递共用队列，避免按键交错。"""
     if not shutil.which("xdotool"):
         return False, "xdotool 未安装"
-    return _xin_submit(_ctrl_v_raw, budget=15.0)
+    return _xin_submit(lambda: _combo_raw(combo), budget=15.0)
 
 
 # ---------------------------------------------------------------- WebSocket
@@ -1120,6 +1286,12 @@ class WSConn:
         # 只发 ping 不看 pong 是没用的: 手机锁屏/切网后连接会变成半死状态,
         # 数据发得出去(TCP 缓冲收着), 但对端早就不处理了。
         self.last_pong = time.time()
+        self.ping_rtt_ms = None
+        self._pending_pings = {}
+        self._ping_lock = threading.Lock()
+        self.send_started = None
+        self.last_send_ms = 0.0
+        self.last_send_at = 0.0
 
     # ---- 发送
     def send_frame(self, opcode, payload=b""):
@@ -1144,7 +1316,14 @@ class WSConn:
 
     def ping(self):
         try:
-            self.send_frame(0x9, b"hb")
+            # 包括等待发送锁的耗时，反映画面通道实际拥堵。
+            started = time.monotonic()
+            payload = b"hb" + struct.pack(">d", started)
+            with self._ping_lock:
+                self._pending_pings[payload] = started
+                if len(self._pending_pings) > 8:
+                    del self._pending_pings[next(iter(self._pending_pings))]
+            self.send_frame(0x9, payload)
         except OSError:
             self.alive = False
 
@@ -1189,6 +1368,10 @@ class WSConn:
                 continue
             if opcode == 0xA:
                 self.last_pong = time.time()
+                with self._ping_lock:
+                    started = self._pending_pings.pop(data, None)
+                if started is not None:
+                    self.ping_rtt_ms = (time.monotonic() - started) * 1000
                 continue
             if opcode in (0x1, 0x2):
                 if msg_op is not None:
@@ -1217,7 +1400,226 @@ class WSConn:
 
 # ---------------------------------------------------------------- 状态采集
 
+# ---- 把窗口的 WM_CLASS 映射成"应用名 + 图标" -------------------------------
+# WM_CLASS 长这样: "Navigator.firefox_firefox" / "code.code" / "chatgpt"。
+# 拿它去 .desktop 里找 Name= / Icon=, 面板上就能显示"Firefox Web Browser"+图标,
+# 而不是一串 0x02200017(用户反馈那样看不出是啥)。
+_APP_DIRS = ("/usr/share/applications", "/usr/local/share/applications",
+             "/var/lib/snapd/desktop/applications",
+             os.path.expanduser("~/.local/share/applications"))
+_ICON_ROOTS = ("/usr/share/icons", "/usr/local/share/icons",
+               os.path.expanduser("~/.local/share/icons"),
+               "/var/lib/snapd/desktop/icons", "/usr/share/pixmaps")
+_app_cache = {"t": 0.0, "idx": {}}
+_icon_cache = {}
+
+
+def _desktop_entries():
+    for d in _APP_DIRS:
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for fn in names:
+            if not fn.endswith(".desktop"):
+                continue
+            try:
+                with open(os.path.join(d, fn), encoding="utf-8",
+                          errors="replace") as f:
+                    txt = f.read()
+            except OSError:
+                continue
+            if "[Desktop Entry]" not in txt:
+                continue
+
+            def get(k, txt=txt):
+                mm = re.search(r"^%s=(.*)$" % k, txt, re.M)
+                return mm.group(1).strip() if mm else ""
+
+            ex = (get("Exec").split() or [""])[0]
+            yield {"file": fn[:-8], "name": get("Name"), "icon": get("Icon"),
+                   "swc": get("StartupWMClass"), "exec": os.path.basename(ex)}
+
+
+def app_index():
+    """{小写键: .desktop 信息}。**分两遍**建: 先 StartupWMClass/文件名(准),
+    再 Exec 名(次准) —— 否则 code-url-handler.desktop(Exec 也叫 code)会把
+    正牌的 code.desktop 挤掉(实测踩到)。"""
+    now = time.time()
+    if _app_cache["idx"] and now - _app_cache["t"] < 600:
+        return _app_cache["idx"]
+    idx, ents = {}, list(_desktop_entries())
+    for pri in (0, 1):
+        for e in ents:
+            keys = (e["swc"], e["file"]) if pri == 0 else (e["exec"],)
+            for k in keys:
+                if k:
+                    idx.setdefault(k.lower(), e)
+    _app_cache.update(t=now, idx=idx)
+    return idx
+
+
+def match_app(cls):
+    """WM_CLASS -> .desktop 条目; 找不到返回 None(前端退回首字母角标)。"""
+    if not cls:
+        return None
+    idx = app_index()
+    if cls.lower() in idx:
+        return idx[cls.lower()]
+    parts = [x for x in re.split(r"[.\-_]", cls) if len(x) >= 3]
+    for x in sorted(set(parts), key=len, reverse=True):
+        if x.lower() in idx:
+            return idx[x.lower()]
+    # 模糊匹配**只允许后缀**(flclash 撞 clash)。以前也允许前缀, 结果 "system"
+    # 撞上了 system-config-printer, 把 Android 模拟器认成了"打印机"。
+    for x in sorted(set(parts), key=len, reverse=True):
+        xl = x.lower()
+        for k, e in idx.items():
+            if 4 <= len(k) <= 24 and k != xl and k.endswith(xl):
+                return e
+    return None
+
+
+_ICON_CACHE_DIR = os.path.join(DATA_DIR, "iconcache")
+
+
+def icon_scaled(path, px=64):
+    """图标太大就先缩到 px 见方再发。
+
+    /usr/share/pixmaps 里有些是 512x512 的原图(chatgpt.png 实测 **499KB**,
+    vscode.png 216KB), 而列表里只显示 ~20px —— 原样发出去手机上白等好几秒。
+    缩完一般几 KB。用**现成的 ffmpeg**(和采集那条路同一个二进制), 结果缓存在
+    data/iconcache; 小图和矢量图直接原样返回。
+    """
+    try:
+        if os.path.getsize(path) <= 24 * 1024:
+            return path
+    except OSError:
+        return path
+    if os.path.splitext(path)[1].lower() == ".svg":
+        return path
+    try:
+        key = "%s-%d-%d.png" % (os.path.basename(path), px, int(os.path.getmtime(path)))
+    except OSError:
+        return path
+    out = os.path.join(_ICON_CACHE_DIR, key)
+    if os.path.exists(out):
+        return out
+    try:
+        os.makedirs(_ICON_CACHE_DIR, exist_ok=True)
+        # 临时文件**必须带 .png**: ffmpeg 靠扩展名猜输出格式, 叫 .tmp 它会
+        # 直接报"Unable to find a suitable output format"然后失败(踩过)。
+        tmp = out + ".part.png"
+        r = subprocess.run(
+            [FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", path,
+             "-vf", "scale=%d:%d:force_original_aspect_ratio=decrease" % (px, px),
+             "-frames:v", "1", tmp],
+            capture_output=True, timeout=15)
+        if r.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+            os.replace(tmp, out)
+            return out
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return path
+
+
+def find_icon(name):
+    """把 .desktop 的 Icon= 解析成真实文件路径; 找不到返回 None。"""
+    if not name:
+        return None
+    if name in _icon_cache:
+        return _icon_cache[name]
+    path = None
+    if name.startswith("/"):
+        path = name if os.path.exists(name) else None
+    else:
+        for root in _ICON_ROOTS:
+            if not os.path.isdir(root):
+                continue
+            if root.endswith("pixmaps"):
+                for ext in (".png", ".svg", ".xpm"):
+                    f = os.path.join(root, name + ext)
+                    if os.path.exists(f):
+                        path = f
+                        break
+                continue
+            for theme in ("hicolor", "Yaru", "Adwaita", "Yaru-dark", ""):
+                for size in ("128x128", "96x96", "64x64", "48x48", "scalable",
+                             "256x256"):
+                    for ext in (".png", ".svg"):
+                        f = (os.path.join(root, theme, size, "apps", name + ext)
+                             if theme else os.path.join(root, size, "apps", name + ext))
+                        if os.path.exists(f):
+                            path = f
+                            break
+                    if path:
+                        break
+                if path:
+                    break
+            if path:
+                break
+    _icon_cache[name] = path
+    return path
+
+
+# ---- 空闲时长: 最后一次键盘/鼠标输入到现在 ----------------------------------
+# 用 X 的 **XScreenSaver 扩展**(`xprintidle` 用的就是它), 纯 ctypes, 不引第三方依赖。
+#
+# 为什么不用 GNOME 的 IdleMonitor: **这台机器上它是坏的** —— 实测连续 12 秒恒为
+# 64ms 不动, 而同一时间 `xinput test-xi2 --root` 一个输入事件都没有(桌面完全静止)。
+# XScreenSaver 那个才是准的: 实测每秒稳定 +1000ms。
+#
+# 它数的是**真实输入事件**(键盘/鼠标移动/按键/滚轮), 所以后台跑 AI 任务、放视频、
+# 程序自己弹窗换前台都**不会**重置它 —— 正是用户要的口径。
+_xss = {"lib": None, "dpy": None, "disp": None, "root": 0, "info": None}
+_xss_lock = threading.Lock()
+
+
+def x_idle_ms():
+    """返回 X 的空闲毫秒数; 拿不到返回 None。"""
+    disp = (session_env() or {}).get("DISPLAY") or os.environ.get("DISPLAY") or ":0"
+    with _xss_lock:
+        try:
+            if _xss["lib"] is None:
+                x11 = ctypes.CDLL("libX11.so.6")
+                x11.XOpenDisplay.restype = ctypes.c_void_p
+                x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+                x11.XDefaultRootWindow.restype = ctypes.c_ulong
+                x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+                xss = ctypes.CDLL("libXss.so.1")
+
+                class _Info(ctypes.Structure):
+                    _fields_ = [("window", ctypes.c_ulong), ("state", ctypes.c_int),
+                                ("kind", ctypes.c_int), ("since", ctypes.c_ulong),
+                                ("idle", ctypes.c_ulong), ("event_mask", ctypes.c_ulong)]
+                xss.XScreenSaverAllocInfo.restype = ctypes.POINTER(_Info)
+                xss.XScreenSaverQueryInfo.restype = ctypes.c_int
+                xss.XScreenSaverQueryInfo.argtypes = [
+                    ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(_Info)]
+                _xss["lib"] = (x11, xss, _Info)
+            x11, xss, _Info = _xss["lib"]
+            if _xss["dpy"] is None or _xss["disp"] != disp:
+                d = x11.XOpenDisplay(disp.encode())
+                if not d:
+                    return None
+                _xss["dpy"] = d
+                _xss["disp"] = disp
+                _xss["root"] = x11.XDefaultRootWindow(ctypes.c_void_p(d))
+                _xss["info"] = xss.XScreenSaverAllocInfo()
+            rc = xss.XScreenSaverQueryInfo(ctypes.c_void_p(_xss["dpy"]),
+                                           ctypes.c_ulong(_xss["root"]), _xss["info"])
+            if rc != 1:
+                return None
+            return int(_xss["info"].contents.idle)
+        except (OSError, AttributeError, ValueError):
+            return None
+
+
 class Collector:
+    # tailscale 健康检查里的话(`tailscale status` 末尾那段 # 开头的)。
+    # 给个默认空列表, 免得第一次快照时属性还不存在。
+    _ts_health = []
+
     def __init__(self):
         self._cpu_prev = None          # (ts, {core: ticks})
         self._cpu_last = {"total": 0.0, "cores": []}
@@ -1383,6 +1785,18 @@ class Collector:
     # -- 电池
     def battery(self):
         out = None
+        # 顺便把"电源插没插"读出来。**必须一起看** —— 内核只报电池自己的状态,
+        # 而笔记本在满电附近充电电路会来回切(充满→停充→微放→再充), status 就在
+        # Full / Not charging / Discharging 之间跳; 光看它会出现"插着电却显示
+        # Discharging"这种吓人的画面(用户反馈"来回切")。
+        ac = None
+        for ps in glob.glob("/sys/class/power_supply/*"):
+            try:
+                if open(os.path.join(ps, "type")).read().strip() == "Mains":
+                    ac = open(os.path.join(ps, "online")).read().strip() == "1"
+                    break
+            except (OSError, ValueError):
+                continue
         for ps in glob.glob("/sys/class/power_supply/*"):
             try:
                 with open(os.path.join(ps, "type")) as f:
@@ -1399,7 +1813,7 @@ class Collector:
                         if os.path.exists(cn) and os.path.exists(vn):
                             watts = (int(open(cn).read().strip()) *
                                      int(open(vn).read().strip())) / 1e12
-                    out = {"cap": cap, "status": st, "watts": watts}
+                    out = {"cap": cap, "status": st, "watts": watts, "ac": ac}
             except (OSError, ValueError):
                 continue
         return out
@@ -1534,10 +1948,158 @@ class Collector:
                 # 列在面板里就是纯噪音(用户反馈过 "0x04200003 @!0,0;BDHF 是什么")。
                 if cls == "gjs.Gjs" or re.match(r"^@!\d+,\d+;", title):
                     continue
-                out.append({"id": wid, "title": title, "cls": cls})
+                e = match_app(cls)
+                out.append({"id": wid, "title": title, "cls": cls,
+                            # 应用名(找不到就给个干净的兜底: 取 WM_CLASS 后半段)
+                            "app": (e["name"] if e and e["name"]
+                                    else cls.split(".")[-1] or cls),
+                            "icon": (e["icon"] if e else "")})
             return out
         except (OSError, subprocess.SubprocessError):
             return []
+
+    # -- CPU 型号 / 大小核拓扑 / 频率
+    def _cpu_info_static(self):
+        """CPU 的"身份": 型号、线程数、P/E 核划分。这些不变, 缓存 1 小时。"""
+        model = ""
+        try:
+            with open("/proc/cpuinfo") as f:
+                for ln in f:
+                    if ln.startswith("model name"):
+                        model = ln.split(":", 1)[1].strip()
+                        break
+        except OSError:
+            pass
+
+        def count(path):
+            # /sys/devices/cpu_core|cpu_atom 是内核给混合架构(Intel 12 代以后)
+            # 暴露的分组, 形如 "0-7" / "8-17"。比去猜频率上限靠谱。
+            try:
+                with open(path) as f:
+                    txt = f.read().strip()
+            except OSError:
+                return 0
+            n = 0
+            for part in txt.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if "-" in part:
+                    a, _, b = part.partition("-")
+                    try:
+                        n += int(b) - int(a) + 1
+                    except ValueError:
+                        pass
+                else:
+                    n += 1
+            return n
+
+        threads = 0
+        try:
+            threads = sum(1 for ln in open("/proc/cpuinfo") if ln.startswith("processor"))
+        except OSError:
+            pass
+        mhz_max = 0
+        for c in ("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq",
+                  "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"):
+            try:
+                mhz_max = max(mhz_max, int(open(c).read().strip()) // 1000)
+            except (OSError, ValueError):
+                pass
+        return {"model": model, "threads": threads,
+                "p": count("/sys/devices/cpu_core/cpus"),
+                "e": count("/sys/devices/cpu_atom/cpus"),
+                "mhz_max": mhz_max}
+
+    def cpu_info(self):
+        """型号/拓扑(缓存) + **当前频率**(每核瞬时值, 不缓存)。"""
+        info = dict(self._cached("cpuinfo", 3600.0, self._cpu_info_static))
+        try:
+            with open("/proc/cpuinfo") as f:
+                vals = [float(x) for x in re.findall(r"cpu MHz\s*:\s*([0-9.]+)", f.read())]
+        except (OSError, ValueError):
+            vals = []
+        if vals:
+            info["mhz"] = int(sum(vals) / len(vals))
+            info["mhz_lo"] = int(min(vals))
+            info["mhz_hi"] = int(max(vals))
+        return info
+
+    # -- 前台窗口 / 空闲时长 / 鼠标位置(面板 1s 推一次, 全缓存 2s)
+    def _activity_now(self):
+        """"现在在用哪个应用" + "上次有人操作是什么时候"。
+
+        - **前台窗口**: xdotool getactivewindow + wmctrl -lx 拿标题/类, 再映射成
+          应用名 + 图标(和窗口列表同一套)。
+        - **空闲时长**: 用 **GNOME 的 IdleMonitor**, 它数的是"最后一次键鼠输入到现在"。
+          所以后台挂着跑代码、放视频都不会被误判成"有人在动"(用户特别提到这点)——
+          那些不会产生输入事件。拿不到就退回 None(前端显示 --)。
+        - **鼠标位置**: xdotool getmouselocation。除了原始屏幕坐标, 还多给一份
+          0~1 的比例 —— 远程桌面那边靠它把指针定位到真实位置(帧缓冲是缩放过的,
+          客户端只要 frac * 帧缓冲宽 就能换算, 不用知道 x11vnc 用的什么缩放)。
+        """
+        env = session_env()
+        if not env:
+            return {}
+        full = {**os.environ, **env}
+        out = {}
+
+        def run(cmd, t=4):
+            try:
+                return subprocess.run(cmd, env=full, capture_output=True,
+                                      text=True, timeout=t).stdout
+            except (OSError, subprocess.SubprocessError):
+                return ""
+
+        # 空闲时长(= 最后一次键鼠输入到现在)
+        idle = x_idle_ms()
+        if idle is None:
+            # 退路: GNOME 的 IdleMonitor。**这台机器上它是坏的**(恒为 64ms,
+            # 而 xinput 显示根本没有输入事件), 所以只当兜底。
+            txt = run(["gdbus", "call", "--session", "--dest", "org.gnome.Mutter.IdleMonitor",
+                       "--object-path", "/org/gnome/Mutter/IdleMonitor/Core",
+                       "--method", "org.gnome.Mutter.IdleMonitor.GetIdletime"])
+            mm = re.search(r"(\d+)", txt)
+            if mm:
+                idle = int(mm.group(1))
+        if idle is not None:
+            out["idle_ms"] = idle
+
+        # 鼠标位置
+        txt = run(["xdotool", "getmouselocation"])
+        mm = re.search(r"x:(\d+)\s+y:(\d+)", txt)
+        if mm:
+            mx, my = int(mm.group(1)), int(mm.group(2))
+            out["mouse"] = {"x": mx, "y": my}
+            try:
+                w, h = screen_size()
+                if w and h:
+                    out["mouse"]["fx"] = round(mx / float(w), 5)
+                    out["mouse"]["fy"] = round(my / float(h), 5)
+            except Exception:
+                pass
+
+        # 前台窗口
+        wid = run(["xdotool", "getactivewindow"]).strip()
+        if wid:
+            try:
+                wid = "0x%08x" % int(wid)
+            except ValueError:
+                wid = ""
+        for w in (self.windows() or []):
+            if wid and w.get("id", "").lower() == wid.lower():
+                out["active"] = {"id": w["id"], "title": w.get("title", ""),
+                                 "cls": w.get("cls", ""), "app": w.get("app", ""),
+                                 "icon": w.get("icon", "")}
+                break
+        else:
+            # wmctrl 列表里没有(比如刚切过去) -> 至少把 id 报出来
+            if wid:
+                out["active"] = {"id": wid, "title": "", "cls": "", "app": "", "icon": ""}
+        return out
+
+    def activity(self):
+        return self._cached("activity", 2.0, self._activity_now)
 
     # -- Tailscale 设备(慢: 起 tailscale 子进程, 缓存 15s)
     def tailscale(self):
@@ -1550,15 +2112,34 @@ class Collector:
             r = subprocess.run(["tailscale", "status"], capture_output=True,
                                text=True, timeout=5)
             out = []
+            health = []
             for ln in r.stdout.splitlines():
+                # `tailscale status` 的末尾会附一段健康检查:
+                #     # Health check:
+                #     #     - Tailscale SSH enabled, but access controls don't ...
+                # 以前没管它 —— 那行按空白切完是 ['#','-','Tailscale','SSH',...],
+                # 于是被当成一台设备显示了出来: 主机名 "-"、系统 "SSH"、IP "#"。
+                # 用户看到的就是列表最下面那个莫名其妙的「- … # · SSH」。
+                s = ln.strip()
+                if s.startswith("#"):
+                    t = s.lstrip("#").strip()
+                    t = re.sub(r"^[-*\u2022]\s+", "", t)   # 去掉前面的列表符号
+                    if t and not t.lower().startswith("health check"):
+                        health.append(t)      # 这段其实有用, 别丢(自检里会报)
+                    continue
                 fld = ln.split()
                 if len(fld) < 5:
                     continue
                 ip, host, _user, osname = fld[0], fld[1], fld[2], fld[3]
+                # 第一列必须是 IP —— 多一道保险, 免得将来 tailscale 再往 stdout
+                # 里塞别的段落, 又被当成设备。
+                if not _IPV4_RE.match(ip) and ":" not in ip:
+                    continue
                 status = " ".join(fld[4:])
                 offline = "offline" in status or "logged out" in status
                 out.append({"ip": ip, "host": host, "os": osname,
                             "online": not offline, "self": "self" in status})
+            self._ts_health = health
             return out
         except (OSError, subprocess.SubprocessError):
             return []
@@ -1739,9 +2320,12 @@ class Collector:
             "top_mem": top_mem,
             "windows": self.windows(),
             "peers": self.tailscale(),
+            "cpu_info": self.cpu_info(),
+            "activity": self.activity(),
         }
         # 桌面连接数: 每 5s 才数一次(面板 1s 推一次, 没必要那么勤)
         snap["vnc_clients"] = self._cached("vncc", 5, vnc_client_count)
+        snap["ts_health"] = list(self._ts_health or [])
         snap["alerts"] = self.alerts(snap)
         return snap
 
@@ -1811,6 +2395,8 @@ def ws_term_bridge(ws):
             return
         _term_count += 1
     pid = fd = None
+    master = slave = None
+    p = pty_thread = None
     try:
         env = _term_env()
         senv = session_env()
@@ -1818,8 +2404,7 @@ def ws_term_bridge(ws):
             env.update({k: v for k, v in senv.items()
                         if k in ("DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS")})
 
-        # 用 Popen 而非 pty.fork: 多线程进程里 fork+exec 之间执行 Python 代码
-        # (execvpe 找 PATH 等)可能死锁; Popen 的 exec 在 C 层完成, 无此风险。
+        # 控制终端初始化放到独立解释器中，多线程服务不使用 preexec_fn。
         try:
             master, slave = os.openpty()
         except OSError as e:
@@ -1834,22 +2419,32 @@ def ws_term_bridge(ws):
             ws.close()
             return
 
-        def _child_init():
-            os.setsid()
+        try:
+            p = subprocess.Popen(
+                [sys.executable, os.path.join(BASE_DIR, "pty_shell.py")], stdin=slave, stdout=slave,
+                stderr=slave, cwd=env["HOME"], env=env,
+                start_new_session=True, close_fds=True)
+        except OSError as e:
+            audit("term", f"终端启动失败(Popen): {e}")
             try:
-                fcntl.ioctl(slave, 0x540E, 0)      # TIOCSCTTY: 设为控制终端
+                ws.send_text(json.dumps(
+                    {"t": "err", "d": f"无法启动终端: {e}"}))
             except OSError:
                 pass
-
-        p = subprocess.Popen(
-            ["bash", "--login", "-i"], stdin=slave, stdout=slave, stderr=slave,
-            cwd=env["HOME"], env=env, preexec_fn=_child_init, close_fds=True)
-        os.close(slave)
+            ws.close()
+            return
         pid, fd = p.pid, master
+        master = None
+        os.close(slave)
+        slave = None
 
         def pty_reader():
+            import select
             try:
-                while True:
+                while ws.alive:
+                    ready, _, _ = select.select([fd], [], [], 1)
+                    if not ready:
+                        continue
                     data = os.read(fd, 65536)
                     if not data:
                         break
@@ -1863,7 +2458,8 @@ def ws_term_bridge(ws):
                 except OSError:
                     pass
 
-        threading.Thread(target=pty_reader, daemon=True).start()
+        pty_thread = threading.Thread(target=pty_reader, daemon=True)
+        pty_thread.start()
         threading.Thread(target=lambda: _hb(ws), daemon=True).start()
 
         while ws.alive:
@@ -1873,6 +2469,8 @@ def ws_term_bridge(ws):
             try:
                 msg = json.loads(payload.decode())
             except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(msg, dict):
                 continue
             t = msg.get("t")
             if t == "i" and isinstance(msg.get("d"), str):
@@ -1886,21 +2484,40 @@ def ws_term_bridge(ws):
                     rows = max(2, min(int(msg.get("r", 24)), 200))
                     fcntl.ioctl(fd, 0x5414, struct.pack("HHHH", rows, cols, 0, 0))  # TIOCSWINSZ
                     os.kill(pid, signal.SIGWINCH)
-                except OSError:
+                except (OSError, TypeError, ValueError, OverflowError):
                     pass
     except (WSClosed, OSError):
         pass
     finally:
+        for pty_fd in (master, slave):
+            if pty_fd is not None:
+                try:
+                    os.close(pty_fd)
+                except OSError:
+                    pass
+        ws.alive = False
+        try:
+            ws.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         if pid is not None:
             try:
                 os.kill(pid, signal.SIGHUP)
             except (ProcessLookupError, OSError):
                 pass
+        if pty_thread is not None:
+            pty_thread.join(timeout=2)
         if fd is not None:
             try:
                 os.close(fd)
             except OSError:
                 pass
+        if p is not None:
+            try:
+                p.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        ws.close()
         with _term_lock:
             _term_count -= 1
 
@@ -1919,8 +2536,131 @@ def _hb(ws):
 # 最后所有人都卡。僵尸客户端(手机锁屏/切网留下的)尤其致命。
 # 这里登记所有活着的桥接, 超过上限就把最早的踢掉 —— 保证最多只有这么多个。
 MAX_VNC_BRIDGES = 2
+VNC_PING_EVERY = 5
 _vnc_lock = threading.Lock()
 _vnc_bridges = []            # [[创建时间, teardown, 本地端口], ...] 按时间升序
+_vnc_network = {}            # viewer id -> WSConn；桥接退出时移除
+# viewer id -> [WSConn]：**只报画面时间戳**的旁路通道(见 ws_vnc_time)。
+# 为什么不复用 /ws/vnc: 那条是**纯 RFB 字节流** ——
+#   · 往里插文本帧会把 noVNC 的协议顶乱, 只能靠"监听器注册顺序"去拦, 很脆;
+#   · 裸 RFB 的测试客户端(见 tests/vnc_stability_check.py)一看到 {"t":"f"}
+#     就直接报"不是 RFB 版本"(实测把 path_check 打挂了)。
+# 单独一条通道就谁也不影响。
+_vnc_time = {}
+_vnc_time_lock = threading.Lock()
+
+
+def vnc_time_publish(viewer, ms):
+    """把"这块画面是什么时候收到的"发给该 viewer 的旁路订阅者。"""
+    if not viewer:
+        return
+    with _vnc_time_lock:
+        subs = list(_vnc_time.get(viewer, ()))
+    for w in subs:
+        try:
+            w.send_text(json.dumps({"t": "f", "s": ms}))
+        except Exception:
+            pass
+
+
+def ws_vnc_time(ws, viewer):
+    """远程桌面的画面时间戳旁路: 客户端连上后一直挂着, 服务端每推一块就报一次。"""
+    with _vnc_time_lock:
+        _vnc_time.setdefault(viewer, []).append(ws)
+    try:
+        while True:
+            try:
+                ws.recv_message()          # 客户端不发东西; 靠它发现断开 + 回 pong
+            except socket.timeout:
+                continue                   # 只是暂时没数据, 不是断开
+            except Exception:
+                break
+    finally:
+        with _vnc_time_lock:
+            subs = _vnc_time.get(viewer)
+            if subs and ws in subs:
+                subs.remove(ws)
+            if subs is not None and not subs:
+                _vnc_time.pop(viewer, None)
+_TAILSCALE_PATH_TTL = 30.0
+_tailscale_path_lock = threading.Lock()
+_tailscale_path_cache = {"at": 0.0, "value": None, "refreshing": False}
+
+
+def _refresh_tailscale_path():
+    """后台读取 tailnet 路径；网络指标请求不等待此子进程。"""
+    try:
+        result = subprocess.run(["tailscale", "status", "--json"],
+                                capture_output=True, text=True, timeout=2)
+        try:
+            status = json.loads(result.stdout) if result.returncode == 0 else {}
+        except (TypeError, ValueError):
+            status = {}
+        peers = status.get("Peer") if isinstance(status, dict) else None
+        if not isinstance(peers, dict):
+            summary = {"state": "unknown", "peers": []}
+        else:
+            active = []
+            for peer in peers.values():
+                if not isinstance(peer, dict) or not peer.get("Active"):
+                    continue
+                relay = str(peer.get("Relay") or "").strip()
+                cur_addr = str(peer.get("CurAddr") or "").strip()
+                # CurAddr means a direct endpoint is currently selected. Relay can
+                # still name the peer's preferred DERP region, so check it second.
+                route = ("direct" if cur_addr else
+                         f"DERP relay ({relay})" if relay else
+                         "active; route unavailable")
+                active.append({
+                    "device": str(peer.get("HostName") or "unknown device"),
+                    "os": str(peer.get("OS") or "unknown"),
+                    "path": route,
+                })
+            summary = {"state": "ok" if active else "no_active_peer",
+                       "peers": active}
+    except (OSError, subprocess.SubprocessError):
+        summary = {"state": "unknown", "peers": []}
+    summary["scope"] = "tailnet active peers; not a confirmed route for this viewer"
+    with _tailscale_path_lock:
+        _tailscale_path_cache.update(at=time.monotonic(), value=summary,
+                                     refreshing=False)
+
+
+def _tailscale_path_summary():
+    """Return cached path immediately and schedule at most one stale refresh."""
+    with _tailscale_path_lock:
+        now = time.monotonic()
+        cached = _tailscale_path_cache["value"]
+        fresh = (cached is not None and
+                 now - _tailscale_path_cache["at"] < _TAILSCALE_PATH_TTL)
+        if not fresh and not _tailscale_path_cache["refreshing"]:
+            _tailscale_path_cache["refreshing"] = True
+            worker = threading.Thread(target=_refresh_tailscale_path,
+                                      name="tailscale-path-refresh", daemon=True)
+            try:
+                worker.start()
+            except RuntimeError:
+                _tailscale_path_cache["refreshing"] = False
+        if cached is not None:
+            return cached
+        return {"state": "unknown", "peers": [],
+                "scope": "tailnet active peers; not a confirmed route for this viewer"}
+
+
+def vnc_network_stats(viewer):
+    path_summary = _tailscale_path_summary()
+    with _vnc_lock:
+        ws = _vnc_network.get(viewer)
+        if ws is None:
+            return {"active": False, "tailnetPath": path_summary}
+        now = time.monotonic()
+        started = ws.send_started
+        pending_ms = (now - started) * 1000 if started is not None else 0
+        recent_ms = ws.last_send_ms if now - ws.last_send_at < 10 else 0
+        return {"active": ws.alive, "rttMs": ws.ping_rtt_ms,
+                "sendMs": max(pending_ms, recent_ms),
+                "pongAgeMs": (time.time() - ws.last_pong) * 1000,
+                "tailnetPath": path_summary}
 
 
 def _vnc_register(teardown, port=None):
@@ -1952,7 +2692,7 @@ def _vnc_unregister(teardown):
                 break
 
 
-def ws_vnc_bridge(ws):
+def ws_vnc_bridge(ws, viewer=""):
     """浏览器 noVNC <-> 127.0.0.1:VNC_PORT x11vnc 双向搬运。
 
     2026-09-14 加固(针对"用一会儿就卡/要刷新"):
@@ -2008,6 +2748,9 @@ def ws_vnc_bridge(ws):
             pass
 
     _vnc_register(teardown, vnc_port)
+    if viewer:
+        with _vnc_lock:
+            _vnc_network[viewer] = ws
 
     def v2w():
         import select as _select
@@ -2028,6 +2771,9 @@ def ws_vnc_bridge(ws):
                     continue          # select 说可读但抢输了, 下一轮再来
                 if not data:
                     break
+                # 这块画面的"采集时刻" = x11vnc 刚把字节交给我们的这一刻。
+                # 下面那圈合并和 send_binary 都算发送侧的开销, 不该算进画面延时。
+                recv_at = int(time.time() * 1000)
                 # 把**已经到达**的数据一起收走, 合成一个 WebSocket 帧再发。
                 # x11vnc 一次更新常拆成好几个 8KB 小包, 不合的话手机每秒要处理
                 # 几百个 WS 消息 —— 纯属白烧手机 CPU, 还更容易被浏览器的调度抖动
@@ -2048,7 +2794,18 @@ def ws_vnc_bridge(ws):
                         if not more:
                             break
                         data += more
-                ws.send_binary(data)
+                ws.send_started = time.monotonic()
+                try:
+                    # 时间戳走**旁路通道**发给前端(见 ws_vnc_time), 这条 WS
+                    # 保持纯 RFB 字节流一个字节都不动。
+                    # 时刻取在"从 x11vnc 收到数据"的当下(recv_at), 不是发送那一刻 ——
+                    # 排队和 WS 写阻塞不该被算成画面延时。
+                    vnc_time_publish(viewer, recv_at)
+                    ws.send_binary(data)
+                    ws.last_send_ms = (time.monotonic() - ws.send_started) * 1000
+                    ws.last_send_at = time.monotonic()
+                finally:
+                    ws.send_started = None
         except (OSError, WSClosed):
             pass
         finally:
@@ -2081,7 +2838,7 @@ def ws_vnc_bridge(ws):
                 break
             if time.time() - ws.last_pong > 40:
                 break
-            if time.time() - last_ping >= 20:
+            if time.time() - last_ping >= VNC_PING_EVERY:
                 ws.ping()
                 last_ping = time.time()
                 if not ws.alive:
@@ -2107,6 +2864,10 @@ def ws_vnc_bridge(ws):
     if stuck:
         audit("vnc", f"桥接线程未及时退出: {','.join(stuck)} (可能有连接残留)")
     _vnc_unregister(teardown)           # 主动退出也要撤下登记, 别占着名额
+    if viewer:
+        with _vnc_lock:
+            if _vnc_network.get(viewer) is ws:
+                del _vnc_network[viewer]
     try:
         vnc.close()
     except OSError:
@@ -2337,15 +3098,21 @@ CAM_DEFAULT_DEV = "/dev/video0"
 CAM_DEFAULT_SIZE = "640x480"
 CAM_DEFAULT_FPS = 12
 CAM_MAX_FPS = 30
+# 摄像头驱动的**实际**输出速率(它会忽略 -framerate, 实测 27~28fps)。
+# 写进 ffmpeg 是为了让 -r 的丢帧换算有个对的基准。
+CAM_INPUT_FPS = 30
+# MJPEG 质量(ffmpeg 的 -q:v, 越小越好)。5 相对摄像头原生图 PSNR 44.9dB,
+# 肉眼分辨不出, 体积只有它的 1/3.6。
+CAM_QUALITY = 5
 _CAM_SIZES = ("320x240", "640x480", "1280x720")
 # 「还有人在看吗」的**唯一判据是前端 JS 主动发来的心跳**, 不是 WebSocket 的 pong:
 # 浏览器/系统的网络栈会自动回 pong, 哪怕页面早就切到后台、JS 已经被挂起。
 # 所以 JS 心跳一停(切后台/锁屏/离开), 就当没人看, 关掉摄像头。
-CAM_IO_TIMEOUT = 10         # socket 读写超时: 卡死的客户端要在 10s 内被断掉
 # 下面两个允许用环境变量压小 —— 好让 console/tests/cam_check.py 几秒内就能
 # 把"心跳停了会不会自己停采"验完(生产环境保持默认)。
 CAM_PING_EVERY = float(os.environ.get("MEOW_CAM_PING_EVERY") or 5)
 CAM_VIEWER_TIMEOUT = float(os.environ.get("MEOW_CAM_VIEWER_TIMEOUT") or 20)
+CAM_IO_TIMEOUT = max(10, CAM_VIEWER_TIMEOUT)  # IO 超时不早于观看心跳宽限
 
 
 V4L2_CAP_VIDEO_CAPTURE = 0x00000001
@@ -2428,10 +3195,16 @@ def _jpeg_frames(stream):
 
     ffmpeg -f mjpeg 输出的就是首尾相接的 JPEG, 没有长度前缀, 必须自己按标记分帧。
     帧数据里不会出现裸的 FFD9(字节填充会插 00), 所以找第一个 FFD9 是安全的。
+
+    **必须用 read1() 而不是 read()** —— 和音频那条路同一个坑(见 _audio_start):
+    `read(n)` 会一直阻塞到**攒满 n 字节**才返回。这里要 64KB, 而软编出来的帧
+    只有 12KB(640x480), 等于硬等 5 帧凑齐才肯处理 —— 凭空给画面加了
+    5/12fps ≈ **400ms** 的延时, 而且帧率被压成"一批一批"地跳。
+    read1(n) 是"有多少给多少", 来一帧就切一帧。
     """
     buf = b""
     while True:
-        chunk = stream.read(65536)
+        chunk = stream.read1(65536)
         if not chunk:
             break
         buf += chunk
@@ -2451,16 +3224,29 @@ def _jpeg_frames(stream):
 
 
 def _cam_attempts(dev, size, fps):
-    """两组参数依次尝试: 先让摄像头直出 MJPEG(不重编码, 几乎不耗 CPU),
-    失败(摄像头只支持 YUYV 等原始格式)再退回软件编码成 MJPEG。"""
+    """采集参数: **解码 + 按用户选的 fps 重新编码**, 不再直出 copy。
+
+    2026-10-23 实测这台机器(华为 MateBook + SenseTek FHD Camera)之后改的:
+
+      - 这颗摄像头**根本不认 -framerate**: 要 5fps 照样吐 28fps; 而直出那条路
+        又用不了 -r(裸 mjpeg 封装里 ffmpeg 丢不掉包)。结果就是用户选
+        "320×240 省流量" 也照样烧 10Mbps —— 帧率选项等于形同虚设。
+      - 直出 MJPEG 每帧 44KB(640x480); 软编 -q:v 5 只要 12KB, 相对原图
+        PSNR 44.9dB(40dB 以上肉眼分辨不出), 流量是 **1/9**。
+      - CPU 代价可以忽略: 27.7% -> 32.2%(单核百分比)。直出那条路本来也要把
+        10Mbps 从 USB 搬进管道, 并不省。
+
+    第一组让摄像头直出 MJPEG 给 ffmpeg 解码(USB 上只走压缩流, 省 USB 带宽),
+    第二组兜底: 摄像头不支持 MJPEG 输出(只给 YUYV 之类)时让 ffmpeg 自己挑输入格式。
+    -framerate 给固定值是因为驱动会忽略它 —— 写实际速率(30)才和 -r 的换算对得上。
+    """
+    common = [FFMPEG, "-hide_banner", "-loglevel", "error", "-f", "v4l2"]
+    tail = ["-video_size", size, "-framerate", str(CAM_INPUT_FPS), "-i", dev,
+            "-c:v", "mjpeg", "-q:v", str(CAM_QUALITY),
+            "-r", str(fps), "-f", "mjpeg", "-"]
     return [
-        ["ffmpeg", "-hide_banner", "-loglevel", "error",
-         "-f", "v4l2", "-input_format", "mjpeg",
-         "-video_size", size, "-framerate", str(fps), "-i", dev,
-         "-c:v", "copy", "-f", "mjpeg", "-"],
-        ["ffmpeg", "-hide_banner", "-loglevel", "error",
-         "-f", "v4l2", "-video_size", size, "-framerate", str(fps), "-i", dev,
-         "-c:v", "mjpeg", "-q:v", "5", "-f", "mjpeg", "-"],
+        [*common, "-input_format", "mjpeg", *tail],
+        [*common, *tail],
     ]
 
 
@@ -2479,7 +3265,13 @@ def _cam_start(dev, size, fps, first_timeout=4.0):
         def reader(p=p, q=q):
             try:
                 for f in _jpeg_frames(p.stdout):
-                    q.put(f)
+                    # ★ 时间戳打在**这里** —— 帧一从采集管道读出来就记。
+                    # 以前是等发送那一刻才 `time.time()`, 两者差的是"出帧到真正
+                    # 发出去"这段时间(排队 + WS 写阻塞), 机器一忙能有几十毫秒。
+                    # 那不是网络延时, 不该算进用户看到的"画面多久以前"。
+                    # 口径: 从这里开始计时, 即**采集侧**时刻(比传感器真正曝光晚
+                    # 一个"驱动+编码"的量, 实测 ~7ms)。
+                    q.put((int(time.time() * 1000), f))
             except (OSError, ValueError):
                 pass
             finally:
@@ -2518,10 +3310,17 @@ def _cam_start(dev, size, fps, first_timeout=4.0):
 
 _cam_lock = threading.Lock()
 _cam_session = {"proc": None, "stop": None}      # 同一时刻只允许一个采集会话
-# "摄像头页还有人在看"的最近时刻(前端 JS 心跳刷新)。给 /api/audio 复用:
-# 麦克风只在摄像头页里开, 而那页走了之后 HTTP 流本身收不到任何信号 ——
-# 半个死的连接连 _peer_gone 都探不出来(写还写得进去, 对端早不处理了)。
-_viewer_seen = {"t": 0.0}
+# "摄像头页还开着"的最近时刻。**两条心跳都写它**: 摄像头 WS 的 {"t":"hb"}
+# 和麦克风的 /api/audio/hb。
+#
+# 为什么非要这么一个时间戳: 页面走了之后, 那条 HTTP 音频流本身收不到任何信号 ——
+# 半个死的连接连 _peer_gone 都探不出来(写还写得进去, 对端早不处理了),
+# 收音会一直开着。
+#
+# 2026-10-23: 摄像头和麦克风拆成两个独立开关之后, 收音不能再只绑摄像头 WS 的
+# 心跳 —— "只开麦克风不开摄像头"、"开着收音把摄像头关掉"这两种用法都会被
+# 误判成"人走了"而把收音掐掉。所以麦克风自己发一条心跳(见 /api/audio/hb)。
+_page_seen = {"t": 0.0}
 
 
 def _cam_release_current(timeout=3.0):
@@ -2596,7 +3395,7 @@ def ws_cam_bridge(ws, dev=None, size=None, fps=None):
     except (TypeError, ValueError):
         fps = CAM_DEFAULT_FPS
 
-    if not shutil.which("ffmpeg"):
+    if not shutil.which(FFMPEG):
         _cam_send_err(ws, "未安装 ffmpeg, 无法采集摄像头")
         return
 
@@ -2627,6 +3426,18 @@ def ws_cam_bridge(ws, dev=None, size=None, fps=None):
         pass
 
     def pump():
+        """把帧推给前端。
+
+        **宁可掉帧, 不可积压**: 每次发送前把队列里积压的旧帧全丢掉, 只发最新那一帧。
+        手机网络一慢, 旧帧会在队列和内核发送缓冲区里排长队 —— 画面越看越滞后,
+        而且**永远追不回来**(生产者一直比消费者快)。监控场景下"跳掉几帧"远比
+        "延迟一直涨"可接受。
+
+        帧率这里**不再自己掐**: 摄像头那侧已经用 `-r` 限过了(见 _cam_attempts)。
+        早先试过在这儿再按 1/fps 兜一道, 结果是**误杀** —— ffmpeg 丢帧后的输出
+        间隔是 72/108ms 跳着来的(输入 28fps 的 2 帧或 3 帧), 一刀切在 70.8ms
+        上就把 72ms 那些也扔了, 12fps 实测掉到 8.2fps。
+        """
         try:
             while not stop.is_set():
                 try:
@@ -2635,7 +3446,27 @@ def ws_cam_bridge(ws, dev=None, size=None, fps=None):
                     continue
                 if f is None:
                     break
-                ws.send_binary(f)
+                # 丢积压: 一路取到队列空, 手上只留最后一帧
+                while True:
+                    try:
+                        nxt = frames.get_nowait()
+                    except queue.Empty:
+                        break
+                    if nxt is None:
+                        f = None
+                        break
+                    f = nxt
+                if f is None:
+                    break
+                # 每帧先发一条极小的文本消息: "这一帧是什么时候**采出来**的"。
+                # 前端拿它算"屏幕上这张画面是多少秒以前的"(配合 /api/time 的
+                # 时钟对齐, 见 cam.js)。时间戳来自读管道那一刻, 不是这一刻 ——
+                # 排队/发送阻塞不该算成画面延时。
+                # 用独立的文本消息而不是往 JPEG 里塞头: 二进制格式一个字节都不用动,
+                # 不认识 {"t":"f"} 的老前端会直接忽略它, 行为完全不变。
+                ts, blob = f
+                ws.send_text(json.dumps({"t": "f", "s": ts}))
+                ws.send_binary(blob)
         except (OSError, WSClosed, ValueError):
             pass
         finally:
@@ -2643,7 +3474,7 @@ def ws_cam_bridge(ws, dev=None, size=None, fps=None):
 
     # 前端最后一次心跳的时间 —— 判"还有没有人在看"就看它
     last_viewer = time.time()
-    _viewer_seen["t"] = last_viewer         # 供 /api/audio 复用(见 _serve_audio)
+    _page_seen["t"] = last_viewer         # 供 /api/audio 复用(见 _serve_audio)
 
     def reader():
         """按 WS 协议读客户端消息, 只关心一件事: 前端 JS 还在不在发心跳。
@@ -2668,7 +3499,7 @@ def ws_cam_bridge(ws, dev=None, size=None, fps=None):
                     try:
                         if json.loads(data.decode("utf-8", "replace")).get("t") == "hb":
                             last_viewer = time.time()
-                            _viewer_seen["t"] = last_viewer   # 给 /api/audio 复用
+                            _page_seen["t"] = last_viewer   # 给 /api/audio 复用
                     except (ValueError, AttributeError, TypeError):
                         pass
         except socket.timeout:
@@ -2805,7 +3636,12 @@ def audio_level(kind="pulse", src="default", seconds=1.5, wait=2.5):
     DMIC 就是: 能打开但一个字节都不出)只能靠超时跳过 —— 给太大就会白等。
     多个候选请用 audio_probe_all() 并行探, 别串行调这个。
     """
-    cmd = ["ffmpeg", "-hide_banner", "-f", kind, "-i", src,
+    # -fragment_size **必须加**: 不加的话 PipeWire 每 ~2 秒才肯给一大块,
+    # 而 -t 只要采 0.7 秒 —— ffmpeg 照样得等那一大块到手才算完, 单次探测就吃掉
+    # 4.2 秒(实测 4172ms -> 833ms, 2026-10-23)。摄像头页一进去就要把所有候选
+    # 探一遍, 这个差别直接决定"点开麦克风等 5 秒"还是"等 1 秒"。
+    frag = ["-fragment_size", "2048"] if kind == "pulse" else []
+    cmd = [FFMPEG, "-hide_banner", "-f", kind, *frag, "-i", src,
            "-t", str(seconds), "-af", "volumedetect", "-f", "null", "-"]
     try:
         p = subprocess.run(cmd, env=x_env(), capture_output=True,
@@ -2817,9 +3653,12 @@ def audio_level(kind="pulse", src="default", seconds=1.5, wait=2.5):
         m = re.search(pat, err)
         return float(m.group(1)) if m else None
     mx = num(r"max_volume:\s*([-\d.]+)\s*dB")
+    # 把 ffmpeg 的最后一行 stderr 也带上: 探测"没结果"时, /api/audio/check 里能直接
+    # 看到**为什么**(设备忙? 权限? 源没了?)。以前这里吞掉 stderr, 出问题只能干瞪眼。
+    tail = (err.strip().splitlines() or [""])[-1][:200]
     return {
         "ok": p.returncode == 0 and mx is not None,
-        "kind": kind, "src": src,
+        "kind": kind, "src": src, "rc": p.returncode, "stderr": tail,
         "mean_volume": num(r"mean_volume:\s*([-\d.]+)\s*dB"),
         "max_volume": mx,
         "silent": (mx if mx is not None else -91.0) <= -90.0,
@@ -3397,6 +4236,33 @@ def audio_out_mode():
     return "silent" if v == "silent" else "pc"
 
 
+def set_audio_out_mode(mode):
+    """执行并确认声音去向变更；真实状态确认通过前不持久化模式。"""
+    if mode == "silent":
+        ok, msg = set_pc_volume(SILENT_VOL)
+        if not ok:
+            return False, msg
+        actual = get_pc_volume()
+        if actual is None:
+            return False, "音量命令已执行，但读回失败，未切换声音去向"
+        if actual.get("vol") != SILENT_VOL:
+            return False, f"音量读回为 {actual.get('vol')}%，未达到 {SILENT_VOL}%，未切换声音去向"
+    elif mode == "pc":
+        silent_sink_release()
+        sink = _default_sink_name()
+        if not sink or sink == NULL_SINK:
+            return False, "恢复电脑输出失败：默认输出设备未恢复"
+    else:
+        return False, "mode 只能是 pc 或 silent"
+
+    ok, msg, _cfg = save_config({"audioOut": mode})
+    if not ok:
+        return False, f"声音去向已调整，但配置保存失败：{msg}"
+    audit("audio", "声音去向 -> " + ("模拟输出(电脑音量一键设为 %d%%)" % SILENT_VOL
+                                    if mode == "silent" else "电脑输出"))
+    return True, mode
+
+
 def silent_sink_ensure():
     """确保虚拟输出存在, 并把正在播放的流都搬过去。返回 (ok, 说明)。"""
     if _sink_idx(NULL_SINK) is None:
@@ -3452,7 +4318,7 @@ def silent_sink_release():
 def _amix_opts():
     """amix 默认会把每路音量除以路数, 混静音会让真实音量掉一半, 必须关掉归一化。"""
     try:
-        h = subprocess.run(["ffmpeg", "-hide_banner", "-h", "filter=amix"],
+        h = subprocess.run([FFMPEG, "-hide_banner", "-h", "filter=amix"],
                            capture_output=True, text=True, timeout=8).stdout
     except Exception:
         h = ""
@@ -3470,7 +4336,7 @@ def _audio_cmd(kind, src):
     # 实测是"每 ~2 秒给一大块(12KB)"—— 音频就一段一段地到手机, 听着一直卡。
     # 压到 2048 字节(48k 单声道约 21ms)才能连续地取、连续地发。
     frag = ["-fragment_size", "2048"] if kind == "pulse" else []
-    return ["ffmpeg", "-hide_banner", "-loglevel", "error",
+    return [FFMPEG, "-hide_banner", "-loglevel", "error",
             "-f", kind, *frag, "-i", src,
             # 第二路: 无限静音, 只为保证"永远有输出"(见 AUDIO_FILTER 注释)
             "-f", "lavfi", "-i", SILENT_SRC,
@@ -3496,8 +4362,66 @@ def _audio_cmd(kind, src):
 # 谁; 最后一个人走了还留 AUDIO_LINGER 秒宽限, 期间重连等于**零空档**。
 AUDIO_LINGER = 2.5
 _hub = {"key": None, "proc": None, "chunks": None, "stop": None,
-        "subs": [], "first": b"", "bytes": 0, "gen": 0}
+        "subs": [], "first": b"", "bytes": 0, "gen": 0, "idle_epoch": 0,
+        "t0": 0.0}      # 第一块音频到手(≈开始采到声音)的墙上时间, 算管道滞后用
 _hub_lock = threading.Lock()
+
+
+def audio_hub_lag():
+    """服务端这条采集管道**自身**滞后了多少秒(0 = 实时)。
+
+    = 已经过去的墙上时间 - 已经吐出来的音频时长。
+    ffmpeg 正常时它是 0 附近(实测稳态 ±30ms); 一旦机器被别的活儿压住、
+    编码跟不上实时, 它会一直涨 —— 那时候手机上听到的就是"越拖越旧"的声音。
+    """
+    with _hub_lock:
+        t0, n, proc = _hub["t0"], _hub["bytes"], _hub["proc"]
+    if not t0 or proc is None or proc.poll() is not None:
+        return None
+    produced = n * 8.0 / (int(AUDIO_BITRATE.rstrip("k")) * 1000)
+    return max(0.0, (time.time() - t0) - produced)
+
+
+# 每条音频流"第 0 个采样是什么时候采到的"(服务端 epoch ms), 按前端给的 sid 存。
+#
+# 为什么要有它: 前端要显示"你**正在听**的这段声音是多久以前的"。一开始前端是用
+# 浏览器的 `buffered.end - currentTime` 去估"还有多少没播", 但 `buffered` 是
+# **粗粒度更新的**(隔一段才刷一次), 拿它算出来是锯齿状乱跳的(实测 0.1~3.6s),
+# 根本不能当读数。改成服务端直接给锚点, 前端只用 (时钟对齐 + currentTime) 就能
+# 精确反推 —— 而且网络延时天然包含在内, 不用再单独估。
+_audio_since = {}
+_audio_since_lock = threading.Lock()
+_AUDIO_SINCE_MAX = 32          # 只留最近这些条, 免得长跑攒一堆
+
+
+def audio_chunk_capture_ms(nbytes):
+    """这一块音频的**第一个采样**是什么时候采到的(服务端 epoch ms)。
+
+    hub 是实时跑的: 位置 q 秒处的音频大约在 hub_t0 + q 被采到。
+    这块是刚读出来的最后一块, 所以它的起始位置 = (已发出字节 - 本块字节) 换算成秒。
+    """
+    with _hub_lock:
+        t0, total = _hub["t0"], _hub["bytes"]
+    if not t0:
+        return None
+    pos = max(0.0, (total - nbytes) * 8.0 / (int(AUDIO_BITRATE.rstrip("k")) * 1000))
+    return int((t0 + pos) * 1000)
+
+
+def audio_since_set(sid, ms):
+    if not sid or ms is None:
+        return
+    with _audio_since_lock:
+        _audio_since[sid] = ms
+        while len(_audio_since) > _AUDIO_SINCE_MAX:
+            _audio_since.pop(next(iter(_audio_since)))
+
+
+def audio_since_get(sid):
+    if not sid:
+        return None
+    with _audio_since_lock:
+        return _audio_since.get(sid)
 
 
 def _hub_fan(proc, chunks, stop):
@@ -3550,9 +4474,9 @@ def _hub_stop_locked():
             pass
 
 
-def _hub_stop_if_idle():
+def _hub_stop_if_idle(epoch):
     with _hub_lock:
-        if not _hub["subs"]:
+        if epoch == _hub["idle_epoch"] and not _hub["subs"]:
             _hub_stop_locked()
 
 
@@ -3561,36 +4485,48 @@ def _hub_detach(q):
         if q in _hub["subs"]:
             _hub["subs"].remove(q)
         idle = not _hub["subs"]
+        _hub["idle_epoch"] += 1
+        epoch = _hub["idle_epoch"]
     if idle:
-        threading.Timer(AUDIO_LINGER, _hub_stop_if_idle).start()
+        timer = threading.Timer(AUDIO_LINGER, _hub_stop_if_idle, args=(epoch,))
+        timer.daemon = True
+        timer.start()
 
 
-def _hub_ensure(src, kind):
-    """保证有一路 (src, kind) 采集在跑; 已在跑就直接复用。返回 (proc, err)。"""
+def _hub_ensure(src, kind, subscriber):
+    """在同一临界区内确保采集并订阅，返回 (proc, stop, err)。"""
     key = (src, kind)
 
     def usable():
         p = _hub["proc"]
         return _hub["key"] == key and p is not None and p.poll() is None
 
+    def attach():
+        _hub["idle_epoch"] += 1
+        if _hub["first"]:
+            subscriber.put_nowait(_hub["first"])
+        _hub["subs"].append(subscriber)
+        return _hub["proc"], _hub["stop"], ""
+
     with _hub_lock:
         if usable():
-            return _hub["proc"], ""
+            return attach()
     with _audio_lock:
         with _hub_lock:
             if usable():
-                return _hub["proc"], ""
+                return attach()
             _hub_stop_locked()
             proc, chunks, first, err = _audio_start(src, kind=kind)
             if proc is None:
-                return None, err
+                return None, None, err
             stop = threading.Event()
             _hub.update(key=key, proc=proc, chunks=chunks, stop=stop,
-                        first=first, subs=[], bytes=0,
+                        first=first, subs=[], bytes=0, t0=time.time(),
                         gen=_hub["gen"] + 1)     # 换了一路采集 -> 世代号 +1
+            result = attach()
         threading.Thread(target=_hub_fan, args=(proc, chunks, stop),
                          daemon=True).start()
-        return proc, ""
+        return result
 
 
 def _audio_start(src, first_timeout=4.0, kind="pulse"):
@@ -3803,7 +4739,33 @@ def vnc_module_preloads():
     return _vnc_preload["html"]
 
 
+# 只用来判断某行第一列像不像 IP(tailscale 解析的兜底), 不追求严格。
+_IPV4_RE = re.compile(r'^\d{1,3}(\.\d{1,3}){3}$')
 _ASSET_V_RE = re.compile(r'''(/static/(?!vendor/)[^"\'\s?]+\.(?:js|css))(?:\?v=\d+)?''')
+
+
+_asset_ver_cache = {"t": 0.0, "v": ""}
+
+
+def asset_version():
+    """自家 js/css 里最新的那个修改时间 —— 当成"这一版"的版本号。
+
+    页面是**常驻**的(挂着 WS), 不会自己刷新, 所以服务端更新完, 手机上看到的
+    还是旧界面(用户踩过: "我的折叠呢?")。前端拿它跟自己 script 标签上的 ?v=
+    比, 不一样就提示刷新。
+    """
+    now = time.time()
+    if _asset_ver_cache["v"] and now - _asset_ver_cache["t"] < 1.0:
+        return _asset_ver_cache["v"]
+    newest = 0
+    try:
+        for fn in os.listdir(STATIC_DIR):
+            if fn.endswith((".js", ".css")):
+                newest = max(newest, os.stat(os.path.join(STATIC_DIR, fn)).st_mtime_ns)
+    except OSError:
+        pass
+    _asset_ver_cache.update(t=now, v=str(newest))
+    return str(newest)
 
 
 def _asset_v(m):
@@ -3816,8 +4778,8 @@ def _asset_v(m):
     """
     rel = m.group(1)
     try:
-        return "%s?v=%d" % (rel, int(os.path.getmtime(
-            os.path.join(STATIC_DIR, rel[len("/static/"):]))))
+        return "%s?v=%d" % (rel, os.stat(
+            os.path.join(STATIC_DIR, rel[len("/static/"):])).st_mtime_ns)
     except OSError:
         return rel
 
@@ -3831,9 +4793,200 @@ def render(name, **kw):
     # 不用挨个改模板, 将来新增模板也自动带上。
     # 放在 </head> 前 = 排在 app.css 之后; 同优先级后者生效, 正好盖住默认值。
     if "</head>" in html:
-        html = html.replace("</head>", bg_css() + "</head>", 1)
+        # 加载进度提示(loadtip.js)由这里**统一注入**: 每个页面都自带, 以后新加的
+        # 页面不用手动引。放在 </head> 前 = 早于 body 里的页面脚本执行。
+        # 注意: _ASSET_V_RE 在下面才跑, 所以这里的 src 也会被挂上 ?v=修改时间。
+        html = html.replace("</head>",
+                            # 把"这一版的版本号"直接注入页面 —— 前端拿它跟 /api/version
+                            # 比。不能拿 loadtip.js 自己的 ?v= 当基准: 那是**单个文件**
+                            # 的修改时间, 而 /api/version 给的是**所有资源里最新的**,
+                            # 两者只有在 loadtip.js 恰好最新时才相等 —— 否则提示永远
+                            # 消不掉(用户就遇到了"刷新好几次还一直提示")。
+                            bg_css()
+                            + '<script>window.__MEOW_V="%s";</script>' % asset_version()
+                            + '<script src="/static/loadtip.js"></script>'
+                            + "</head>", 1)
     html = _ASSET_V_RE.sub(_asset_v, html)      # 静态文件防中间缓存(见 _asset_v)
     return html
+
+
+# ---- 一键自检 ---------------------------------------------------------------
+# 用户要求: 主页最下面一个按钮, 点一下把"这台机器现在到底还能不能用"逐项查一遍,
+# 最后弹窗看结果, 而且**尽量静默、别产生明显影响**。所以:
+#   - 不改任何配置、不碰扬声器、不写设备;
+#   - **摄像头不在这里开**(会亮指示灯, 而且是独占设备) —— 出帧和画面延时
+#     交给前端那两条测量去验(它们本来就要采一小段);
+#   - 麦克风**只做一次试采**(约 0.9 秒): "设备在"不等于"采得到声音",
+#     这台机器的 DMIC 就出过事, 不真采一下这项检查没有意义。
+# level 语义: ok=正常 / warn=能用但要注意 / bad=坏了需要处理。
+def run_selfcheck():
+    groups = []
+
+    def g(name):
+        grp = {"name": name, "items": []}
+        groups.append(grp)
+        return grp
+
+    def add(grp, name, level, detail=""):
+        grp["items"].append({"name": name, "level": level, "detail": str(detail)[:300]})
+
+    t0 = time.time()
+
+    # ---- 运行环境 ----
+    env = g("运行环境")
+    up = time.time() - _BOOT_AT
+    add(env, "服务进程", "ok", "pid=%d · 已跑 %s" % (os.getpid(), _dur(up)))
+    devs = _ffmpeg_devices(FFMPEG)
+    miss = [n for n in FFMPEG_NEEDS if n not in devs]
+    add(env, "ffmpeg", "bad" if miss else "ok",
+        ("%s（**缺 %s**）" % (FFMPEG, ",".join(miss))) if miss
+        else "%s（pulse,v4l2 都在）" % FFMPEG)
+    try:
+        probe = os.path.join(DATA_DIR, ".selfcheck.tmp")
+        with open(probe, "w") as f:
+            f.write("x")
+        os.remove(probe)
+        add(env, "运行时目录可写", "ok", DATA_DIR)
+    except OSError as e:
+        add(env, "运行时目录可写", "bad", e)
+    for f, what in ((AUTH_FILE, "凭据"), (CONFIG_FILE, "配置")):
+        add(env, f"{what}文件", "ok" if os.path.exists(f) else "warn",
+            os.path.basename(f) if os.path.exists(f) else "不存在(会用默认值)")
+
+    # ---- 摄像头(只查, 不开) ----
+    cam = g("摄像头")
+    add(cam, "ffmpeg v4l2", "ok" if "v4l2" in devs else "bad",
+        "支持" if "v4l2" in devs else "这个 ffmpeg 没有 v4l2 输入")
+    cdevs = cam_devices()
+    if not cdevs:
+        add(cam, "采集设备", "bad", "没找到可采集的 /dev/video*")
+    else:
+        for d in cdevs:
+            ok = os.path.exists(d) and os.access(d, os.R_OK)
+            add(cam, "设备 " + d, "ok" if ok else "bad",
+                "可读" if ok else "打不开(权限或被占用?)")
+    with _cam_lock:
+        p = _cam_session.get("proc")
+        busy = p is not None and p.poll() is None
+    add(cam, "当前采集状态", "warn" if busy else "ok",
+        "正在采集(可能有别的页面在看)" if busy else "空闲")
+
+    # ---- 声音 ----
+    au = g("声音")
+    srcs = audio_sources()
+    add(au, "PulseAudio 输入源", "ok" if srcs else "bad",
+        ("%d 个" % len(srcs)) if srcs else "pactl 一个都列不出来(服务没跑?)")
+    mics = audio_list_mics()               # ← 唯一的"动设备": 试采 0.9 秒
+    good = [m for m in mics if m["usable"]]
+    if good:
+        add(au, "麦克风实测", "ok",
+            "；".join("%s %s dB" % (m["label"], m["max_volume"]) for m in good))
+    elif mics:
+        add(au, "麦克风实测", "bad",
+            "检测到 %d 个设备但都采不到声音" % len(mics))
+    else:
+        add(au, "麦克风实测", "bad", "没有检测到麦克风设备")
+    try:
+        r = subprocess.run(["pactl", "get-default-sink"], env=x_env(),
+                           capture_output=True, text=True, timeout=5)
+        sink = (r.stdout or "").strip()
+        add(au, "默认输出", "ok" if sink else "warn", sink or "拿不到")
+    except (OSError, subprocess.SubprocessError) as e:
+        add(au, "默认输出", "warn", e)
+    # 有没有漏掉的采集进程(老版本出过"没人听还在采"的事)
+    try:
+        out = subprocess.run(["pgrep", "-af", "ffmpeg"], capture_output=True,
+                             text=True, timeout=5).stdout
+        n = len([l for l in out.splitlines() if "ffmpeg" in l and "pgrep" not in l])
+        # 阈值给宽一点: 自检自己就会起一两个(音频探针 + 前端的画面延时测量),
+        # 真正要抓的是"没人看还在采"那种泄漏(会攒到十几个)。
+        add(au, "在跑的 ffmpeg", "ok" if n <= 4 else "warn",
+            "%d 个进程" % n if n <= 4 else "%d 个（偏多，可能有没退干净的采集）" % n)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    # ---- 远程桌面 ----
+    vnc = g("远程桌面")
+    try:
+        s = socket.create_connection(("127.0.0.1", VNC_PORT), timeout=3)
+        s.close()
+        add(vnc, "x11vnc 端口 %d" % VNC_PORT, "ok", "可连")
+    except OSError as e:
+        add(vnc, "x11vnc 端口 %d" % VNC_PORT, "bad", e)
+    try:
+        w, h = screen_size()
+        add(vnc, "X 显示", "ok" if w else "warn", "%dx%d" % (w, h) if w else "拿不到尺寸")
+    except Exception as e:
+        add(vnc, "X 显示", "warn", e)
+    try:
+        add(vnc, "当前桌面连接数", "ok", vnc_client_count())
+    except Exception:
+        pass
+
+    # ---- 系统 ----
+    sy = g("系统")
+    try:
+        snap = COLLECTOR.snapshot()
+        cpu = (snap.get("cpu") or {}).get("total")
+        add(sy, "CPU", "ok", "%.0f%% · 负载 %s" % (cpu or 0, snap.get("load")))
+        mem = snap.get("mem") or {}
+        if mem.get("total"):
+            used = 100.0 * (mem["total"] - mem["avail"]) / mem["total"]
+            add(sy, "内存", "warn" if used > 88 else "ok",
+                "%.0f%% (%s / %s)" % (used, _mb(mem["total"] - mem["avail"]),
+                                      _mb(mem["total"])))
+        temps = [t for t in (snap.get("temps") or []) if t[1] and 0 < t[1] < 150]
+        if temps:
+            nm, val = max(temps, key=lambda t: t[1])
+            add(sy, "温度", "warn" if val > 80 else "ok", "%s %.0f°C" % (nm, val))
+        for d in (snap.get("disks") or []):
+            if not isinstance(d, dict):
+                continue
+            pct = d.get("percent")
+            if pct is None:
+                continue
+            add(sy, "磁盘 " + str(d.get("mount") or d.get("dev") or "?"),
+                "warn" if pct > 88 else "ok", "%.0f%% 已用" % pct)
+        peers = snap.get("peers")
+        if isinstance(peers, list):
+            on = [p for p in peers if isinstance(p, dict) and p.get("online")]
+            add(sy, "Tailscale 设备", "ok", "%d 台在线 / 共 %d" % (len(on), len(peers)))
+        for h in (snap.get("ts_health") or []):
+            add(sy, "Tailscale 提示", "warn", h)
+        al = snap.get("alerts") or []
+        for a in al:
+            add(sy, "告警: " + str(a.get("key")),
+                "bad" if a.get("level") == "crit" else "warn", a.get("msg"))
+        if not al:
+            add(sy, "系统告警", "ok", "无")
+    except Exception as e:
+        add(sy, "系统状态", "warn", "采集失败: %s" % e)
+
+    # ---- 汇总 ----
+    items = [it for grp in groups for it in grp["items"]]
+    summary = {"ok": 0, "warn": 0, "bad": 0}
+    for it in items:
+        summary[it["level"]] = summary.get(it["level"], 0) + 1
+    return {
+        "ok": summary["bad"] == 0,
+        "at": int(time.time() * 1000),
+        "ms": int((time.time() - t0) * 1000),
+        "summary": summary,
+        "groups": groups,
+    }
+
+
+def _dur(sec):
+    sec = int(sec)
+    if sec < 3600:
+        return "%d 分 %d 秒" % (sec // 60, sec % 60)
+    return "%d 时 %d 分" % (sec // 3600, (sec % 3600) // 60)
+
+
+def _mb(nbytes):
+    """Collector 里的内存/磁盘都是**字节**(见 Collector.mem / disks)。"""
+    n = float(nbytes or 0)
+    return "%.1f GB" % (n / 1073741824.0) if n >= 1073741824 else "%.0f MB" % (n / 1048576.0)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -3927,8 +5080,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        extra = dict(extra or {})
+        # extra 里的同名头要**覆盖**默认值, 不能追加 —— 否则 Cache-Control 会发两条
+        # (no-cache + no-store), 语义就没准了。
+        lower = {k.lower(): k for k in extra}
+        if "cache-control" in lower:
+            cache = extra.pop(lower["cache-control"])
         self.send_header("Cache-Control", cache)
-        for k, v in (extra or {}).items():
+        for k, v in extra.items():
             self.send_header(k, v)
         self.end_headers()
         if body:
@@ -3943,9 +5102,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (OSError, ValueError):
             return False
 
-    def _serve_audio(self, src="default"):
+    def _serve_audio(self, src="default", sid=""):
         """把麦克风的声音编码成 MP3, 边采边以 chunked 方式推给浏览器。"""
-        if not shutil.which("ffmpeg"):
+        if not shutil.which(FFMPEG):
             self._json({"ok": False, "err": "未安装 ffmpeg, 无法采集声音"})
             return
         # 关键: 不能"能打开就用" —— PulseAudio 的 default 常是扬声器回环,
@@ -3994,21 +5153,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            f"(试过 {len(_tried)} 个候选)")
         if kind == "pulse" and src != "default":
             audio_unmute(src)          # 内置麦克风常被默认静音
-        proc, err = _hub_ensure(src, kind)
+        q = queue.Queue(maxsize=64)
+        proc, stop, err = _hub_ensure(src, kind, q)
         if proc is None:
             self._json({"ok": False,
                         "err": "采集声音失败: " + _audio_hint(err)})
             return
-        q = queue.Queue(maxsize=64)
-        with _hub_lock:
-            if _hub["first"]:              # 让新来的立刻有数据, 不用干等第一包
-                try:
-                    q.put_nowait(_hub["first"])
-                except queue.Full:
-                    pass
-            _hub["subs"].append(q)
-            stop = _hub["stop"]
-
         audit("audio", f"开始采集声音 {src} (pid={proc.pid})")
         try:
             self.send_response(200)
@@ -4022,25 +5172,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except OSError:
                 pass
             buf = None
-            # 麦克风跟着"摄像头页还在不在"走 —— 但只在**这个流是从活着的摄像头页
-            # 开起来的**时候才绑。否则像自检脚本、或者直接用 curl 拉流的场景,
+            # 收音跟着"这个页面还开着吗"走 —— 但只在**这条流是从活着的页面开起来的**
+            # 时候才绑。否则像自检脚本、或者直接用 curl 拉流的场景,
             # 会被一个陈旧的全局时间戳误杀(踩过: cam_check 的音频用例就是这么挂的)。
-            vt0 = _viewer_seen["t"]
-            tied = bool(vt0) and (time.time() - vt0) <= CAM_VIEWER_TIMEOUT
+            pt0 = _page_seen["t"]
+            tied = bool(pt0) and (time.time() - pt0) <= CAM_VIEWER_TIMEOUT
             while not stop.is_set():
                 # 主动探一下客户端还在不在。光靠"写失败"发现断开太慢 ——
                 # 内核缓冲区没满时 write 照样成功, 麦克风会被白占好几秒。
                 if _peer_gone(self.connection):
                     break
+                # 页面心跳比"开流那一刻"更新 -> 确认有人在看, 从此把这条流绑到它。
+                # 前端开麦时会立刻发一次 /api/audio/hb, 所以这个窗口只有几十毫秒。
+                # 写成循环里判断而不是只看开流那一刻, 是为了**不用 await 去保证
+                # 心跳先于开流到达** —— 那会把用户手势链拉长, play() 可能被浏览器
+                # 的自动播放策略拦掉。
+                if not tied and _page_seen["t"] > pt0:
+                    tied = True
                 # 半死连接上面那行探不出来: 手机锁屏/切网/webview 被挂起时写还写得
-                # 进去, 对端早就不处理了。所以再挂一道"摄像头页还在不在"的判据 ——
-                # 麦克风只在摄像头页里开, 那页的 JS 心跳停了就说明人走了。
-                # (_viewer_seen 从没被写过 = 压根没人开过摄像头页, 不做这个判断)
-                if tied and time.time() - _viewer_seen["t"] > CAM_VIEWER_TIMEOUT:
-                    audit("audio", "摄像头页心跳停了 %.0fs, 判定没人听, 停止收音"
-                                   % (time.time() - _viewer_seen["t"]))
+                # 进去, 对端早就不处理了。所以再挂一道"页面还在不在"的判据 ——
+                # 那页的 JS 心跳停了就说明人走了。
+                # (_page_seen 从没被写过 = 压根没人开过这个页面, 不做这个判断)
+                if tied and time.time() - _page_seen["t"] > CAM_VIEWER_TIMEOUT:
+                    audit("audio", "页面心跳停了 %.0fs, 判定没人听, 停止收音"
+                                   % (time.time() - _page_seen["t"]))
                     break
                 if buf:
+                    # 记下"这条流第 0 个采样是什么时候采到的", 前端要用它算
+                    # "正在听的声音是多久以前的"(见 audio_chunk_capture_ms)。
+                    # **只在第一块上记**: 每块都覆盖就变成"最新一块的时刻"了,
+                    # 前端拿它 + currentTime 会算出负数。
+                    if sid and audio_since_get(sid) is None:
+                        audio_since_set(sid, audio_chunk_capture_ms(len(buf)))
                     if not self._write_chunk(buf):
                         break
                     buf = None
@@ -4088,7 +5251,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         # ETag 用 修改时间+大小 拼, 不用读文件内容 —— 够用且零成本
-        etag = f'"{int(st.st_mtime)}-{st.st_size}"'
+        etag = f'"{st.st_mtime_ns}-{st.st_size}"'
         # 第三方库(vendor)内容永不变 → 长期缓存, 重复进入**零请求**
         # 我们自己的文件必须能立刻生效 → no-cache + ETag(走 304, 只花一个往返)
         cache = ("public, max-age=31536000, immutable"
@@ -4113,7 +5276,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             extra["Vary"] = "Accept-Encoding"
         if (compressible and len(body) > 512
                 and "gzip" in self.headers.get("Accept-Encoding", "")):
-            key = (path, int(st.st_mtime), st.st_size)
+            key = (path, st.st_mtime_ns, st.st_size)
             with _gzip_lock:
                 gz = _gzip_cache.get(key)
             if gz is None:
@@ -4176,7 +5339,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path == "/api/health":
             # boot: 本进程的启动标识, 前端靠它判断"服务是否真的换了进程"
-            self._json({"ok": True, "app": "meow-console", "boot": BOOT_ID})
+            self._json({"ok": True, "app": "meow-console", "boot": BOOT_ID,
+                        "inputVersion": 2})
             return
         if path.startswith("/static/"):
             # 静态资源不含敏感信息, 放在鉴权前 —— 否则登录页 CSS 会被重定向
@@ -4297,11 +5461,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if ws:
                 audit("term", "终端会话打开 from " + _who(self))
                 ws_term_bridge(ws)
+        elif path == "/ws/vnc-time":
+            # 画面时间戳旁路(见 ws_vnc_time)。只读, 不接受任何输入。
+            ws = self._ws(protocols=["binary"])
+            if ws:
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                ws_vnc_time(ws, q.get("viewer", [""])[0][:80])
         elif path == "/ws/vnc":
             ws = self._ws(protocols=["binary"])
             if ws:
                 audit("vnc", "远程桌面连接 from " + _who(self))
-                ws_vnc_bridge(ws)
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                viewer = q.get("viewer", [""])[0][:80]
+                ws_vnc_bridge(ws, viewer)
+        elif path == "/api/vnc/network":
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            self._json({"ok": True, **vnc_network_stats(q.get("viewer", [""])[0])})
         elif path == "/api/vnc/clients":
             # 诊断用: x11vnc 上当前几个客户端(正常 1)。数字偏大 = 有遗留连接。
             self._json({"ok": True, "clients": vnc_client_count(),
@@ -4318,10 +5493,93 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"ok": True, "rows": rows,
                         "counts": dict(counts.most_common()),
                         "cats": AUDIT_CATS})
+        elif path == "/api/icon":
+            # 窗口列表里的应用图标。名字来自 .desktop 的 Icon=, 也可能是绝对路径。
+            # 只允许 _ICON_ROOTS 里的文件 —— 别给路径穿越留口子。
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            f = find_icon((q.get("n") or [""])[0])
+            f = icon_scaled(f) if f else None
+            real = os.path.realpath(f) if f else ""
+            roots = tuple(_ICON_ROOTS) + (_ICON_CACHE_DIR,)
+            if not real or not os.path.isfile(real) or not any(
+                    real.startswith(os.path.realpath(r) + os.sep) for r in roots):
+                self._html(404, "<h1>404</h1>")
+                return
+            try:
+                st = os.stat(real)
+                with open(real, "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                self._html(404, "<h1>404</h1>")
+                return
+            etag = f'"{st.st_mtime_ns}-{st.st_size}"'
+            if self.headers.get("If-None-Match") == etag:
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.end_headers()
+                return
+            ext = os.path.splitext(real)[1].lower()
+            ctype = {"png": "image/png", "svg": "image/svg+xml",
+                     "xpm": "image/x-xpixmap"}.get(ext.lstrip("."), "application/octet-stream")
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("ETag", etag)
+            # 图标基本不变 -> 让浏览器长期缓存, 别每秒都来要一遍
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            try:
+                self.wfile.write(data)
+            except OSError:
+                pass
+        elif path == "/api/version":
+            # 给前端判断"服务端是不是更新过了"(见 loadtip.js)。
+            # 必须 no-store —— 用户那台网络里有设备会缓存响应, 不然这个也会被缓存住。
+            self._json({"ok": True, "v": asset_version()},
+                       extra={"Cache-Control": "no-store"})
+        elif path == "/api/activity":
+            # 给远程桌面用: 进去时把虚拟光标定位到**电脑上鼠标的真实位置**,
+            # 而不是画布正中(用户要求)。顺带把前台窗口/空闲时长也给了。
+            self._json(COLLECTOR.activity())
+        elif path == "/api/time":
+            # 给前端做**时钟对齐**用: 手机的 Date.now() 和电脑的差多少。
+            # 前端连打几次取 RTT 最小的那次, 就能把服务端发来的时间戳换算到
+            # 本地时钟上 —— 摄像头页那个"画面是多少毫秒以前的"就是这么算的
+            # (见 cam.js 的 syncClock / frameAge)。
+            self._json({"ok": True, "s": int(time.time() * 1000)})
+        elif path == "/api/selfcheck":
+            # 一键自检(主页最下面那个按钮)。服务端这半边查的是"机器本身"。
+            # 会**短暂试采一次麦克风**(约 0.9 秒) —— "设备在"不等于"采得到声音"。
+            # 摄像头不在这里开(亮灯 + 独占设备), 交给前端那两条延时测量去验。
+            r = run_selfcheck()
+            s = r["summary"]
+            audit("selfcheck", "自检: %d 项正常, %d 项注意, %d 项异常 (%dms)"
+                               % (s["ok"], s["warn"], s["bad"], r["ms"]))
+            self._json(r)
+        elif path == "/api/audio/hb":
+            # 麦克风的"页面还开着"心跳。摄像头和麦克风现在是两个独立开关,
+            # 收音不能再靠摄像头 WS 的心跳续命(只开麦/关了摄像头都会被误杀),
+            # 所以麦自己刷一次这个时间戳(见 _page_seen 的注释)。
+            # 顺手把服务端管道滞后捎回去 —— 前端要拿它算"声音是多少秒以前的",
+            # 省掉一次单独的轮询。
+            _page_seen["t"] = time.time()
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            sid = (q.get("sid") or [""])[0]
+            self._json({"ok": True, "lag": audio_hub_lag(),
+                        "since": audio_since_get(sid)})
         elif path == "/api/audio/mics":
             # 给前端用: 有哪些麦克风、哪些真的能用(实测)。
-            # 走缓存版 —— 每次真探要 20 秒上下, 而前端一进摄像头页就会调它。
-            mics = audio_list_mics_cached()
+            # 默认走缓存版 —— 前端一进摄像头页就会调它, 每次真探要 1 秒上下。
+            # ?fresh=1 强制**当场重探**: 用户要开麦了, 不能拿几十秒前的旧结论
+            # 去糊弄他(设备可能刚插上/刚拔掉)。
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if (q.get("fresh") or ["0"])[0] not in ("", "0"):
+                mics = audio_list_mics()
+                with _mics_lock:
+                    _mics_cache["t"] = time.time() + 90
+                    _mics_cache["val"] = mics
+            else:
+                mics = audio_list_mics_cached()
             usable = next((m for m in mics if m["usable"]), None)
             self._json({"ok": True, "mics": mics, "usable": usable})
         elif path == "/api/audio/check":
@@ -4337,7 +5595,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # 声音**默认不采**: 只有用户主动点了「开启声音」才会来请求这里。
             # 断开(关页面/点停止)时 ffmpeg 立刻收工。
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            self._serve_audio(src=(q.get("src") or ["default"])[0])
+            self._serve_audio(src=(q.get("src") or ["default"])[0],
+                              sid=(q.get("sid") or [""])[0])
         elif path == "/ws/cam":
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             g = lambda k: (q.get(k) or [None])[0]
@@ -4348,16 +5607,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._html(404, "<h1>404</h1>")
 
     # ---- POST
+    def _post_body(self, limit):
+        """拒绝负长度、过大或不完整的请求体，避免阻塞及后续请求错位。"""
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            if n < 0:
+                raise ValueError("请求体长度不能为负数")
+            if n > limit:
+                self.close_connection = True
+                self._json({"ok": False, "err": "请求内容过大"}, code=413)
+                return None
+            body = self.rfile.read(n)
+            if len(body) != n:
+                raise ValueError("请求内容不完整")
+            return body.decode("utf-8")
+        except (OSError, ValueError, UnicodeDecodeError) as e:
+            self.close_connection = True
+            self._json({"ok": False, "err": f"无法读取请求内容: {e}"}, code=400)
+            return None
+
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
         # 表单类接口(/login /setup)共用一个 body 读取, 别在各分支里各读一遍
         body = ""
         if path in ("/login", "/setup"):
-            try:
-                n = int(self.headers.get("Content-Length", 0))
-                body = self.rfile.read(n).decode()
-            except (OSError, ValueError, UnicodeDecodeError):
-                body = ""
+            body = self._post_body(16 * 1024)
+            if body is None:
+                return
         if path == "/login":
             ip = self.client_address[0]
             form = urllib.parse.parse_qs(body)
@@ -4401,7 +5677,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if pw != pw2:
                 self._login_page("两次输入的密码不一致")
                 return
-            set_credentials(user2, pw)
+            if not setup_credentials(user2, pw):
+                self._html(403, "已经设置过账号了, 不能重设")
+                return
             audit("init", f"首次设置完成 user={user2}")
             self._redirect("/home", extra={
                 "Set-Cookie": (f"{COOKIE_NAME}={make_token()}; Path=/; "
@@ -4410,11 +5688,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self._user():
             self._json({"ok": False, "err": "未登录"}, code=401)
             return
+        body = self._post_body(12 * 1024 * 1024 if path == "/api/bg" else 1024 * 1024)
+        if body is None:
+            return
         try:
-            n = int(self.headers.get("Content-Length", 0))
-            data = json.loads(self.rfile.read(n).decode() or "{}")
-        except (OSError, ValueError, UnicodeDecodeError):
-            data = {}
+            data = json.loads(body or "{}")
+            if not isinstance(data, dict):
+                raise ValueError("请求内容必须是 JSON 对象")
+        except ValueError as e:
+            self._json({"ok": False, "err": f"参数错误: {e}"}, code=400)
+            return
         if path == "/api/power":
             action = data.get("action", "")
             if not data.get("confirm") and action in ("suspend", "reboot", "poweroff"):
@@ -4550,18 +5833,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if mode not in ("pc", "silent"):
                 self._json({"ok": False, "err": "mode 只能是 pc 或 silent"})
                 return
-            if mode == "silent":
-                # 「模拟输出」= 把电脑音量钉在 1% + 锁定。
-                # 用户实测发现的巧办法: 1% 已经听不见, 而 monitor **仍有满幅信号**;
-                # 只有 0%/静音才会让 monitor 一起静音(那手机就没声了)。所以根本不需要
-                # 虚拟输出那套搬流 —— 简单、且没有副作用。
-                set_pc_volume(SILENT_VOL)   # 必须在存 mode 之前(下面会按 mode 拦)
-            else:
-                silent_sink_release()     # 顺手清掉以前遗留的 meow_silent
-            save_config({"audioOut": mode})
-            audit("audio", "声音去向 -> " + ("模拟输出(电脑音量一键设为 %d%%)" % SILENT_VOL
-                                            if mode == "silent" else "电脑输出"))
-            self._json({"ok": True, "mode": mode})
+            ok, msg = set_audio_out_mode(mode)
+            self._json({"ok": ok, "mode": mode if ok else audio_out_mode(),
+                        "err": "" if ok else msg})
         elif path == "/api/bg":
             # 两种 body: 图片二进制(Content-Type: image/*) / JSON(参数或清除)
             # 两种 body, 都是 JSON: 图片(base64, 键 img) / 参数或清除。
@@ -4629,7 +5903,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not isinstance(text, str):
                 self._json({"ok": False, "err": "参数错误"})
                 return
-            ok, msg = clip_set(text)
+            ok, msg = _xin_submit(lambda: _set_clip_persistent(text), budget=20.0)
             audit("clip", f"写入远程剪贴板 {len(text)} 字 {'OK' if ok else 'FAIL'}")
             self._json({"ok": ok, "msg": msg})
         elif path == "/api/type":
@@ -4647,6 +5921,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                    f"请改用剪贴板粘贴"})
                 return
             mode = data.get("mode")
+            if "requestId" in data:
+                # 已打开的旧页面可能仍按回执协议重试，不能当普通输入执行。
+                self._json({"ok": False, "err": "输入确认功能已回退，请刷新页面"}, code=409)
+                return
             ok, msg, how = deliver_text(text, mode if isinstance(mode, str) else None)
             # 只记首字的码点, 不记整句(可能在输密码)。用来判断"到服务端时字对不对":
             # 手机上打的是"你好", 首字应是 U+4F60; 若对不上就是前端/手机输入法那头错了。
@@ -4655,15 +5933,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                           f"{'OK' if ok else 'FAIL: ' + str(msg)[:60]}")
             self._json({"ok": ok, "msg": msg})
         elif path == "/api/paste":
-            # 关键: 设置剪贴板和发 Ctrl+V 必须在服务端一次做完。
-            # 旧实现是前端先 rfb.clipboardPasteFrom() 再立刻 fetch /api/paste,
-            # 两条路完全异步 —— Ctrl+V 常常在选区还没换过来时就按下去了,
-            # 粘出来的是上一次的内容。
+            # 按当前焦点窗口选粘贴键；设剪贴板与按键必须在同一个串行任务里。
+            combo = _paste_combo(_resolve_mode(_type_mode()))
             text = data.get("text")
             if isinstance(text, str) and text:
-                ok, msg = clip_set(text)
+                # 面板的“粘贴”原本会保留写入的远端剪贴板；只把设值与按键
+                # 合成一个队列任务，不改变这个语义。
+                result = _xin_submit(lambda: _paste_persistent(text, combo), budget=20.0)
+                ok, msg = result
                 if not ok:
-                    # 设不上选区(远端有程序占着/没有 xclip)就只能退化成逐字键入。
+                    if not getattr(result, "retry_safe", False):
+                        self._json({"ok": False, "msg": msg})
+                        return
+                    # 选区或粘贴键失败时退化成逐字键入。
                     # 但键入是每字 ~4ms, 8000 字要敲 40 秒 —— 期间界面一直停在
                     # "粘贴中…", 看着就跟卡死一样(实测到的"粘贴卡死"就是这个)。
                     # 长文本直接报错, 把选择权还给用户。
@@ -4678,8 +5960,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._json({"ok": ok2, "msg": "剪贴板不可用, 已直接键入" if ok2
                                 else f"失败: {msg} / {msg2}"})
                     return
-            ok, msg = send_ctrl_v()
-            audit("clip", f"粘贴 {len(text) if isinstance(text, str) else 0} 字")
+            else:
+                if combo == "shift+Insert":
+                    current = clip_get()
+                    if current is None:
+                        ok, msg = False, "无法读取远端剪贴板"
+                    elif not current:
+                        ok, msg = False, "远端剪贴板为空"
+                    else:
+                        ok, msg = _xin_submit(lambda: _paste_persistent(current, combo),
+                                             budget=20.0)
+                else:
+                    ok, msg = send_paste_key(combo)
+            audit("clip", f"粘贴({combo}) {len(text) if isinstance(text, str) else 0} 字")
             self._json({"ok": ok, "msg": msg})
         elif path == "/api/vnc/reset":
             # 一键清理并重启: 先回响应, 再重启服务(见 _restart_soon)。
@@ -4737,6 +6030,11 @@ def main():
     # —— 改了 server.py 但没重启服务是排查时最常踩的坑。
     audit("boot", f"服务启动 pid={os.getpid()} 输入串行化=on 输入法门禁="
                   f"{'on' if shutil.which('fcitx-remote') else 'off(未装 fcitx-remote)'}")
+    # ffmpeg 是**显式挑**出来的(见 _pick_ffmpeg 的注释): 本机 PATH 里那个
+    # ~/.local/bin/ffmpeg 是没编 pulse 的精简构建, 吃掉它麦克风就全废。
+    # 写进日志, 下次一眼就能看出是不是又挑错了。
+    audit("boot", f"ffmpeg -> {FFMPEG} (支持: "
+                  f"{','.join(sorted(_ffmpeg_devices(FFMPEG) & set(FFMPEG_NEEDS))) or '无'})")
     print(f"[meow-console] listening on {BIND}:{PORT}  (经 lan_forward 对外暴露)", flush=True)
     # 后台预热麦克风探测: 第一次探要真开设备试采(约 3 秒), 不等用户进摄像头页才做。
     # 失败无所谓(没麦克风本来就会返回空列表), 所以吞掉异常。

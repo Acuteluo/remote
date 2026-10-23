@@ -56,10 +56,13 @@ def main():
     print()
     print("【1】六个页面渲染")
     pages = {"/login": None,
-             "/home": ["alerts", "chips", "disks", "clock", "pw-btn"],
-             "/vnc": ["vnc-ping", "vnc-audio", "set-panel", "set-vol", "vnc-shot",
+             "/home": ["alerts", "chips", "disks", "clock", "pw-btn",
+                      "sc-open", "sc-mask", "sc-body"],
+             # vnc-ping 已按用户要求从顶栏去掉(只留帧率+延时), 换成 vnc-rate
+             "/vnc": ["vnc-rate", "vnc-audio", "set-panel", "set-vol", "vnc-shot",
                       "vnc-clients", "vnc-reset"],
-             "/cam": ["cam-img", "cam-switch", "cam-audio", "cam-level"],
+             "/cam": ["cam-img", "cam-switch", "cam-video-sw", "cam-mic-sw",
+                      "cam-level", "cam-level-db", "cam-lag-v", "cam-lag-a"],
              "/term": ["terminal"],
              "/log": ["log-cats", "log-list", "log-refresh"]}
     for p, ids in pages.items():

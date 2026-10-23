@@ -26,6 +26,12 @@
   body.vnc-fs #vnc-banner { display: none !important; }
   body.vnc-fs #screen-wrap { position: fixed; inset: 0; z-index: 9999; }
   body.vnc-fs #pad-cursor { display: none !important; }
+  /* 藏掉 noVNC 设的那个 CSS 光标。
+     它把远端光标图片(24x24)原尺寸设成 canvas 的 cursor, 但画面是**缩过**的
+     (1440 帧缓冲 -> 420 CSS px, 0.29 倍), 光标没跟着缩, 看起来比画面大 3 倍多,
+     用户反馈"很大的鼠标指针, 很丑"。位置由 #pad-cursor 那个 ○ 表示, 够用了。
+     noVNC 是写内联 style 的, 所以必须 !important 才盖得住。 */
+  #screen canvas { cursor: none !important; }
   /* 接住所有触摸: 它盖在画布上, 事件不会传到 noVNC 的 canvas */
   #vnc-fs-tap { position: absolute; inset: 0; z-index: 40; touch-action: none; }
   #vnc-fs-tap.hide { display: none; }
@@ -141,6 +147,22 @@
   #vnc-banner { flex: none; display: none; padding: 8px 12px; background: #3a2418;
     border-bottom: 1px solid #5a3a22; color: var(--warn); font-size: 12px; line-height: 1.6; }
   #vnc-banner.show { display: block; }
+  #pad-mode-toast { position: fixed; top: calc(58px + env(safe-area-inset-top));
+    left: 12px; right: 12px; z-index: 10060; padding: 10px 12px;
+    border-radius: 9px; background: #20374eee; color: #fff; text-align: center;
+    pointer-events: none; opacity: 0; }
+  #pad-mode-toast.show { animation: pad-mode-fade 1s ease-out forwards; }
+  @keyframes pad-mode-fade { 0%, 35% { opacity: 1; } 100% { opacity: 0; } }
+  #vnc-input-alert { display: none; position: fixed; left: 8px; right: 8px;
+    top: calc(52px + env(safe-area-inset-top)); z-index: 10050;
+    align-items: start; gap: 8px; padding: 10px 12px; border-radius: 9px;
+    background: #51252b; border: 1px solid #a85860; color: #fff;
+    box-shadow: 0 4px 16px #0009; font-size: 13px; line-height: 1.45; }
+  #vnc-input-alert.show { display: flex; }
+  #vnc-input-alert-text { flex: 1; overflow-wrap: anywhere; }
+  #vnc-input-alert-close { flex: none; padding: 0 3px; border: 0;
+    background: transparent; color: #fff; font-size: 19px; line-height: 1; }
+  body.vnc-fs #vnc-input-alert { top: calc(8px + env(safe-area-inset-top)); }
   /* 右上角实时延迟: 绿 <80ms / 黄 <200ms / 红 >=200ms */
   /* 网络 / 画面 合成**一个胶囊**: 手机顶栏太窄, 两个独立胶囊各自带边框+内边距
      要多占 ~20px, 正好把"返回/远程桌面"挤成竖排。合成一个框后显示
@@ -153,15 +175,8 @@
      文字本身还在 DOM 里(测试拿它当连接判据), 只是不显示。
      状态栏一藏, 就靠 .pingbox 的 margin-left:auto 把右边这组顶到最右。 */
   #vnc-status.ok { display: none; }
-  .pingbox #vnc-ping, .pingbox #vnc-rate {
+  .pingbox #vnc-rate {
     border: 0; border-radius: 0; background: transparent; padding: 3px 7px; }
-  .pingbox #vnc-rate { border-left: 1px solid var(--line); }
-  #vnc-ping { flex: none; font-size: 11px; font-variant-numeric: tabular-nums;
-    padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line);
-    background: var(--card2); color: var(--dim); white-space: nowrap; }
-  #vnc-ping.ok { color: var(--ok); border-color: #1f4a37; }
-  #vnc-ping.warn { color: var(--warn); border-color: #4a3a1f; }
-  #vnc-ping.bad { color: var(--bad); border-color: #4a2530; }
   /* 帧率/码率: 和延迟并排。延迟低≠不卡, 卡不卡要看帧率 */
   #vnc-rate { flex: none; font-size: 11px; font-variant-numeric: tabular-nums;
     padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line);
@@ -177,18 +192,23 @@
   <span class="logo">远程桌面</span>
   <span class="host" id="vnc-status">连接中…</span>
   <span class="pingbox">
-    <span id="vnc-ping" class="ping" title="网络延迟(HTTP 往返)。点一下立刻重测">网络 --</span>
-    <span id="vnc-rate" class="ping" title="画面延时估算(网络单程 + 25ms)。帧率/码率也在这里看">画面 --</span>
+    <span id="vnc-rate" class="ping" title="本地帧率 + 画面延时(最新一帧是多少秒以前的)">画面 --</span>
   </span>
   <button id="vnc-audio" class="audiobtn" title="把电脑正在放的声音转发到手机">🔕</button>
 </div>
 <audio id="vnc-audio-el" preload="none"></audio>
 <div id="vnc-banner"></div>
+<div id="pad-mode-toast" role="status" aria-live="polite"></div>
+<div id="vnc-input-alert" role="alert" aria-live="assertive">
+  <span id="vnc-input-alert-text"></span>
+  <button id="vnc-input-alert-close" aria-label="关闭输入错误提示">×</button>
+</div>
 <div class="vnc-toolbar">
   <button id="vnc-kbbtn">键盘</button>
   <button id="vnc-keybtn">按键</button>
   <button id="vnc-padbtn" class="on">触控板</button>
   <button id="vnc-clipbtn">剪贴板</button>
+  <button id="vnc-saver" title="跨网络卡顿时降低图传数据量；再点恢复原画质">省流</button>
   <button id="vnc-shot" title="把当前远程画面保存为图片到手机">截图</button>
   <button id="vnc-setbtn">设置</button>
   <button id="vnc-fs" title="全屏横屏观看(只展示画面和声音)">⛶ 全屏</button>
@@ -218,6 +238,8 @@
   <button class="kb combo" data-combo="ctrl+a">Ctrl+A</button>
   <button class="kb combo" data-combo="ctrl+c">Ctrl+C</button>
   <button class="kb combo" data-combo="ctrl+v">Ctrl+V</button>
+  <button class="kb combo" data-combo="ctrl+shift+c">Ctrl+Shift+C</button>
+  <button class="kb combo" data-combo="ctrl+shift+v">Ctrl+Shift+V</button>
   <button class="kb combo" data-combo="ctrl+x">Ctrl+X</button>
   <button class="kb combo" data-combo="ctrl+z">Ctrl+Z</button>
   <button class="kb combo" data-combo="ctrl+enter">Ctrl+↵</button>
@@ -385,13 +407,13 @@
     <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">
       <button class="cbtn" id="clip-get">读取远端</button>
       <button class="cbtn" id="clip-set">写入远端</button>
-      <button class="cbtn pri" id="clip-paste">粘贴到光标(Ctrl+V)</button>
+      <button class="cbtn pri" id="clip-paste">粘贴到光标(自动适配)</button>
       <button class="cbtn" id="clip-type">直接键入</button>
       <button class="cbtn" id="clip-close" style="color:var(--dim);flex:0 1 auto">关闭</button>
     </div>
     <p id="clip-msg" style="color:var(--dim);font-size:11px;margin:7px 0 0"></p>
     <p style="color:var(--dim);font-size:11px;margin:3px 0 0">
-      终端(xterm 等)不响应 Ctrl+V, 请用"直接键入"; 读取到的内容长按可复制到手机。</p>
+      终端自动使用 Ctrl+Shift+V（老 xterm 用 Shift+Insert）；复制终端选区可用「按键」中的 Ctrl+Shift+C。读取到的内容长按可复制到手机。</p>
   </div>
 </div>
 

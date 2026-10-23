@@ -68,12 +68,12 @@ PORTS = [int(p) for p in sys.argv[1:] if p.isdigit()] or \
 
 def list_ipv4_addresses():
     """枚举本机全部 IPv4 地址(含回环), 用 SIOCGIFCONF。"""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     buf = array.array("B", b"\0" * 8192)
-    addr_len, _ = struct.unpack(
-        "iL", fcntl.ioctl(
-            s.fileno(), 0x8912,  # SIOCGIFCONF
-            struct.pack("iL", buf.buffer_info()[1], buf.buffer_info()[0])))
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        addr_len, _ = struct.unpack(
+            "iL", fcntl.ioctl(
+                s.fileno(), 0x8912,  # SIOCGIFCONF
+                struct.pack("iL", buf.buffer_info()[1], buf.buffer_info()[0])))
     out = []
     for i in range(0, addr_len, 40):
         raw = bytes(buf[i:i + 40])
@@ -171,8 +171,14 @@ def main():
     active = {}          # {(host, port): (Server, HandlerClass)}
     while True:
         want = set()
-        hosts = [h for h in list_ipv4_addresses()
-                 if not h.startswith("127.") and ":" not in h]
+        try:
+            hosts = [h for h in list_ipv4_addresses()
+                     if not h.startswith("127.") and ":" not in h]
+        except OSError as e:
+            # 短暂枚举失败不代表地址消失，保留现有监听并重试。
+            print(f"[lan-forward] 网卡枚举失败，保留连接并重试: {e}", flush=True)
+            threading.Event().wait(RECONCILE_SEC)
+            continue
         if not hosts:
             print("[lan-forward] 未找到局域网 IPv4 地址", flush=True)
         else:
@@ -182,6 +188,7 @@ def main():
         for key in [k for k in active if k not in want]:
             srv, _ = active.pop(key)
             srv.shutdown()
+            srv.server_close()
             print(f"[lan-forward] 摘除 {key[0]}:{key[1]}", flush=True)
         for key in sorted(want - set(active)):
             host, port = key
