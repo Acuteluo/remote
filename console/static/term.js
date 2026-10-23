@@ -1,6 +1,7 @@
 // Web 终端: xterm.js <-> /ws/term
 'use strict';
 const statusEl = document.getElementById('term-status');
+if (window.LoadTip) LoadTip.start(['页面', '样式', '终端就绪']);
 const FONT_KEY = 'meow_term_font';
 // 主题色: 终端的光标、以及 ANSI 蓝, 都跟着它走(原来写死成默认蓝 #4da3ff)。
 // 页面里 render() 注入的 :root{--acc} 已经生效, 所以这里读得到。
@@ -52,11 +53,16 @@ function connect() {
   };
   socket.onmessage = (e) => {
     if (ws !== socket) return;
-    if (e.data instanceof ArrayBuffer) term.write(new Uint8Array(e.data));
+    if (e.data instanceof ArrayBuffer) {
+      term.write(new Uint8Array(e.data));
+      // 第一坨输出到了 = shell 提示符出来了, 才算真的能用(WS onopen 只是连上)
+      if (window.LoadTip) LoadTip.step('终端就绪');
+    }
     else {
       try {
         const msg = JSON.parse(e.data);
         if (msg.t === 'err') {
+          if (window.LoadTip) LoadTip.fail('终端就绪', msg.d || '终端启动失败');
           statusEl.textContent = msg.d || '终端启动失败';
           term.write('\r\n' + statusEl.textContent + '\r\n');
           return;

@@ -74,12 +74,57 @@ let hideTimer = 0;
 let autoSaver = false;
 let slowSamples = 0, fastSamples = 0;
 let viewerId = '', streamRtt = null;
+// 进远程桌面的加载进度: 页面 -> 建立连接 -> 首帧画面(见 loadtip.js)
+if (window.LoadTip) LoadTip.start(['页面', '样式', '建立连接', '首帧画面']);
 let networkError = '';
 
 // ---- 图传实际帧率/码率 ----
 // 为什么要显示这个: "延迟 <50ms 但画面很卡"是很常见的情况 —— 延迟量的是
 // HTTP 往返(几毫秒级), 而卡不卡取决于**每秒真正收到多少帧、多少数据**。
 // 两者是完全不同的指标, 只显示延迟会让人误判。
+// ---- 画面延时(帧龄) ----
+// 服务端每推一块画面前会先发一条 {"t":"f","s":<服务端毫秒>} 的**文本**帧,
+// s 是它**从 x11vnc 收到这块字节**的时刻。配合 /api/time 的时钟对齐,
+// 就能算出"屏幕上这一帧是多少秒以前的"。
+//
+// 注意这和 noVNC 自己的协议无关: noVNC 只吃二进制 RFB 字节流, 文本帧会把协议
+// 顶乱 —— 所以下面 CountingWS 里那层监听会把它拦掉(stopImmediatePropagation)。
+let clockOff = 0, clockOk = false, frameSentAt = 0, frameArrivedAt = 0;
+let curFrameAge = null;      // 最近一帧**到达时**的"年龄"(ms)
+
+// 延时显示(约定): **<1s 用整数毫秒**(3ms / 999ms), **>=1s 用秒**
+// (1.005s / 10.12s / 100.1s —— 秒这一档小数位随量级自适应, 宽度基本恒定)。
+// 采集模块 / 远程桌面 / 一键自检三处同一套, 改的时候一起改。
+const fmtLag = (ms) => {
+if (ms == null || !isFinite(ms) || ms < 0) return '--';
+if (ms < 1000) return Math.round(ms) + 'ms';
+const sec = ms / 1000;
+return sec.toFixed(sec < 10 ? 3 : sec < 100 ? 2 : 1) + 's';
+};
+// 红黄绿(自己定的门槛):
+//   画面延时  绿 <0.3s   黄 <1s   红 >=1s
+//   帧率      绿 >=15fps 黄 >=5fps 红 <5fps
+//             帧率 0 不上色 —— 桌面没变化时 x11vnc 本来就不发帧, 那不是故障。
+const lvLagVnc = (ms) => (ms == null ? '' : ms < 300 ? 'ok' : ms < 1000 ? 'warn' : 'bad');
+const lvFpsVnc = (f) => (!f ? '' : f >= 15 ? 'ok' : f >= 5 ? 'warn' : 'bad');
+
+async function syncClock() {
+  const c0 = Date.now();
+  const rs = await Promise.all([0, 1, 2].map(() =>
+    fetch('/api/time', { cache: 'no-store' })
+      .then((r) => r.json()).then((j) => ({ j, t: Date.now() }))
+      .catch(() => null)));
+  let best = null;
+  for (const x of rs) {
+    if (!x || typeof x.j.s !== 'number') continue;
+    const rtt = x.t - c0;
+    if (!best || rtt < best.rtt) best = { rtt, off: x.j.s - (c0 + rtt / 2) };
+  }
+  if (best) { clockOff = best.off; clockOk = true; }
+}
+syncClock();
+setInterval(syncClock, 30000);      // 手机网络会变, 定期重新对一次
+
 let wsRxBytes = 0;          // 收到的总字节(累加)
 let fbFrames = 0;           // FramebufferUpdate 次数(累加)
 let rateAt = 0, rateBytes0 = 0, rateFrames0 = 0;
@@ -114,13 +159,15 @@ function connect() {
       const d = ev.data;
       if (typeof d === 'string') {
         wsRxBytes += d.length;
+        // 服务端只在这条 RFB 流之外发错误提示; 画面时间戳走的是**旁路通道**
+        // (见下面 openTimeChannel), 所以这里不再需要拦文本帧。
         try {
           const msg = JSON.parse(d);
           if (msg.t === 'err') {
             networkError = msg.d || '远程桌面连接失败';
             showInputAlert(networkError, 'network');
           }
-        } catch (e) { /* 普通RFB数据由noVNC处理 */ }
+        } catch (e) { /* 不是 JSON, 交给 noVNC */ }
       }
       else if (d && d.byteLength) wsRxBytes += d.byteLength;
     });
@@ -154,7 +201,15 @@ function connect() {
     const origFb = r._framebufferUpdate.bind(r);
     r._framebufferUpdate = function () {
       const complete = origFb();
-      if (complete) fbFrames++;
+      if (complete) {
+        fbFrames++;
+        if (window.LoadTip) LoadTip.step('首帧画面');   // 第一帧真的画出来才算加载完
+        // 和采集模块同一个口径: 记的是**帧到达那一刻**, 延时在显示时才算。
+        // 为什么要分开: /api/time 的时钟对齐是异步的, 首帧常常在它完成之前
+        // 就到了 —— 那时算不了。桌面静止时又不会再来新帧, 于是那一栏会永远
+        // 停在 "--"。先记到达时刻, 等时钟对齐好再回头算, 就没这个问题。
+        frameArrivedAt = Date.now();
+      }
       return complete;
     };
   } catch (e) { /* 无所谓 */ }
@@ -166,7 +221,11 @@ function connect() {
 
   r.addEventListener('connect', () => {
     if (rfb !== r) return;
+    if (window.LoadTip) LoadTip.step('建立连接');
     connected = true;
+    // 先按真实鼠标位置摆好 ○; 拿不到再退回居中(virtInit)
+    virtInitFromServer().then((ok) => { if (!ok) virtInit(); });
+    openTimeChannel();
     connectedAt = Date.now();
     everConnected = true;
     clearTimeout(discoTimer);          // 抖动已恢复, 不用弹提示了
@@ -298,6 +357,7 @@ function renderFsInfo() {
   if (!el) return;
   const parts = [];
   if (connected) parts.push(lastFps.toFixed(0) + 'fps');
+  if (connected) parts.push('画面 ' + fmtLag(curFrameAge) + ' 前');
   if (lastKbs) {
     parts.push(lastKbs >= 1024 ? (lastKbs / 1024).toFixed(1) + 'MB/s'
                                : lastKbs.toFixed(0) + 'KB/s');
@@ -308,26 +368,69 @@ function renderFsInfo() {
   el.textContent = parts.join(' · ');
 }
 
-function renderRate(fps, kbs) {
+// 用户要求这一栏显示**本地帧率**和**画面延时(=最新一帧是多少秒以前的)**。
+// 以前显示的是 WebSocket 心跳往返 —— 那量的是控制帧 RTT, 不是画面有多旧
+// (心跳很快但画面卡住的情况完全存在), 两回事。
+// 帧率 0 不上色: 桌面静止时 x11vnc 本来就不发帧, 那不是故障。
+function paintRate() {
   const el = $('vnc-rate');
+  if (!el) return;
+  // 帧龄 = 这一帧**到达时**有多旧(不含 noVNC 解码/绘制那几毫秒)。
+  // 屏幕静止时没有新帧, 数字就停在上一次的值 —— 那正是"你看到的画面有多旧"。
+  // 夹到 0 以上: 同采集模块 —— 画面延时和时钟对齐误差(±RTT/2)是同一个量级,
+  // 直接相减经常是负数。负数表示"低于测量分辨率", 不是没数据。
+  curFrameAge = (clockOk && frameSentAt && frameArrivedAt)
+    ? Math.max(0, frameArrivedAt + clockOff - frameSentAt) : null;
+  if (!connected) {
+    el.textContent = '画面 --';
+    el.className = 'ping bad';
+    return;
+  }
+  el.textContent = `${lastFps.toFixed(0)}fps · ${fmtLag(curFrameAge)} 前`;
+  el.title = `本地帧率 ${lastFps.toFixed(1)} fps(每秒真正收到的画面帧数)`
+    + `，码率 ${lastKbs >= 1024 ? (lastKbs / 1024).toFixed(2) + ' MB/s'
+                               : lastKbs.toFixed(0) + ' KB/s'}\n`
+    + `画面延时 ${fmtLag(curFrameAge)}：从服务端收到 x11vnc 的画面数据, 算到你这边`
+    + '显示出来。\n桌面静止时不会有新帧, 这个数就停在上一次的值。';
+  el.className = 'ping ' + lvLagVnc(curFrameAge);
+}
+
+// 画面时间戳的旁路通道。
+// 为什么不塞进 /ws/vnc: 那条是**纯 RFB 字节流**, 插文本帧会把 noVNC 顶乱,
+// 而且裸 RFB 的测试客户端会直接报"不是 RFB 版本"。单独一条谁也不影响。
+let timeWs = null;
+function openTimeChannel() {
+  closeTimeChannel();
+  try {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    timeWs = new WebSocket(`${proto}://${location.host}/ws/vnc-time?viewer=${encodeURIComponent(viewerId)}`);
+    timeWs.onmessage = (ev) => {
+      if (typeof ev.data !== 'string') return;
+      try {
+        const j = JSON.parse(ev.data);
+        if (j.t === 'f') frameSentAt = j.s || 0;
+      } catch (e) { /* 忽略 */ }
+    };
+    timeWs.onclose = () => { if (timeWs === this) timeWs = null; };
+  } catch (e) { timeWs = null; }
+}
+function closeTimeChannel() {
+  if (!timeWs) return;
+  const w = timeWs;
+  timeWs = null;
+  try { w.onclose = null; w.close(); } catch (e) { /* ignore */ }
+}
+
+function renderRate(fps, kbs) {
   lastFps = fps;
   lastKbs = kbs;
-  if (el) {
-    if (!connected) {
-      el.textContent = '图传 --';
-      el.className = 'ping bad';
-    } else {
-      // 心跳与画面共用连接，包含网络和排队耗时；静止画面0fps不算故障。
-      el.textContent = streamRtt == null ? '图传 --' : `图传 ${Math.round(streamRtt)}ms`;
-      el.title = `图传帧率 ${fps.toFixed(1)} fps，码率 ${kbs >= 1024
-        ? (kbs / 1024).toFixed(2) + ' MB/s' : kbs.toFixed(0) + ' KB/s'}\n`
-        + '图传数值为 WebSocket 心跳往返，含排队耗时；每5秒测量一次，并非画面渲染延时。';
-      el.className = 'ping ' + (streamRtt == null || streamRtt < 200
-        ? 'ok' : streamRtt < 500 ? 'warn' : 'bad');
-    }
-  }
+  paintRate();
   renderFsInfo();
 }
+
+// 帧率要 1 秒的窗口才准, 但延时数字没必要跟着等 —— 单独快刷一下,
+// 手感跟采集模块那边(100ms)一致。
+setInterval(paintRate, 300);
 
 setInterval(() => {
   const now = Date.now();
@@ -402,7 +505,10 @@ function startPing() {
 function stopPing() {
   if (pingTimer) { clearInterval(pingTimer); pingTimer = 0; }
 }
-$('vnc-ping').addEventListener('click', () => { pingEma = 0; pingOnce(); });
+// 顶栏那个「网络」胶囊已按用户要求去掉(只保留帧率+延时); 全屏信息行里还留着。
+// 元素没了就别绑 —— 否则这一行会抛错, 后面的代码全不执行。
+const pingEl = $('vnc-ping');
+if (pingEl) pingEl.addEventListener('click', () => { pingEma = 0; pingOnce(); });
 
 // ================= 键盘 =================
 // 2026-09-14 修复的 5 个问题:
@@ -1006,25 +1112,55 @@ const EDGE_EXIT = 18;                      // 退出边缘区(px) -> 解锁(滞�
 let edgeLatch = 0;                         // 边缘锁 位掩码: 1=下 2=上 4=左 8=右
 const virt = { x: 0, y: 0, ok: false };
 let dragLock = 0;                          // 0=关闭, BTN_LEFT/BTN_RIGHT=持续按住
+let dragButton = BTN_LEFT, dragClickTimer = 0;
+let padButtonPress = null;                 // pad-l/r: pointerId + 0.5s lock timer
 let tapDrag = false;                       // 双击后按住拖拽(手势, 自动释放)
 let lastTapAt = 0;
 
 function syncDragLockUI() {
   const btn = $('pad-drag');
-  const labels = new Map([[0, '不拖动'], [BTN_LEFT, '左键锁定'], [BTN_RIGHT, '右键锁定']]);
-  btn.textContent = labels.get(dragLock);
-  btn.classList.toggle('on', dragLock !== 0);
-  btn.setAttribute('aria-pressed', dragLock !== 0 ? 'true' : 'false');
-  btn.setAttribute('aria-label', `拖动锁当前${labels.get(dragLock)}；点击切换`);
+  const side = dragButton === BTN_LEFT ? '左键' : '右键';
+  btn.textContent = `按住${side}`;
+  const modeHeld = dragLock === dragButton;
+  btn.classList.toggle('on', modeHeld);
+  btn.setAttribute('aria-pressed', modeHeld ? 'true' : 'false');
+  btn.setAttribute('aria-label', `${side}模式；单击按住或松开，双击切换左右键`);
+  for (const [id, bit, label] of [['pad-l', BTN_LEFT, '左键'], ['pad-r', BTN_RIGHT, '右键']]) {
+    const padBtn = $(id);
+    const held = dragLock === bit;
+    padBtn.textContent = held ? `按住${label}` : label;
+    padBtn.classList.toggle('on', held);
+    padBtn.setAttribute('aria-pressed', held ? 'true' : 'false');
+  }
 }
 
 function resetDragLock(sendRelease) {
+  clearTimeout(dragClickTimer); dragClickTimer = 0;
+  cancelPadButtonHold();
+  cancelPadGesture();
   if (sendRelease && mask) sendPointer(0);
   mask = 0;
   tapDrag = false;
   dragLock = 0;
   lastTapAt = 0;
   syncDragLockUI();
+}
+
+// 进页面时把虚拟光标定位到**电脑上鼠标的真实位置**(用户要求)。
+// 服务端给的是 0~1 的比例, 乘画布宽高就行 —— 这样不用知道 x11vnc 用了什么缩放。
+async function virtInitFromServer() {
+  try {
+    const j = await (await fetch('/api/activity', { cache: 'no-store' })).json();
+    const m = j && j.mouse;
+    const d = rfb && rfb._display;
+    const r = canvasRect();
+    if (!m || m.fx == null || !d || !d.width || !r) return false;
+    virt.x = r.left + m.fx * r.width;
+    virt.y = r.top + m.fy * r.height;
+    virt.ok = true;
+    virtClamp(); placeCursor();
+    return true;
+  } catch (e) { return false; }
 }
 
 function virtInit() {
@@ -1036,6 +1172,19 @@ function virtInit() {
   virt.ok = true;
   placeCursor();
 }
+
+// 直接点/拖画面时, 把虚拟光标同步到手指/鼠标的位置。
+// 不做这个的话: noVNC 会把远端鼠标真的移过去, 而那个 ○ 还停在原地 ——
+// 用户报的就是"圆圈不会移动"。
+function syncVirtFromEvent(e) {
+  virt.ok = true;
+  virt.x = e.clientX; virt.y = e.clientY;
+  virtClamp(); placeCursor();
+}
+['pointerdown', 'pointermove'].forEach((t) => {
+  const el = $('screen');
+  if (el) el.addEventListener(t, syncVirtFromEvent, { passive: true });
+});
 
 function virtClamp() {
   const r = canvasRect();
@@ -1118,13 +1267,12 @@ function cancelMomentum() {
 
 function startMomentum() {
   cancelMomentumKeepAcc();
-  const v = SCROLL.vel, vx = SCROLL.velX;
-  if (Math.abs(v) < 0.12 && Math.abs(vx) < 0.12) { SCROLL.acc = 0; SCROLL.accX = 0; return; }
+  if (Math.abs(SCROLL.vel) < 0.12 && Math.abs(SCROLL.velX) < 0.12) { SCROLL.acc = 0; SCROLL.accX = 0; return; }
   let last = performance.now();
   const tick = (now) => {
     const dt = Math.min(now - last, 40); last = now;
-    SCROLL.acc += v * dt;
-    SCROLL.accX += vx * dt;
+    SCROLL.acc += SCROLL.vel * dt;
+    SCROLL.accX += SCROLL.velX * dt;
     drainScroll();
     SCROLL.vel *= Math.pow(0.93, dt / 16.7);
     SCROLL.velX *= Math.pow(0.93, dt / 16.7);
@@ -1146,6 +1294,25 @@ function cancelMomentumKeepAcc() {
 // 2 指: 上下滑=滚轮 / 左右滑=横向滚轮 / 双指点按=右键
 const pts = new Map();            // pointerId -> {x, y}
 let gesture = null;               // {maxPts, move, t0, scrolled}
+let scrollFrame = 0, scrollDX = 0, scrollDY = 0;
+function flushPadScroll() {
+  if (scrollFrame) { cancelAnimationFrame(scrollFrame); scrollFrame = 0; }
+  if (!scrollDX && !scrollDY) return;
+  const now = performance.now(), dt = Math.max(8, now - SCROLL.lastT);
+  SCROLL.lastT = now;
+  const dx = scrollDX, dy = scrollDY;
+  scrollDX = 0; scrollDY = 0;
+  if (!gesture) return;
+  gesture.scrollMove = (gesture.scrollMove || 0) + Math.hypot(dx, dy);
+  if (!gesture.scrolled && gesture.scrollMove < 3) return;
+  gesture.scrolled = true;
+  const y = -dy * S.scrollDir, x = -dx * S.scrollDir;
+  SCROLL.acc += y; SCROLL.accX += x;
+  const blend = 1 - Math.exp(-dt / 35);
+  SCROLL.vel += (y / dt - SCROLL.vel) * blend;
+  SCROLL.velX += (x / dt - SCROLL.velX) * blend;
+  drainScroll();
+}
 
 padArea.addEventListener('pointerdown', (e) => {
   if (padPanel.classList.contains('hide')) return;
@@ -1181,27 +1348,15 @@ padArea.addEventListener('pointermove', (e) => {
   if (!gesture) return;
 
   if (pts.size >= 2) {
-    // 只认第一根手指的位移。
-    // 双指时每根手指都会各自派发 pointermove, 两根一起累加 = 滚动量翻倍, 而且
-    // 两根手指不可能完全同步, 逐帧差值一抖一抖 —— 表现就是"双指滑动一顿一顿的"。
-    const firstId = pts.keys().next().value;
-    if (e.pointerId !== firstId) return;
-    // 双指滚动: 累积 + 估算速度供抬手后做惯性
-    const now = performance.now();
-    const dt = Math.max(1, now - SCROLL.lastT);
-    SCROLL.lastT = now;
-    const dir = S.scrollDir;
-    const dAcc = -dy * dir;
-    const dAccX = -dx;
-    SCROLL.acc += dAcc;
-    SCROLL.accX += dAccX;
-    SCROLL.vel = SCROLL.vel * 0.6 + (dAcc / dt) * 0.4;
-    SCROLL.velX = SCROLL.velX * 0.6 + (dAccX / dt) * 0.4;
-    gesture.scrolled = true;
-    gesture.move += Math.abs(dx) + Math.abs(dy);
+    // 两指中心位移：每根手指贡献一半，不依赖哪根先落下。
+    scrollDX += dx / pts.size; scrollDY += dy / pts.size;
+    gesture.move += (Math.abs(dx) + Math.abs(dy)) / pts.size;
     cancelMomentumKeepAcc();
-    scheduleDrain();
+    if (!scrollFrame) scrollFrame = requestAnimationFrame(() => {
+      scrollFrame = 0; flushPadScroll();
+    });
   } else {
+    if (gesture.maxPts >= 2) return; // 双指结束前不把剩余手指变成鼠标移动
     gesture.move += Math.abs(dx) + Math.abs(dy);
     if (!virt.ok) virtInit();
     // 指针加速: 慢速微调用基准增益, 快速甩动按比例放大。
@@ -1223,11 +1378,10 @@ padArea.addEventListener('pointermove', (e) => {
 
 function padUp(e) {
   if (!pts.has(e.pointerId)) return;
+  flushPadScroll();
   pts.delete(e.pointerId);
   if (pts.size > 0) {
-    // 抬起一根手指后重新基线, 避免剩下那根手指把残余位移当成移动
-    if (gesture) { gesture.move = 0; gesture.t0 = Date.now(); }
-    SCROLL.lastT = performance.now();
+    // 等到所有手指抬起；保留最后移动时间以识别停顿后松手。
     return;
   }
   if (!gesture) return;
@@ -1239,6 +1393,7 @@ function padUp(e) {
     tapDrag = false;
     release(BTN_LEFT);
   } else if (g.scrolled) {
+    if (performance.now() - SCROLL.lastT > 80) cancelMomentum();
     startMomentum();                      // 双指滚动抬手 -> 惯性继续
   } else if (g.maxPts === 1 && g.move < TAP_MAX_MOVE && quick && !dragLock) {
     click(BTN_LEFT);                      // 轻点=左键
@@ -1250,11 +1405,72 @@ function padUp(e) {
   }
 }
 padArea.addEventListener('pointerup', padUp);
-padArea.addEventListener('pointercancel', padUp);
+function cancelPadGesture() {
+  if (scrollFrame) cancelAnimationFrame(scrollFrame);
+  scrollFrame = 0; scrollDX = 0; scrollDY = 0;
+  pts.clear(); gesture = null; lastTapAt = 0;
+  cancelMomentum(); SCROLL.acc = 0; SCROLL.accX = 0;
+  if (tapDrag) { tapDrag = false; release(BTN_LEFT); }
+}
+padArea.addEventListener('pointercancel', cancelPadGesture);
+window.addEventListener('blur', () => resetDragLock(true));
 
 // ================= 触控板下方按键 =================
-$('pad-l').addEventListener('pointerdown', (e) => { e.preventDefault(); click(BTN_LEFT); });
-$('pad-r').addEventListener('pointerdown', (e) => { e.preventDefault(); click(BTN_RIGHT); });
+function cancelPadButtonHold(pointerId = null) {
+  if (!padButtonPress || (pointerId !== null && padButtonPress.pointerId !== pointerId)) return;
+  if (padButtonPress.timer) clearTimeout(padButtonPress.timer);
+  padButtonPress = null;
+}
+
+function beginPadButtonHold(button, pointerId) {
+  cancelPadButtonHold();
+  const pressState = { button, pointerId, timer: 0, fired: false };
+  padButtonPress = pressState;
+  pressState.timer = setTimeout(() => {
+    if (padButtonPress !== pressState) return;
+    pressState.timer = 0;
+    pressState.fired = true;
+    if (!ready()) return;
+    clearTimeout(dragClickTimer); dragClickTimer = 0;
+    if (tapDrag) { tapDrag = false; release(BTN_LEFT); }
+    lastTapAt = 0;
+    if (dragLock !== button) {
+      if (dragLock) release(dragLock);
+      dragLock = button;
+      press(button);
+    }
+    dragButton = button;
+    syncDragLockUI();
+    showPadToast(`已按住${button === BTN_LEFT ? '左键' : '右键'}`);
+  }, 500);
+}
+
+function endPadButtonHold(pointerId, canceled = false) {
+  const pressState = padButtonPress;
+  if (!pressState || pressState.pointerId !== pointerId) return;
+  cancelPadButtonHold(pointerId);
+  if (canceled || pressState.fired) return;
+  if (dragLock === pressState.button) {
+    release(pressState.button);
+    dragLock = 0;
+    syncDragLockUI();
+    showPadToast(`已松开${pressState.button === BTN_LEFT ? '左键' : '右键'}`);
+  } else {
+    click(pressState.button);
+  }
+}
+
+for (const [id, button] of [['pad-l', BTN_LEFT], ['pad-r', BTN_RIGHT]]) {
+  const padBtn = $(id);
+  padBtn.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    try { padBtn.setPointerCapture(e.pointerId); } catch (err) {}
+    beginPadButtonHold(button, e.pointerId);
+  });
+  for (const ev of ['pointerup', 'pointercancel', 'pointerleave']) {
+    padBtn.addEventListener(ev, (e) => endPadButtonHold(e.pointerId, ev !== 'pointerup'));
+  }
+}
 
 // 滚轮键支持长按连发(翻长文档不用一直戳)
 function holdRepeat(el, fn) {
@@ -1273,14 +1489,37 @@ function holdRepeat(el, fn) {
 holdRepeat($('pad-wu'), () => wheelStep(-1, 0));
 holdRepeat($('pad-wd'), () => wheelStep(1, 0));
 
-$('pad-drag').addEventListener('click', () => {
-  const next = dragLock === 0 ? BTN_LEFT : dragLock === BTN_LEFT ? BTN_RIGHT : 0;
+function toggleDragLock() {
   if (tapDrag) { tapDrag = false; release(BTN_LEFT); }
   lastTapAt = 0;
-  if (dragLock) release(dragLock);
-  dragLock = next;
-  if (dragLock) press(dragLock);
+  if (dragLock) { release(dragLock); dragLock = 0; }
+  else if (ready()) { dragLock = dragButton; press(dragLock); }
   syncDragLockUI();
+}
+function switchDragButton() {
+  if (tapDrag) { tapDrag = false; release(BTN_LEFT); }
+  if (dragLock) release(dragLock);
+  dragLock = 0; lastTapAt = 0;
+  dragButton = dragButton === BTN_LEFT ? BTN_RIGHT : BTN_LEFT;
+  syncDragLockUI();
+  showPadToast((dragButton === BTN_LEFT ? '左键' : '右键') + '模式：单击按住 / 松开');
+}
+function showPadToast(msg) {
+  const toast = $('pad-mode-toast');
+  toast.textContent = msg;
+  toast.classList.remove('show');
+  void toast.offsetWidth;
+  toast.classList.add('show');
+}
+$('pad-drag').addEventListener('click', () => {
+  if (dragClickTimer) {
+    clearTimeout(dragClickTimer); dragClickTimer = 0;
+    switchDragButton();
+  } else {
+    dragClickTimer = setTimeout(() => {
+      dragClickTimer = 0; toggleDragLock();
+    }, DBLTAP_MS);
+  }
 });
 syncDragLockUI();
 $('pad-speed').addEventListener('click', () => {
@@ -2050,9 +2289,25 @@ function startPlainAudio() {
   }
 }
 
+// 音频开着的时候定期报一次"这个页面还活着"。
+//
+// 为什么需要: 服务端 /api/audio 有个判据 —— 开流那一刻如果最近有页面心跳过,
+// 就把这条流**绑到那个心跳**上, 之后 20 秒收不到心跳就停(没人听就别占着设备)。
+// 采集模块一直在发这个心跳, 远程桌面原来**从来不发** —— 于是"刚在采集模块用过
+// 麦克风, 20 秒内切到远程桌面开声音"会被误判成"人走了", 声音播着播着就断。
+let audioHbTimer = 0;
+function audioHb() {
+  if (!audioOn) return;
+  fetch('/api/audio/hb', { cache: 'no-store' }).catch(() => {});
+}
+
 function setAudio(on) {
   audioOn = on;
+  clearInterval(audioHbTimer);
+  audioHbTimer = 0;
   if (on) {
+    audioHb();                          // 立刻报一次(要早于服务端开流判断)
+    audioHbTimer = setInterval(audioHb, 5000);
     audioEl.volume = 1;                 // 音量交给手机音量键(见文件上方说明)
     audioEl.pause();
     if (mseSupported()) {

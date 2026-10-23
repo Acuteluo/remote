@@ -5,7 +5,9 @@
 
 钉住的规则:
   1. 各页面的返回链接只有 `‹` 一个字(不带"返回"字样), 语义靠 title/aria-label
-  2. 远程桌面顶栏: 网络 / 画面 两个数字在**同一个胶囊**里
+  2. 远程桌面顶栏: 只显示**本地帧率 + 画面延时**一个胶囊
+     (2026-10-23 用户要求去掉「网络」那一栏: 那量的是 HTTP 往返, 和画面有多旧
+      是两回事, 他只关心本地体验。网络 RTT 移到全屏信息行里保留。)
   3. 远程桌面全屏: 退出键**无框**(透明背景 + 0 边框)
   4. 摄像头全屏: 覆盖层(顶部按钮/提示/底部信息条) 3.5 秒没操作自动淡出, 点一下回来
   5. 全程无 JS 报错
@@ -64,7 +66,7 @@ def main():
             chk(f"{path} 的返回键有 title/aria 说明",
                 bool(got) and got["title"] and got["aria"], str(got))
 
-        print("【2】顶栏: 网络 / 画面 在同一个胶囊里")
+        print("【2】顶栏: 本地帧率 + 画面延时 在同一个胶囊里(已去掉「网络」)")
         pg.goto(URL + "/vnc", wait_until="domcontentloaded")
         pg.wait_for_function(
             "() => document.getElementById('vnc-status').textContent.includes('已连接')")
@@ -72,22 +74,24 @@ def main():
         box = pg.evaluate("""() => {
             const pb = document.querySelector('.pingbox');
             if (!pb) return null;
-            const ping = document.getElementById('vnc-ping');
             const rate = document.getElementById('vnc-rate');
             const r = pb.getBoundingClientRect();
-            return {inside: pb.contains(ping) && pb.contains(rate),
+            return {hasRate: pb.contains(rate),
+                    hasPing: !!document.getElementById('vnc-ping'),
                     w: Math.round(r.width),
-                    ping: ping.textContent.trim(), rate: rate.textContent.trim(),
-                    pingBorder: getComputedStyle(ping).borderTopWidth,
-                    rateBorder: getComputedStyle(rate).borderTopWidth};
+                    rate: rate.textContent.trim(),
+                    rateBorder: getComputedStyle(rate).borderTopWidth,
+                    fs: document.getElementById('vnc-fs-info').textContent.trim()};
         }""")
-        chk("两个数字在同一个框里", bool(box) and box["inside"], str(box))
-        chk("框内两个数字各自不再有边框",
-            bool(box) and box["pingBorder"] == "0px" and box["rateBorder"] == "0px",
-            str(box))
-        chk("顶栏只显示 网络 xx ms / 画面 xx ms",
-            bool(box) and box["ping"].startswith("网络") and box["rate"].startswith("画面"),
-            f"{box['ping'] if box else '?'} | {box['rate'] if box else '?'}")
+        chk("帧率+延时在胶囊里", bool(box) and box["hasRate"], str(box))
+        chk("胶囊里不再有「网络」那一栏", bool(box) and box["hasPing"] is False, str(box))
+        chk("胶囊内的数字不再有边框",
+            bool(box) and box["rateBorder"] == "0px", str(box))
+        chk("顶栏显示 本地帧率 + xx 前",
+            bool(box) and "fps" in box["rate"] and "前" in box["rate"],
+            box["rate"] if box else "?")
+        chk("网络 RTT 挪到了全屏信息行(没丢)",
+            bool(box) and "网络" in box["fs"], box["fs"] if box else "?")
         # 连上以后不该显示"已连接"(默认状态, 白占地方); 文字仍在 DOM 里供测试判连接
         st_ok = pg.evaluate("""() => {
             const s = document.getElementById('vnc-status');
@@ -141,6 +145,10 @@ def main():
         print("【4】摄像头全屏: 覆盖层 3.5 秒自动收起, 点一下回来")
         pg.goto(URL + "/cam", wait_until="domcontentloaded")
         pg.wait_for_timeout(1200)
+        # 2026-10-23: 画面/麦克风改成默认关闭的开关了, 全屏按钮在画面没开时是禁用的
+        # —— 先打开画面, 再测全屏(这不是绕开检查, 而是页面契约变了, 前置条件跟着变)。
+        pg.check("#cam-video-sw")
+        pg.wait_for_timeout(1500)
         pg.click("#cam-fs")
         pg.wait_for_timeout(900)
         st = pg.evaluate("""() => {

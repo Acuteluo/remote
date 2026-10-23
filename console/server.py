@@ -9,6 +9,7 @@
 import atexit
 import base64
 import collections
+import ctypes
 import concurrent.futures
 import fcntl
 import glob
@@ -92,6 +93,10 @@ DEFAULT_CONFIG = {"typeMode": "auto", "typeBatch": 80, "typeDelayMs": 20,
                   "bgTrans": 35, "bgDim": 45, "bgBlur": 0,
                   # 声音去向: pc=电脑也响(默认) / silent=只发手机(电脑静音, 走虚拟输出)
                   "audioOut": "pc",
+                  # 主页各信息面板的折叠状态: {卡片id: true=已折叠}。
+                  # 存服务端(而不是 localStorage)是为了换设备也一致 —— 和主题色/
+                  # 背景一样属于"这台电脑的偏好"。
+                  "collapsed": {},
                   # 端口也归配置管(命令行 --port / 环境变量 MEOW_PORT 优先级更高):
                   # port = 控制台对外端口; vncPort = x11vnc 的内部 RFB 端口。
                   "port": DEFAULT_PORT, "vncPort": DEFAULT_VNC_PORT,
@@ -196,6 +201,7 @@ WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 # 而不是"探到 200 就算好了" —— 服务是延迟 ~1.2s 才重启的, 提前探到的 200 是
 # **旧进程**在应答, 那时 reload 会正好撞进重启窗口, 页面直接打不开(用户报的 bug)。
 BOOT_ID = secrets.token_hex(4)
+_BOOT_AT = time.time()          # 进程起来的大致时刻(自检里报"已跑多久"用)
 CLK_TCK = os.sysconf("SC_CLK_TCK") or 100
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 
@@ -448,6 +454,63 @@ def x_env():
         env["LC_ALL"] = "C.UTF-8"
         env["LANG"] = "C.UTF-8"
     return env
+
+
+# ---- ffmpeg: 按**能力**挑, 不按 PATH 挑 ----
+# 踩过的大坑(2026-10-23): 本机 ~/.local/bin/ffmpeg 是给 Rerun Viewer 用的
+# imageio 静态构建(v7.0.2, johnvansickle), 它**没有编 pulse 输入设备**, 也不认
+# -fragment_size; 而 systemd 用户环境的 PATH 里 ~/.local/bin 排在 /usr/bin 前面
+# (见 systemctl --user show-environment), 于是服务一重启就吃到这个阉割版 ——
+# **画面照常**(它有 v4l2), **麦克风整条路全废**: 探测 5 个候选全在 3ms 内失败,
+# 页面上点开麦毫无反应, 服务端连一个 /api/audio 都收不到。
+# 更阴的是: 开发时在 shell 里手跑 ffmpeg 一切正常(那个 PATH 里没有 ~/.local/bin),
+# 只有服务进程才复现 —— 所以必须显式挑, 不能 `shutil.which("ffmpeg")` 了事。
+FFMPEG_NEEDS = ("pulse", "v4l2")     # 收音要 pulse, 摄像头要 v4l2
+
+
+def _ffmpeg_devices(path):
+    """这个 ffmpeg 支持的设备名集合(解析 `ffmpeg -devices`)。"""
+    try:
+        r = subprocess.run([path, "-hide_banner", "-devices"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    names = set()
+    for line in (r.stdout or "").splitlines():
+        if not line.startswith(" "):
+            continue                       # 设备行都以空格开头, 表头不是
+        parts = line.split()
+        if len(parts) < 2 or parts[1] == "=":
+            continue                       # " D. = Demuxing supported" 这种表头
+        for n in parts[1].split(","):
+            if n:
+                names.add(n.strip())
+    return names
+
+
+def _pick_ffmpeg():
+    """第一个**同时支持 pulse 和 v4l2** 的 ffmpeg; 都没有就退回第一个能跑的。
+
+    先看发行版自带的完整构建(/usr/bin), 再看 PATH —— 顺序很重要: PATH 里那个
+    可能正是被用户自己装的精简构建盖住的。
+    """
+    cands = ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg",
+             shutil.which("ffmpeg") or "ffmpeg"]
+    fallback = None
+    for p in cands:
+        if not p or (p != "ffmpeg" and not os.path.exists(p)):
+            continue
+        devs = _ffmpeg_devices(p)
+        if not devs:
+            continue                       # 跑不起来, 跳过
+        if fallback is None:
+            fallback = p
+        if all(n in devs for n in FFMPEG_NEEDS):
+            return p
+    return fallback or "ffmpeg"
+
+
+FFMPEG = _pick_ffmpeg()
 
 
 # ---- 真实屏幕几何(缓存 30s) ----
@@ -1337,7 +1400,226 @@ class WSConn:
 
 # ---------------------------------------------------------------- 状态采集
 
+# ---- 把窗口的 WM_CLASS 映射成"应用名 + 图标" -------------------------------
+# WM_CLASS 长这样: "Navigator.firefox_firefox" / "code.code" / "chatgpt"。
+# 拿它去 .desktop 里找 Name= / Icon=, 面板上就能显示"Firefox Web Browser"+图标,
+# 而不是一串 0x02200017(用户反馈那样看不出是啥)。
+_APP_DIRS = ("/usr/share/applications", "/usr/local/share/applications",
+             "/var/lib/snapd/desktop/applications",
+             os.path.expanduser("~/.local/share/applications"))
+_ICON_ROOTS = ("/usr/share/icons", "/usr/local/share/icons",
+               os.path.expanduser("~/.local/share/icons"),
+               "/var/lib/snapd/desktop/icons", "/usr/share/pixmaps")
+_app_cache = {"t": 0.0, "idx": {}}
+_icon_cache = {}
+
+
+def _desktop_entries():
+    for d in _APP_DIRS:
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for fn in names:
+            if not fn.endswith(".desktop"):
+                continue
+            try:
+                with open(os.path.join(d, fn), encoding="utf-8",
+                          errors="replace") as f:
+                    txt = f.read()
+            except OSError:
+                continue
+            if "[Desktop Entry]" not in txt:
+                continue
+
+            def get(k, txt=txt):
+                mm = re.search(r"^%s=(.*)$" % k, txt, re.M)
+                return mm.group(1).strip() if mm else ""
+
+            ex = (get("Exec").split() or [""])[0]
+            yield {"file": fn[:-8], "name": get("Name"), "icon": get("Icon"),
+                   "swc": get("StartupWMClass"), "exec": os.path.basename(ex)}
+
+
+def app_index():
+    """{小写键: .desktop 信息}。**分两遍**建: 先 StartupWMClass/文件名(准),
+    再 Exec 名(次准) —— 否则 code-url-handler.desktop(Exec 也叫 code)会把
+    正牌的 code.desktop 挤掉(实测踩到)。"""
+    now = time.time()
+    if _app_cache["idx"] and now - _app_cache["t"] < 600:
+        return _app_cache["idx"]
+    idx, ents = {}, list(_desktop_entries())
+    for pri in (0, 1):
+        for e in ents:
+            keys = (e["swc"], e["file"]) if pri == 0 else (e["exec"],)
+            for k in keys:
+                if k:
+                    idx.setdefault(k.lower(), e)
+    _app_cache.update(t=now, idx=idx)
+    return idx
+
+
+def match_app(cls):
+    """WM_CLASS -> .desktop 条目; 找不到返回 None(前端退回首字母角标)。"""
+    if not cls:
+        return None
+    idx = app_index()
+    if cls.lower() in idx:
+        return idx[cls.lower()]
+    parts = [x for x in re.split(r"[.\-_]", cls) if len(x) >= 3]
+    for x in sorted(set(parts), key=len, reverse=True):
+        if x.lower() in idx:
+            return idx[x.lower()]
+    # 模糊匹配**只允许后缀**(flclash 撞 clash)。以前也允许前缀, 结果 "system"
+    # 撞上了 system-config-printer, 把 Android 模拟器认成了"打印机"。
+    for x in sorted(set(parts), key=len, reverse=True):
+        xl = x.lower()
+        for k, e in idx.items():
+            if 4 <= len(k) <= 24 and k != xl and k.endswith(xl):
+                return e
+    return None
+
+
+_ICON_CACHE_DIR = os.path.join(DATA_DIR, "iconcache")
+
+
+def icon_scaled(path, px=64):
+    """图标太大就先缩到 px 见方再发。
+
+    /usr/share/pixmaps 里有些是 512x512 的原图(chatgpt.png 实测 **499KB**,
+    vscode.png 216KB), 而列表里只显示 ~20px —— 原样发出去手机上白等好几秒。
+    缩完一般几 KB。用**现成的 ffmpeg**(和采集那条路同一个二进制), 结果缓存在
+    data/iconcache; 小图和矢量图直接原样返回。
+    """
+    try:
+        if os.path.getsize(path) <= 24 * 1024:
+            return path
+    except OSError:
+        return path
+    if os.path.splitext(path)[1].lower() == ".svg":
+        return path
+    try:
+        key = "%s-%d-%d.png" % (os.path.basename(path), px, int(os.path.getmtime(path)))
+    except OSError:
+        return path
+    out = os.path.join(_ICON_CACHE_DIR, key)
+    if os.path.exists(out):
+        return out
+    try:
+        os.makedirs(_ICON_CACHE_DIR, exist_ok=True)
+        # 临时文件**必须带 .png**: ffmpeg 靠扩展名猜输出格式, 叫 .tmp 它会
+        # 直接报"Unable to find a suitable output format"然后失败(踩过)。
+        tmp = out + ".part.png"
+        r = subprocess.run(
+            [FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", path,
+             "-vf", "scale=%d:%d:force_original_aspect_ratio=decrease" % (px, px),
+             "-frames:v", "1", tmp],
+            capture_output=True, timeout=15)
+        if r.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+            os.replace(tmp, out)
+            return out
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return path
+
+
+def find_icon(name):
+    """把 .desktop 的 Icon= 解析成真实文件路径; 找不到返回 None。"""
+    if not name:
+        return None
+    if name in _icon_cache:
+        return _icon_cache[name]
+    path = None
+    if name.startswith("/"):
+        path = name if os.path.exists(name) else None
+    else:
+        for root in _ICON_ROOTS:
+            if not os.path.isdir(root):
+                continue
+            if root.endswith("pixmaps"):
+                for ext in (".png", ".svg", ".xpm"):
+                    f = os.path.join(root, name + ext)
+                    if os.path.exists(f):
+                        path = f
+                        break
+                continue
+            for theme in ("hicolor", "Yaru", "Adwaita", "Yaru-dark", ""):
+                for size in ("128x128", "96x96", "64x64", "48x48", "scalable",
+                             "256x256"):
+                    for ext in (".png", ".svg"):
+                        f = (os.path.join(root, theme, size, "apps", name + ext)
+                             if theme else os.path.join(root, size, "apps", name + ext))
+                        if os.path.exists(f):
+                            path = f
+                            break
+                    if path:
+                        break
+                if path:
+                    break
+            if path:
+                break
+    _icon_cache[name] = path
+    return path
+
+
+# ---- 空闲时长: 最后一次键盘/鼠标输入到现在 ----------------------------------
+# 用 X 的 **XScreenSaver 扩展**(`xprintidle` 用的就是它), 纯 ctypes, 不引第三方依赖。
+#
+# 为什么不用 GNOME 的 IdleMonitor: **这台机器上它是坏的** —— 实测连续 12 秒恒为
+# 64ms 不动, 而同一时间 `xinput test-xi2 --root` 一个输入事件都没有(桌面完全静止)。
+# XScreenSaver 那个才是准的: 实测每秒稳定 +1000ms。
+#
+# 它数的是**真实输入事件**(键盘/鼠标移动/按键/滚轮), 所以后台跑 AI 任务、放视频、
+# 程序自己弹窗换前台都**不会**重置它 —— 正是用户要的口径。
+_xss = {"lib": None, "dpy": None, "disp": None, "root": 0, "info": None}
+_xss_lock = threading.Lock()
+
+
+def x_idle_ms():
+    """返回 X 的空闲毫秒数; 拿不到返回 None。"""
+    disp = (session_env() or {}).get("DISPLAY") or os.environ.get("DISPLAY") or ":0"
+    with _xss_lock:
+        try:
+            if _xss["lib"] is None:
+                x11 = ctypes.CDLL("libX11.so.6")
+                x11.XOpenDisplay.restype = ctypes.c_void_p
+                x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+                x11.XDefaultRootWindow.restype = ctypes.c_ulong
+                x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+                xss = ctypes.CDLL("libXss.so.1")
+
+                class _Info(ctypes.Structure):
+                    _fields_ = [("window", ctypes.c_ulong), ("state", ctypes.c_int),
+                                ("kind", ctypes.c_int), ("since", ctypes.c_ulong),
+                                ("idle", ctypes.c_ulong), ("event_mask", ctypes.c_ulong)]
+                xss.XScreenSaverAllocInfo.restype = ctypes.POINTER(_Info)
+                xss.XScreenSaverQueryInfo.restype = ctypes.c_int
+                xss.XScreenSaverQueryInfo.argtypes = [
+                    ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(_Info)]
+                _xss["lib"] = (x11, xss, _Info)
+            x11, xss, _Info = _xss["lib"]
+            if _xss["dpy"] is None or _xss["disp"] != disp:
+                d = x11.XOpenDisplay(disp.encode())
+                if not d:
+                    return None
+                _xss["dpy"] = d
+                _xss["disp"] = disp
+                _xss["root"] = x11.XDefaultRootWindow(ctypes.c_void_p(d))
+                _xss["info"] = xss.XScreenSaverAllocInfo()
+            rc = xss.XScreenSaverQueryInfo(ctypes.c_void_p(_xss["dpy"]),
+                                           ctypes.c_ulong(_xss["root"]), _xss["info"])
+            if rc != 1:
+                return None
+            return int(_xss["info"].contents.idle)
+        except (OSError, AttributeError, ValueError):
+            return None
+
+
 class Collector:
+    # tailscale 健康检查里的话(`tailscale status` 末尾那段 # 开头的)。
+    # 给个默认空列表, 免得第一次快照时属性还不存在。
+    _ts_health = []
+
     def __init__(self):
         self._cpu_prev = None          # (ts, {core: ticks})
         self._cpu_last = {"total": 0.0, "cores": []}
@@ -1503,6 +1785,18 @@ class Collector:
     # -- 电池
     def battery(self):
         out = None
+        # 顺便把"电源插没插"读出来。**必须一起看** —— 内核只报电池自己的状态,
+        # 而笔记本在满电附近充电电路会来回切(充满→停充→微放→再充), status 就在
+        # Full / Not charging / Discharging 之间跳; 光看它会出现"插着电却显示
+        # Discharging"这种吓人的画面(用户反馈"来回切")。
+        ac = None
+        for ps in glob.glob("/sys/class/power_supply/*"):
+            try:
+                if open(os.path.join(ps, "type")).read().strip() == "Mains":
+                    ac = open(os.path.join(ps, "online")).read().strip() == "1"
+                    break
+            except (OSError, ValueError):
+                continue
         for ps in glob.glob("/sys/class/power_supply/*"):
             try:
                 with open(os.path.join(ps, "type")) as f:
@@ -1519,7 +1813,7 @@ class Collector:
                         if os.path.exists(cn) and os.path.exists(vn):
                             watts = (int(open(cn).read().strip()) *
                                      int(open(vn).read().strip())) / 1e12
-                    out = {"cap": cap, "status": st, "watts": watts}
+                    out = {"cap": cap, "status": st, "watts": watts, "ac": ac}
             except (OSError, ValueError):
                 continue
         return out
@@ -1654,10 +1948,158 @@ class Collector:
                 # 列在面板里就是纯噪音(用户反馈过 "0x04200003 @!0,0;BDHF 是什么")。
                 if cls == "gjs.Gjs" or re.match(r"^@!\d+,\d+;", title):
                     continue
-                out.append({"id": wid, "title": title, "cls": cls})
+                e = match_app(cls)
+                out.append({"id": wid, "title": title, "cls": cls,
+                            # 应用名(找不到就给个干净的兜底: 取 WM_CLASS 后半段)
+                            "app": (e["name"] if e and e["name"]
+                                    else cls.split(".")[-1] or cls),
+                            "icon": (e["icon"] if e else "")})
             return out
         except (OSError, subprocess.SubprocessError):
             return []
+
+    # -- CPU 型号 / 大小核拓扑 / 频率
+    def _cpu_info_static(self):
+        """CPU 的"身份": 型号、线程数、P/E 核划分。这些不变, 缓存 1 小时。"""
+        model = ""
+        try:
+            with open("/proc/cpuinfo") as f:
+                for ln in f:
+                    if ln.startswith("model name"):
+                        model = ln.split(":", 1)[1].strip()
+                        break
+        except OSError:
+            pass
+
+        def count(path):
+            # /sys/devices/cpu_core|cpu_atom 是内核给混合架构(Intel 12 代以后)
+            # 暴露的分组, 形如 "0-7" / "8-17"。比去猜频率上限靠谱。
+            try:
+                with open(path) as f:
+                    txt = f.read().strip()
+            except OSError:
+                return 0
+            n = 0
+            for part in txt.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if "-" in part:
+                    a, _, b = part.partition("-")
+                    try:
+                        n += int(b) - int(a) + 1
+                    except ValueError:
+                        pass
+                else:
+                    n += 1
+            return n
+
+        threads = 0
+        try:
+            threads = sum(1 for ln in open("/proc/cpuinfo") if ln.startswith("processor"))
+        except OSError:
+            pass
+        mhz_max = 0
+        for c in ("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq",
+                  "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"):
+            try:
+                mhz_max = max(mhz_max, int(open(c).read().strip()) // 1000)
+            except (OSError, ValueError):
+                pass
+        return {"model": model, "threads": threads,
+                "p": count("/sys/devices/cpu_core/cpus"),
+                "e": count("/sys/devices/cpu_atom/cpus"),
+                "mhz_max": mhz_max}
+
+    def cpu_info(self):
+        """型号/拓扑(缓存) + **当前频率**(每核瞬时值, 不缓存)。"""
+        info = dict(self._cached("cpuinfo", 3600.0, self._cpu_info_static))
+        try:
+            with open("/proc/cpuinfo") as f:
+                vals = [float(x) for x in re.findall(r"cpu MHz\s*:\s*([0-9.]+)", f.read())]
+        except (OSError, ValueError):
+            vals = []
+        if vals:
+            info["mhz"] = int(sum(vals) / len(vals))
+            info["mhz_lo"] = int(min(vals))
+            info["mhz_hi"] = int(max(vals))
+        return info
+
+    # -- 前台窗口 / 空闲时长 / 鼠标位置(面板 1s 推一次, 全缓存 2s)
+    def _activity_now(self):
+        """"现在在用哪个应用" + "上次有人操作是什么时候"。
+
+        - **前台窗口**: xdotool getactivewindow + wmctrl -lx 拿标题/类, 再映射成
+          应用名 + 图标(和窗口列表同一套)。
+        - **空闲时长**: 用 **GNOME 的 IdleMonitor**, 它数的是"最后一次键鼠输入到现在"。
+          所以后台挂着跑代码、放视频都不会被误判成"有人在动"(用户特别提到这点)——
+          那些不会产生输入事件。拿不到就退回 None(前端显示 --)。
+        - **鼠标位置**: xdotool getmouselocation。除了原始屏幕坐标, 还多给一份
+          0~1 的比例 —— 远程桌面那边靠它把指针定位到真实位置(帧缓冲是缩放过的,
+          客户端只要 frac * 帧缓冲宽 就能换算, 不用知道 x11vnc 用的什么缩放)。
+        """
+        env = session_env()
+        if not env:
+            return {}
+        full = {**os.environ, **env}
+        out = {}
+
+        def run(cmd, t=4):
+            try:
+                return subprocess.run(cmd, env=full, capture_output=True,
+                                      text=True, timeout=t).stdout
+            except (OSError, subprocess.SubprocessError):
+                return ""
+
+        # 空闲时长(= 最后一次键鼠输入到现在)
+        idle = x_idle_ms()
+        if idle is None:
+            # 退路: GNOME 的 IdleMonitor。**这台机器上它是坏的**(恒为 64ms,
+            # 而 xinput 显示根本没有输入事件), 所以只当兜底。
+            txt = run(["gdbus", "call", "--session", "--dest", "org.gnome.Mutter.IdleMonitor",
+                       "--object-path", "/org/gnome/Mutter/IdleMonitor/Core",
+                       "--method", "org.gnome.Mutter.IdleMonitor.GetIdletime"])
+            mm = re.search(r"(\d+)", txt)
+            if mm:
+                idle = int(mm.group(1))
+        if idle is not None:
+            out["idle_ms"] = idle
+
+        # 鼠标位置
+        txt = run(["xdotool", "getmouselocation"])
+        mm = re.search(r"x:(\d+)\s+y:(\d+)", txt)
+        if mm:
+            mx, my = int(mm.group(1)), int(mm.group(2))
+            out["mouse"] = {"x": mx, "y": my}
+            try:
+                w, h = screen_size()
+                if w and h:
+                    out["mouse"]["fx"] = round(mx / float(w), 5)
+                    out["mouse"]["fy"] = round(my / float(h), 5)
+            except Exception:
+                pass
+
+        # 前台窗口
+        wid = run(["xdotool", "getactivewindow"]).strip()
+        if wid:
+            try:
+                wid = "0x%08x" % int(wid)
+            except ValueError:
+                wid = ""
+        for w in (self.windows() or []):
+            if wid and w.get("id", "").lower() == wid.lower():
+                out["active"] = {"id": w["id"], "title": w.get("title", ""),
+                                 "cls": w.get("cls", ""), "app": w.get("app", ""),
+                                 "icon": w.get("icon", "")}
+                break
+        else:
+            # wmctrl 列表里没有(比如刚切过去) -> 至少把 id 报出来
+            if wid:
+                out["active"] = {"id": wid, "title": "", "cls": "", "app": "", "icon": ""}
+        return out
+
+    def activity(self):
+        return self._cached("activity", 2.0, self._activity_now)
 
     # -- Tailscale 设备(慢: 起 tailscale 子进程, 缓存 15s)
     def tailscale(self):
@@ -1670,15 +2112,34 @@ class Collector:
             r = subprocess.run(["tailscale", "status"], capture_output=True,
                                text=True, timeout=5)
             out = []
+            health = []
             for ln in r.stdout.splitlines():
+                # `tailscale status` 的末尾会附一段健康检查:
+                #     # Health check:
+                #     #     - Tailscale SSH enabled, but access controls don't ...
+                # 以前没管它 —— 那行按空白切完是 ['#','-','Tailscale','SSH',...],
+                # 于是被当成一台设备显示了出来: 主机名 "-"、系统 "SSH"、IP "#"。
+                # 用户看到的就是列表最下面那个莫名其妙的「- … # · SSH」。
+                s = ln.strip()
+                if s.startswith("#"):
+                    t = s.lstrip("#").strip()
+                    t = re.sub(r"^[-*\u2022]\s+", "", t)   # 去掉前面的列表符号
+                    if t and not t.lower().startswith("health check"):
+                        health.append(t)      # 这段其实有用, 别丢(自检里会报)
+                    continue
                 fld = ln.split()
                 if len(fld) < 5:
                     continue
                 ip, host, _user, osname = fld[0], fld[1], fld[2], fld[3]
+                # 第一列必须是 IP —— 多一道保险, 免得将来 tailscale 再往 stdout
+                # 里塞别的段落, 又被当成设备。
+                if not _IPV4_RE.match(ip) and ":" not in ip:
+                    continue
                 status = " ".join(fld[4:])
                 offline = "offline" in status or "logged out" in status
                 out.append({"ip": ip, "host": host, "os": osname,
                             "online": not offline, "self": "self" in status})
+            self._ts_health = health
             return out
         except (OSError, subprocess.SubprocessError):
             return []
@@ -1859,9 +2320,12 @@ class Collector:
             "top_mem": top_mem,
             "windows": self.windows(),
             "peers": self.tailscale(),
+            "cpu_info": self.cpu_info(),
+            "activity": self.activity(),
         }
         # 桌面连接数: 每 5s 才数一次(面板 1s 推一次, 没必要那么勤)
         snap["vnc_clients"] = self._cached("vncc", 5, vnc_client_count)
+        snap["ts_health"] = list(self._ts_health or [])
         snap["alerts"] = self.alerts(snap)
         return snap
 
@@ -2076,6 +2540,48 @@ VNC_PING_EVERY = 5
 _vnc_lock = threading.Lock()
 _vnc_bridges = []            # [[创建时间, teardown, 本地端口], ...] 按时间升序
 _vnc_network = {}            # viewer id -> WSConn；桥接退出时移除
+# viewer id -> [WSConn]：**只报画面时间戳**的旁路通道(见 ws_vnc_time)。
+# 为什么不复用 /ws/vnc: 那条是**纯 RFB 字节流** ——
+#   · 往里插文本帧会把 noVNC 的协议顶乱, 只能靠"监听器注册顺序"去拦, 很脆;
+#   · 裸 RFB 的测试客户端(见 tests/vnc_stability_check.py)一看到 {"t":"f"}
+#     就直接报"不是 RFB 版本"(实测把 path_check 打挂了)。
+# 单独一条通道就谁也不影响。
+_vnc_time = {}
+_vnc_time_lock = threading.Lock()
+
+
+def vnc_time_publish(viewer, ms):
+    """把"这块画面是什么时候收到的"发给该 viewer 的旁路订阅者。"""
+    if not viewer:
+        return
+    with _vnc_time_lock:
+        subs = list(_vnc_time.get(viewer, ()))
+    for w in subs:
+        try:
+            w.send_text(json.dumps({"t": "f", "s": ms}))
+        except Exception:
+            pass
+
+
+def ws_vnc_time(ws, viewer):
+    """远程桌面的画面时间戳旁路: 客户端连上后一直挂着, 服务端每推一块就报一次。"""
+    with _vnc_time_lock:
+        _vnc_time.setdefault(viewer, []).append(ws)
+    try:
+        while True:
+            try:
+                ws.recv_message()          # 客户端不发东西; 靠它发现断开 + 回 pong
+            except socket.timeout:
+                continue                   # 只是暂时没数据, 不是断开
+            except Exception:
+                break
+    finally:
+        with _vnc_time_lock:
+            subs = _vnc_time.get(viewer)
+            if subs and ws in subs:
+                subs.remove(ws)
+            if subs is not None and not subs:
+                _vnc_time.pop(viewer, None)
 _TAILSCALE_PATH_TTL = 30.0
 _tailscale_path_lock = threading.Lock()
 _tailscale_path_cache = {"at": 0.0, "value": None, "refreshing": False}
@@ -2265,6 +2771,9 @@ def ws_vnc_bridge(ws, viewer=""):
                     continue          # select 说可读但抢输了, 下一轮再来
                 if not data:
                     break
+                # 这块画面的"采集时刻" = x11vnc 刚把字节交给我们的这一刻。
+                # 下面那圈合并和 send_binary 都算发送侧的开销, 不该算进画面延时。
+                recv_at = int(time.time() * 1000)
                 # 把**已经到达**的数据一起收走, 合成一个 WebSocket 帧再发。
                 # x11vnc 一次更新常拆成好几个 8KB 小包, 不合的话手机每秒要处理
                 # 几百个 WS 消息 —— 纯属白烧手机 CPU, 还更容易被浏览器的调度抖动
@@ -2287,6 +2796,11 @@ def ws_vnc_bridge(ws, viewer=""):
                         data += more
                 ws.send_started = time.monotonic()
                 try:
+                    # 时间戳走**旁路通道**发给前端(见 ws_vnc_time), 这条 WS
+                    # 保持纯 RFB 字节流一个字节都不动。
+                    # 时刻取在"从 x11vnc 收到数据"的当下(recv_at), 不是发送那一刻 ——
+                    # 排队和 WS 写阻塞不该被算成画面延时。
+                    vnc_time_publish(viewer, recv_at)
                     ws.send_binary(data)
                     ws.last_send_ms = (time.monotonic() - ws.send_started) * 1000
                     ws.last_send_at = time.monotonic()
@@ -2584,6 +3098,12 @@ CAM_DEFAULT_DEV = "/dev/video0"
 CAM_DEFAULT_SIZE = "640x480"
 CAM_DEFAULT_FPS = 12
 CAM_MAX_FPS = 30
+# 摄像头驱动的**实际**输出速率(它会忽略 -framerate, 实测 27~28fps)。
+# 写进 ffmpeg 是为了让 -r 的丢帧换算有个对的基准。
+CAM_INPUT_FPS = 30
+# MJPEG 质量(ffmpeg 的 -q:v, 越小越好)。5 相对摄像头原生图 PSNR 44.9dB,
+# 肉眼分辨不出, 体积只有它的 1/3.6。
+CAM_QUALITY = 5
 _CAM_SIZES = ("320x240", "640x480", "1280x720")
 # 「还有人在看吗」的**唯一判据是前端 JS 主动发来的心跳**, 不是 WebSocket 的 pong:
 # 浏览器/系统的网络栈会自动回 pong, 哪怕页面早就切到后台、JS 已经被挂起。
@@ -2675,10 +3195,16 @@ def _jpeg_frames(stream):
 
     ffmpeg -f mjpeg 输出的就是首尾相接的 JPEG, 没有长度前缀, 必须自己按标记分帧。
     帧数据里不会出现裸的 FFD9(字节填充会插 00), 所以找第一个 FFD9 是安全的。
+
+    **必须用 read1() 而不是 read()** —— 和音频那条路同一个坑(见 _audio_start):
+    `read(n)` 会一直阻塞到**攒满 n 字节**才返回。这里要 64KB, 而软编出来的帧
+    只有 12KB(640x480), 等于硬等 5 帧凑齐才肯处理 —— 凭空给画面加了
+    5/12fps ≈ **400ms** 的延时, 而且帧率被压成"一批一批"地跳。
+    read1(n) 是"有多少给多少", 来一帧就切一帧。
     """
     buf = b""
     while True:
-        chunk = stream.read(65536)
+        chunk = stream.read1(65536)
         if not chunk:
             break
         buf += chunk
@@ -2698,16 +3224,29 @@ def _jpeg_frames(stream):
 
 
 def _cam_attempts(dev, size, fps):
-    """两组参数依次尝试: 先让摄像头直出 MJPEG(不重编码, 几乎不耗 CPU),
-    失败(摄像头只支持 YUYV 等原始格式)再退回软件编码成 MJPEG。"""
+    """采集参数: **解码 + 按用户选的 fps 重新编码**, 不再直出 copy。
+
+    2026-10-23 实测这台机器(华为 MateBook + SenseTek FHD Camera)之后改的:
+
+      - 这颗摄像头**根本不认 -framerate**: 要 5fps 照样吐 28fps; 而直出那条路
+        又用不了 -r(裸 mjpeg 封装里 ffmpeg 丢不掉包)。结果就是用户选
+        "320×240 省流量" 也照样烧 10Mbps —— 帧率选项等于形同虚设。
+      - 直出 MJPEG 每帧 44KB(640x480); 软编 -q:v 5 只要 12KB, 相对原图
+        PSNR 44.9dB(40dB 以上肉眼分辨不出), 流量是 **1/9**。
+      - CPU 代价可以忽略: 27.7% -> 32.2%(单核百分比)。直出那条路本来也要把
+        10Mbps 从 USB 搬进管道, 并不省。
+
+    第一组让摄像头直出 MJPEG 给 ffmpeg 解码(USB 上只走压缩流, 省 USB 带宽),
+    第二组兜底: 摄像头不支持 MJPEG 输出(只给 YUYV 之类)时让 ffmpeg 自己挑输入格式。
+    -framerate 给固定值是因为驱动会忽略它 —— 写实际速率(30)才和 -r 的换算对得上。
+    """
+    common = [FFMPEG, "-hide_banner", "-loglevel", "error", "-f", "v4l2"]
+    tail = ["-video_size", size, "-framerate", str(CAM_INPUT_FPS), "-i", dev,
+            "-c:v", "mjpeg", "-q:v", str(CAM_QUALITY),
+            "-r", str(fps), "-f", "mjpeg", "-"]
     return [
-        ["ffmpeg", "-hide_banner", "-loglevel", "error",
-         "-f", "v4l2", "-input_format", "mjpeg",
-         "-video_size", size, "-framerate", str(fps), "-i", dev,
-         "-c:v", "copy", "-f", "mjpeg", "-"],
-        ["ffmpeg", "-hide_banner", "-loglevel", "error",
-         "-f", "v4l2", "-video_size", size, "-framerate", str(fps), "-i", dev,
-         "-c:v", "mjpeg", "-q:v", "5", "-f", "mjpeg", "-"],
+        [*common, "-input_format", "mjpeg", *tail],
+        [*common, *tail],
     ]
 
 
@@ -2726,7 +3265,13 @@ def _cam_start(dev, size, fps, first_timeout=4.0):
         def reader(p=p, q=q):
             try:
                 for f in _jpeg_frames(p.stdout):
-                    q.put(f)
+                    # ★ 时间戳打在**这里** —— 帧一从采集管道读出来就记。
+                    # 以前是等发送那一刻才 `time.time()`, 两者差的是"出帧到真正
+                    # 发出去"这段时间(排队 + WS 写阻塞), 机器一忙能有几十毫秒。
+                    # 那不是网络延时, 不该算进用户看到的"画面多久以前"。
+                    # 口径: 从这里开始计时, 即**采集侧**时刻(比传感器真正曝光晚
+                    # 一个"驱动+编码"的量, 实测 ~7ms)。
+                    q.put((int(time.time() * 1000), f))
             except (OSError, ValueError):
                 pass
             finally:
@@ -2765,10 +3310,17 @@ def _cam_start(dev, size, fps, first_timeout=4.0):
 
 _cam_lock = threading.Lock()
 _cam_session = {"proc": None, "stop": None}      # 同一时刻只允许一个采集会话
-# "摄像头页还有人在看"的最近时刻(前端 JS 心跳刷新)。给 /api/audio 复用:
-# 麦克风只在摄像头页里开, 而那页走了之后 HTTP 流本身收不到任何信号 ——
-# 半个死的连接连 _peer_gone 都探不出来(写还写得进去, 对端早不处理了)。
-_viewer_seen = {"t": 0.0}
+# "摄像头页还开着"的最近时刻。**两条心跳都写它**: 摄像头 WS 的 {"t":"hb"}
+# 和麦克风的 /api/audio/hb。
+#
+# 为什么非要这么一个时间戳: 页面走了之后, 那条 HTTP 音频流本身收不到任何信号 ——
+# 半个死的连接连 _peer_gone 都探不出来(写还写得进去, 对端早不处理了),
+# 收音会一直开着。
+#
+# 2026-10-23: 摄像头和麦克风拆成两个独立开关之后, 收音不能再只绑摄像头 WS 的
+# 心跳 —— "只开麦克风不开摄像头"、"开着收音把摄像头关掉"这两种用法都会被
+# 误判成"人走了"而把收音掐掉。所以麦克风自己发一条心跳(见 /api/audio/hb)。
+_page_seen = {"t": 0.0}
 
 
 def _cam_release_current(timeout=3.0):
@@ -2843,7 +3395,7 @@ def ws_cam_bridge(ws, dev=None, size=None, fps=None):
     except (TypeError, ValueError):
         fps = CAM_DEFAULT_FPS
 
-    if not shutil.which("ffmpeg"):
+    if not shutil.which(FFMPEG):
         _cam_send_err(ws, "未安装 ffmpeg, 无法采集摄像头")
         return
 
@@ -2874,6 +3426,18 @@ def ws_cam_bridge(ws, dev=None, size=None, fps=None):
         pass
 
     def pump():
+        """把帧推给前端。
+
+        **宁可掉帧, 不可积压**: 每次发送前把队列里积压的旧帧全丢掉, 只发最新那一帧。
+        手机网络一慢, 旧帧会在队列和内核发送缓冲区里排长队 —— 画面越看越滞后,
+        而且**永远追不回来**(生产者一直比消费者快)。监控场景下"跳掉几帧"远比
+        "延迟一直涨"可接受。
+
+        帧率这里**不再自己掐**: 摄像头那侧已经用 `-r` 限过了(见 _cam_attempts)。
+        早先试过在这儿再按 1/fps 兜一道, 结果是**误杀** —— ffmpeg 丢帧后的输出
+        间隔是 72/108ms 跳着来的(输入 28fps 的 2 帧或 3 帧), 一刀切在 70.8ms
+        上就把 72ms 那些也扔了, 12fps 实测掉到 8.2fps。
+        """
         try:
             while not stop.is_set():
                 try:
@@ -2882,7 +3446,27 @@ def ws_cam_bridge(ws, dev=None, size=None, fps=None):
                     continue
                 if f is None:
                     break
-                ws.send_binary(f)
+                # 丢积压: 一路取到队列空, 手上只留最后一帧
+                while True:
+                    try:
+                        nxt = frames.get_nowait()
+                    except queue.Empty:
+                        break
+                    if nxt is None:
+                        f = None
+                        break
+                    f = nxt
+                if f is None:
+                    break
+                # 每帧先发一条极小的文本消息: "这一帧是什么时候**采出来**的"。
+                # 前端拿它算"屏幕上这张画面是多少秒以前的"(配合 /api/time 的
+                # 时钟对齐, 见 cam.js)。时间戳来自读管道那一刻, 不是这一刻 ——
+                # 排队/发送阻塞不该算成画面延时。
+                # 用独立的文本消息而不是往 JPEG 里塞头: 二进制格式一个字节都不用动,
+                # 不认识 {"t":"f"} 的老前端会直接忽略它, 行为完全不变。
+                ts, blob = f
+                ws.send_text(json.dumps({"t": "f", "s": ts}))
+                ws.send_binary(blob)
         except (OSError, WSClosed, ValueError):
             pass
         finally:
@@ -2890,7 +3474,7 @@ def ws_cam_bridge(ws, dev=None, size=None, fps=None):
 
     # 前端最后一次心跳的时间 —— 判"还有没有人在看"就看它
     last_viewer = time.time()
-    _viewer_seen["t"] = last_viewer         # 供 /api/audio 复用(见 _serve_audio)
+    _page_seen["t"] = last_viewer         # 供 /api/audio 复用(见 _serve_audio)
 
     def reader():
         """按 WS 协议读客户端消息, 只关心一件事: 前端 JS 还在不在发心跳。
@@ -2915,7 +3499,7 @@ def ws_cam_bridge(ws, dev=None, size=None, fps=None):
                     try:
                         if json.loads(data.decode("utf-8", "replace")).get("t") == "hb":
                             last_viewer = time.time()
-                            _viewer_seen["t"] = last_viewer   # 给 /api/audio 复用
+                            _page_seen["t"] = last_viewer   # 给 /api/audio 复用
                     except (ValueError, AttributeError, TypeError):
                         pass
         except socket.timeout:
@@ -3052,7 +3636,12 @@ def audio_level(kind="pulse", src="default", seconds=1.5, wait=2.5):
     DMIC 就是: 能打开但一个字节都不出)只能靠超时跳过 —— 给太大就会白等。
     多个候选请用 audio_probe_all() 并行探, 别串行调这个。
     """
-    cmd = ["ffmpeg", "-hide_banner", "-f", kind, "-i", src,
+    # -fragment_size **必须加**: 不加的话 PipeWire 每 ~2 秒才肯给一大块,
+    # 而 -t 只要采 0.7 秒 —— ffmpeg 照样得等那一大块到手才算完, 单次探测就吃掉
+    # 4.2 秒(实测 4172ms -> 833ms, 2026-10-23)。摄像头页一进去就要把所有候选
+    # 探一遍, 这个差别直接决定"点开麦克风等 5 秒"还是"等 1 秒"。
+    frag = ["-fragment_size", "2048"] if kind == "pulse" else []
+    cmd = [FFMPEG, "-hide_banner", "-f", kind, *frag, "-i", src,
            "-t", str(seconds), "-af", "volumedetect", "-f", "null", "-"]
     try:
         p = subprocess.run(cmd, env=x_env(), capture_output=True,
@@ -3064,9 +3653,12 @@ def audio_level(kind="pulse", src="default", seconds=1.5, wait=2.5):
         m = re.search(pat, err)
         return float(m.group(1)) if m else None
     mx = num(r"max_volume:\s*([-\d.]+)\s*dB")
+    # 把 ffmpeg 的最后一行 stderr 也带上: 探测"没结果"时, /api/audio/check 里能直接
+    # 看到**为什么**(设备忙? 权限? 源没了?)。以前这里吞掉 stderr, 出问题只能干瞪眼。
+    tail = (err.strip().splitlines() or [""])[-1][:200]
     return {
         "ok": p.returncode == 0 and mx is not None,
-        "kind": kind, "src": src,
+        "kind": kind, "src": src, "rc": p.returncode, "stderr": tail,
         "mean_volume": num(r"mean_volume:\s*([-\d.]+)\s*dB"),
         "max_volume": mx,
         "silent": (mx if mx is not None else -91.0) <= -90.0,
@@ -3726,7 +4318,7 @@ def silent_sink_release():
 def _amix_opts():
     """amix 默认会把每路音量除以路数, 混静音会让真实音量掉一半, 必须关掉归一化。"""
     try:
-        h = subprocess.run(["ffmpeg", "-hide_banner", "-h", "filter=amix"],
+        h = subprocess.run([FFMPEG, "-hide_banner", "-h", "filter=amix"],
                            capture_output=True, text=True, timeout=8).stdout
     except Exception:
         h = ""
@@ -3744,7 +4336,7 @@ def _audio_cmd(kind, src):
     # 实测是"每 ~2 秒给一大块(12KB)"—— 音频就一段一段地到手机, 听着一直卡。
     # 压到 2048 字节(48k 单声道约 21ms)才能连续地取、连续地发。
     frag = ["-fragment_size", "2048"] if kind == "pulse" else []
-    return ["ffmpeg", "-hide_banner", "-loglevel", "error",
+    return [FFMPEG, "-hide_banner", "-loglevel", "error",
             "-f", kind, *frag, "-i", src,
             # 第二路: 无限静音, 只为保证"永远有输出"(见 AUDIO_FILTER 注释)
             "-f", "lavfi", "-i", SILENT_SRC,
@@ -3770,8 +4362,66 @@ def _audio_cmd(kind, src):
 # 谁; 最后一个人走了还留 AUDIO_LINGER 秒宽限, 期间重连等于**零空档**。
 AUDIO_LINGER = 2.5
 _hub = {"key": None, "proc": None, "chunks": None, "stop": None,
-        "subs": [], "first": b"", "bytes": 0, "gen": 0, "idle_epoch": 0}
+        "subs": [], "first": b"", "bytes": 0, "gen": 0, "idle_epoch": 0,
+        "t0": 0.0}      # 第一块音频到手(≈开始采到声音)的墙上时间, 算管道滞后用
 _hub_lock = threading.Lock()
+
+
+def audio_hub_lag():
+    """服务端这条采集管道**自身**滞后了多少秒(0 = 实时)。
+
+    = 已经过去的墙上时间 - 已经吐出来的音频时长。
+    ffmpeg 正常时它是 0 附近(实测稳态 ±30ms); 一旦机器被别的活儿压住、
+    编码跟不上实时, 它会一直涨 —— 那时候手机上听到的就是"越拖越旧"的声音。
+    """
+    with _hub_lock:
+        t0, n, proc = _hub["t0"], _hub["bytes"], _hub["proc"]
+    if not t0 or proc is None or proc.poll() is not None:
+        return None
+    produced = n * 8.0 / (int(AUDIO_BITRATE.rstrip("k")) * 1000)
+    return max(0.0, (time.time() - t0) - produced)
+
+
+# 每条音频流"第 0 个采样是什么时候采到的"(服务端 epoch ms), 按前端给的 sid 存。
+#
+# 为什么要有它: 前端要显示"你**正在听**的这段声音是多久以前的"。一开始前端是用
+# 浏览器的 `buffered.end - currentTime` 去估"还有多少没播", 但 `buffered` 是
+# **粗粒度更新的**(隔一段才刷一次), 拿它算出来是锯齿状乱跳的(实测 0.1~3.6s),
+# 根本不能当读数。改成服务端直接给锚点, 前端只用 (时钟对齐 + currentTime) 就能
+# 精确反推 —— 而且网络延时天然包含在内, 不用再单独估。
+_audio_since = {}
+_audio_since_lock = threading.Lock()
+_AUDIO_SINCE_MAX = 32          # 只留最近这些条, 免得长跑攒一堆
+
+
+def audio_chunk_capture_ms(nbytes):
+    """这一块音频的**第一个采样**是什么时候采到的(服务端 epoch ms)。
+
+    hub 是实时跑的: 位置 q 秒处的音频大约在 hub_t0 + q 被采到。
+    这块是刚读出来的最后一块, 所以它的起始位置 = (已发出字节 - 本块字节) 换算成秒。
+    """
+    with _hub_lock:
+        t0, total = _hub["t0"], _hub["bytes"]
+    if not t0:
+        return None
+    pos = max(0.0, (total - nbytes) * 8.0 / (int(AUDIO_BITRATE.rstrip("k")) * 1000))
+    return int((t0 + pos) * 1000)
+
+
+def audio_since_set(sid, ms):
+    if not sid or ms is None:
+        return
+    with _audio_since_lock:
+        _audio_since[sid] = ms
+        while len(_audio_since) > _AUDIO_SINCE_MAX:
+            _audio_since.pop(next(iter(_audio_since)))
+
+
+def audio_since_get(sid):
+    if not sid:
+        return None
+    with _audio_since_lock:
+        return _audio_since.get(sid)
 
 
 def _hub_fan(proc, chunks, stop):
@@ -3871,7 +4521,7 @@ def _hub_ensure(src, kind, subscriber):
                 return None, None, err
             stop = threading.Event()
             _hub.update(key=key, proc=proc, chunks=chunks, stop=stop,
-                        first=first, subs=[], bytes=0,
+                        first=first, subs=[], bytes=0, t0=time.time(),
                         gen=_hub["gen"] + 1)     # 换了一路采集 -> 世代号 +1
             result = attach()
         threading.Thread(target=_hub_fan, args=(proc, chunks, stop),
@@ -4089,7 +4739,33 @@ def vnc_module_preloads():
     return _vnc_preload["html"]
 
 
+# 只用来判断某行第一列像不像 IP(tailscale 解析的兜底), 不追求严格。
+_IPV4_RE = re.compile(r'^\d{1,3}(\.\d{1,3}){3}$')
 _ASSET_V_RE = re.compile(r'''(/static/(?!vendor/)[^"\'\s?]+\.(?:js|css))(?:\?v=\d+)?''')
+
+
+_asset_ver_cache = {"t": 0.0, "v": ""}
+
+
+def asset_version():
+    """自家 js/css 里最新的那个修改时间 —— 当成"这一版"的版本号。
+
+    页面是**常驻**的(挂着 WS), 不会自己刷新, 所以服务端更新完, 手机上看到的
+    还是旧界面(用户踩过: "我的折叠呢?")。前端拿它跟自己 script 标签上的 ?v=
+    比, 不一样就提示刷新。
+    """
+    now = time.time()
+    if _asset_ver_cache["v"] and now - _asset_ver_cache["t"] < 1.0:
+        return _asset_ver_cache["v"]
+    newest = 0
+    try:
+        for fn in os.listdir(STATIC_DIR):
+            if fn.endswith((".js", ".css")):
+                newest = max(newest, os.stat(os.path.join(STATIC_DIR, fn)).st_mtime_ns)
+    except OSError:
+        pass
+    _asset_ver_cache.update(t=now, v=str(newest))
+    return str(newest)
 
 
 def _asset_v(m):
@@ -4117,9 +4793,200 @@ def render(name, **kw):
     # 不用挨个改模板, 将来新增模板也自动带上。
     # 放在 </head> 前 = 排在 app.css 之后; 同优先级后者生效, 正好盖住默认值。
     if "</head>" in html:
-        html = html.replace("</head>", bg_css() + "</head>", 1)
+        # 加载进度提示(loadtip.js)由这里**统一注入**: 每个页面都自带, 以后新加的
+        # 页面不用手动引。放在 </head> 前 = 早于 body 里的页面脚本执行。
+        # 注意: _ASSET_V_RE 在下面才跑, 所以这里的 src 也会被挂上 ?v=修改时间。
+        html = html.replace("</head>",
+                            # 把"这一版的版本号"直接注入页面 —— 前端拿它跟 /api/version
+                            # 比。不能拿 loadtip.js 自己的 ?v= 当基准: 那是**单个文件**
+                            # 的修改时间, 而 /api/version 给的是**所有资源里最新的**,
+                            # 两者只有在 loadtip.js 恰好最新时才相等 —— 否则提示永远
+                            # 消不掉(用户就遇到了"刷新好几次还一直提示")。
+                            bg_css()
+                            + '<script>window.__MEOW_V="%s";</script>' % asset_version()
+                            + '<script src="/static/loadtip.js"></script>'
+                            + "</head>", 1)
     html = _ASSET_V_RE.sub(_asset_v, html)      # 静态文件防中间缓存(见 _asset_v)
     return html
+
+
+# ---- 一键自检 ---------------------------------------------------------------
+# 用户要求: 主页最下面一个按钮, 点一下把"这台机器现在到底还能不能用"逐项查一遍,
+# 最后弹窗看结果, 而且**尽量静默、别产生明显影响**。所以:
+#   - 不改任何配置、不碰扬声器、不写设备;
+#   - **摄像头不在这里开**(会亮指示灯, 而且是独占设备) —— 出帧和画面延时
+#     交给前端那两条测量去验(它们本来就要采一小段);
+#   - 麦克风**只做一次试采**(约 0.9 秒): "设备在"不等于"采得到声音",
+#     这台机器的 DMIC 就出过事, 不真采一下这项检查没有意义。
+# level 语义: ok=正常 / warn=能用但要注意 / bad=坏了需要处理。
+def run_selfcheck():
+    groups = []
+
+    def g(name):
+        grp = {"name": name, "items": []}
+        groups.append(grp)
+        return grp
+
+    def add(grp, name, level, detail=""):
+        grp["items"].append({"name": name, "level": level, "detail": str(detail)[:300]})
+
+    t0 = time.time()
+
+    # ---- 运行环境 ----
+    env = g("运行环境")
+    up = time.time() - _BOOT_AT
+    add(env, "服务进程", "ok", "pid=%d · 已跑 %s" % (os.getpid(), _dur(up)))
+    devs = _ffmpeg_devices(FFMPEG)
+    miss = [n for n in FFMPEG_NEEDS if n not in devs]
+    add(env, "ffmpeg", "bad" if miss else "ok",
+        ("%s（**缺 %s**）" % (FFMPEG, ",".join(miss))) if miss
+        else "%s（pulse,v4l2 都在）" % FFMPEG)
+    try:
+        probe = os.path.join(DATA_DIR, ".selfcheck.tmp")
+        with open(probe, "w") as f:
+            f.write("x")
+        os.remove(probe)
+        add(env, "运行时目录可写", "ok", DATA_DIR)
+    except OSError as e:
+        add(env, "运行时目录可写", "bad", e)
+    for f, what in ((AUTH_FILE, "凭据"), (CONFIG_FILE, "配置")):
+        add(env, f"{what}文件", "ok" if os.path.exists(f) else "warn",
+            os.path.basename(f) if os.path.exists(f) else "不存在(会用默认值)")
+
+    # ---- 摄像头(只查, 不开) ----
+    cam = g("摄像头")
+    add(cam, "ffmpeg v4l2", "ok" if "v4l2" in devs else "bad",
+        "支持" if "v4l2" in devs else "这个 ffmpeg 没有 v4l2 输入")
+    cdevs = cam_devices()
+    if not cdevs:
+        add(cam, "采集设备", "bad", "没找到可采集的 /dev/video*")
+    else:
+        for d in cdevs:
+            ok = os.path.exists(d) and os.access(d, os.R_OK)
+            add(cam, "设备 " + d, "ok" if ok else "bad",
+                "可读" if ok else "打不开(权限或被占用?)")
+    with _cam_lock:
+        p = _cam_session.get("proc")
+        busy = p is not None and p.poll() is None
+    add(cam, "当前采集状态", "warn" if busy else "ok",
+        "正在采集(可能有别的页面在看)" if busy else "空闲")
+
+    # ---- 声音 ----
+    au = g("声音")
+    srcs = audio_sources()
+    add(au, "PulseAudio 输入源", "ok" if srcs else "bad",
+        ("%d 个" % len(srcs)) if srcs else "pactl 一个都列不出来(服务没跑?)")
+    mics = audio_list_mics()               # ← 唯一的"动设备": 试采 0.9 秒
+    good = [m for m in mics if m["usable"]]
+    if good:
+        add(au, "麦克风实测", "ok",
+            "；".join("%s %s dB" % (m["label"], m["max_volume"]) for m in good))
+    elif mics:
+        add(au, "麦克风实测", "bad",
+            "检测到 %d 个设备但都采不到声音" % len(mics))
+    else:
+        add(au, "麦克风实测", "bad", "没有检测到麦克风设备")
+    try:
+        r = subprocess.run(["pactl", "get-default-sink"], env=x_env(),
+                           capture_output=True, text=True, timeout=5)
+        sink = (r.stdout or "").strip()
+        add(au, "默认输出", "ok" if sink else "warn", sink or "拿不到")
+    except (OSError, subprocess.SubprocessError) as e:
+        add(au, "默认输出", "warn", e)
+    # 有没有漏掉的采集进程(老版本出过"没人听还在采"的事)
+    try:
+        out = subprocess.run(["pgrep", "-af", "ffmpeg"], capture_output=True,
+                             text=True, timeout=5).stdout
+        n = len([l for l in out.splitlines() if "ffmpeg" in l and "pgrep" not in l])
+        # 阈值给宽一点: 自检自己就会起一两个(音频探针 + 前端的画面延时测量),
+        # 真正要抓的是"没人看还在采"那种泄漏(会攒到十几个)。
+        add(au, "在跑的 ffmpeg", "ok" if n <= 4 else "warn",
+            "%d 个进程" % n if n <= 4 else "%d 个（偏多，可能有没退干净的采集）" % n)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    # ---- 远程桌面 ----
+    vnc = g("远程桌面")
+    try:
+        s = socket.create_connection(("127.0.0.1", VNC_PORT), timeout=3)
+        s.close()
+        add(vnc, "x11vnc 端口 %d" % VNC_PORT, "ok", "可连")
+    except OSError as e:
+        add(vnc, "x11vnc 端口 %d" % VNC_PORT, "bad", e)
+    try:
+        w, h = screen_size()
+        add(vnc, "X 显示", "ok" if w else "warn", "%dx%d" % (w, h) if w else "拿不到尺寸")
+    except Exception as e:
+        add(vnc, "X 显示", "warn", e)
+    try:
+        add(vnc, "当前桌面连接数", "ok", vnc_client_count())
+    except Exception:
+        pass
+
+    # ---- 系统 ----
+    sy = g("系统")
+    try:
+        snap = COLLECTOR.snapshot()
+        cpu = (snap.get("cpu") or {}).get("total")
+        add(sy, "CPU", "ok", "%.0f%% · 负载 %s" % (cpu or 0, snap.get("load")))
+        mem = snap.get("mem") or {}
+        if mem.get("total"):
+            used = 100.0 * (mem["total"] - mem["avail"]) / mem["total"]
+            add(sy, "内存", "warn" if used > 88 else "ok",
+                "%.0f%% (%s / %s)" % (used, _mb(mem["total"] - mem["avail"]),
+                                      _mb(mem["total"])))
+        temps = [t for t in (snap.get("temps") or []) if t[1] and 0 < t[1] < 150]
+        if temps:
+            nm, val = max(temps, key=lambda t: t[1])
+            add(sy, "温度", "warn" if val > 80 else "ok", "%s %.0f°C" % (nm, val))
+        for d in (snap.get("disks") or []):
+            if not isinstance(d, dict):
+                continue
+            pct = d.get("percent")
+            if pct is None:
+                continue
+            add(sy, "磁盘 " + str(d.get("mount") or d.get("dev") or "?"),
+                "warn" if pct > 88 else "ok", "%.0f%% 已用" % pct)
+        peers = snap.get("peers")
+        if isinstance(peers, list):
+            on = [p for p in peers if isinstance(p, dict) and p.get("online")]
+            add(sy, "Tailscale 设备", "ok", "%d 台在线 / 共 %d" % (len(on), len(peers)))
+        for h in (snap.get("ts_health") or []):
+            add(sy, "Tailscale 提示", "warn", h)
+        al = snap.get("alerts") or []
+        for a in al:
+            add(sy, "告警: " + str(a.get("key")),
+                "bad" if a.get("level") == "crit" else "warn", a.get("msg"))
+        if not al:
+            add(sy, "系统告警", "ok", "无")
+    except Exception as e:
+        add(sy, "系统状态", "warn", "采集失败: %s" % e)
+
+    # ---- 汇总 ----
+    items = [it for grp in groups for it in grp["items"]]
+    summary = {"ok": 0, "warn": 0, "bad": 0}
+    for it in items:
+        summary[it["level"]] = summary.get(it["level"], 0) + 1
+    return {
+        "ok": summary["bad"] == 0,
+        "at": int(time.time() * 1000),
+        "ms": int((time.time() - t0) * 1000),
+        "summary": summary,
+        "groups": groups,
+    }
+
+
+def _dur(sec):
+    sec = int(sec)
+    if sec < 3600:
+        return "%d 分 %d 秒" % (sec // 60, sec % 60)
+    return "%d 时 %d 分" % (sec // 3600, (sec % 3600) // 60)
+
+
+def _mb(nbytes):
+    """Collector 里的内存/磁盘都是**字节**(见 Collector.mem / disks)。"""
+    n = float(nbytes or 0)
+    return "%.1f GB" % (n / 1073741824.0) if n >= 1073741824 else "%.0f MB" % (n / 1048576.0)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -4213,8 +5080,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        extra = dict(extra or {})
+        # extra 里的同名头要**覆盖**默认值, 不能追加 —— 否则 Cache-Control 会发两条
+        # (no-cache + no-store), 语义就没准了。
+        lower = {k.lower(): k for k in extra}
+        if "cache-control" in lower:
+            cache = extra.pop(lower["cache-control"])
         self.send_header("Cache-Control", cache)
-        for k, v in (extra or {}).items():
+        for k, v in extra.items():
             self.send_header(k, v)
         self.end_headers()
         if body:
@@ -4229,9 +5102,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (OSError, ValueError):
             return False
 
-    def _serve_audio(self, src="default"):
+    def _serve_audio(self, src="default", sid=""):
         """把麦克风的声音编码成 MP3, 边采边以 chunked 方式推给浏览器。"""
-        if not shutil.which("ffmpeg"):
+        if not shutil.which(FFMPEG):
             self._json({"ok": False, "err": "未安装 ffmpeg, 无法采集声音"})
             return
         # 关键: 不能"能打开就用" —— PulseAudio 的 default 常是扬声器回环,
@@ -4299,25 +5172,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except OSError:
                 pass
             buf = None
-            # 麦克风跟着"摄像头页还在不在"走 —— 但只在**这个流是从活着的摄像头页
-            # 开起来的**时候才绑。否则像自检脚本、或者直接用 curl 拉流的场景,
+            # 收音跟着"这个页面还开着吗"走 —— 但只在**这条流是从活着的页面开起来的**
+            # 时候才绑。否则像自检脚本、或者直接用 curl 拉流的场景,
             # 会被一个陈旧的全局时间戳误杀(踩过: cam_check 的音频用例就是这么挂的)。
-            vt0 = _viewer_seen["t"]
-            tied = bool(vt0) and (time.time() - vt0) <= CAM_VIEWER_TIMEOUT
+            pt0 = _page_seen["t"]
+            tied = bool(pt0) and (time.time() - pt0) <= CAM_VIEWER_TIMEOUT
             while not stop.is_set():
                 # 主动探一下客户端还在不在。光靠"写失败"发现断开太慢 ——
                 # 内核缓冲区没满时 write 照样成功, 麦克风会被白占好几秒。
                 if _peer_gone(self.connection):
                     break
+                # 页面心跳比"开流那一刻"更新 -> 确认有人在看, 从此把这条流绑到它。
+                # 前端开麦时会立刻发一次 /api/audio/hb, 所以这个窗口只有几十毫秒。
+                # 写成循环里判断而不是只看开流那一刻, 是为了**不用 await 去保证
+                # 心跳先于开流到达** —— 那会把用户手势链拉长, play() 可能被浏览器
+                # 的自动播放策略拦掉。
+                if not tied and _page_seen["t"] > pt0:
+                    tied = True
                 # 半死连接上面那行探不出来: 手机锁屏/切网/webview 被挂起时写还写得
-                # 进去, 对端早就不处理了。所以再挂一道"摄像头页还在不在"的判据 ——
-                # 麦克风只在摄像头页里开, 那页的 JS 心跳停了就说明人走了。
-                # (_viewer_seen 从没被写过 = 压根没人开过摄像头页, 不做这个判断)
-                if tied and time.time() - _viewer_seen["t"] > CAM_VIEWER_TIMEOUT:
-                    audit("audio", "摄像头页心跳停了 %.0fs, 判定没人听, 停止收音"
-                                   % (time.time() - _viewer_seen["t"]))
+                # 进去, 对端早就不处理了。所以再挂一道"页面还在不在"的判据 ——
+                # 那页的 JS 心跳停了就说明人走了。
+                # (_page_seen 从没被写过 = 压根没人开过这个页面, 不做这个判断)
+                if tied and time.time() - _page_seen["t"] > CAM_VIEWER_TIMEOUT:
+                    audit("audio", "页面心跳停了 %.0fs, 判定没人听, 停止收音"
+                                   % (time.time() - _page_seen["t"]))
                     break
                 if buf:
+                    # 记下"这条流第 0 个采样是什么时候采到的", 前端要用它算
+                    # "正在听的声音是多久以前的"(见 audio_chunk_capture_ms)。
+                    # **只在第一块上记**: 每块都覆盖就变成"最新一块的时刻"了,
+                    # 前端拿它 + currentTime 会算出负数。
+                    if sid and audio_since_get(sid) is None:
+                        audio_since_set(sid, audio_chunk_capture_ms(len(buf)))
                     if not self._write_chunk(buf):
                         break
                     buf = None
@@ -4575,6 +5461,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if ws:
                 audit("term", "终端会话打开 from " + _who(self))
                 ws_term_bridge(ws)
+        elif path == "/ws/vnc-time":
+            # 画面时间戳旁路(见 ws_vnc_time)。只读, 不接受任何输入。
+            ws = self._ws(protocols=["binary"])
+            if ws:
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                ws_vnc_time(ws, q.get("viewer", [""])[0][:80])
         elif path == "/ws/vnc":
             ws = self._ws(protocols=["binary"])
             if ws:
@@ -4601,10 +5493,93 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"ok": True, "rows": rows,
                         "counts": dict(counts.most_common()),
                         "cats": AUDIT_CATS})
+        elif path == "/api/icon":
+            # 窗口列表里的应用图标。名字来自 .desktop 的 Icon=, 也可能是绝对路径。
+            # 只允许 _ICON_ROOTS 里的文件 —— 别给路径穿越留口子。
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            f = find_icon((q.get("n") or [""])[0])
+            f = icon_scaled(f) if f else None
+            real = os.path.realpath(f) if f else ""
+            roots = tuple(_ICON_ROOTS) + (_ICON_CACHE_DIR,)
+            if not real or not os.path.isfile(real) or not any(
+                    real.startswith(os.path.realpath(r) + os.sep) for r in roots):
+                self._html(404, "<h1>404</h1>")
+                return
+            try:
+                st = os.stat(real)
+                with open(real, "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                self._html(404, "<h1>404</h1>")
+                return
+            etag = f'"{st.st_mtime_ns}-{st.st_size}"'
+            if self.headers.get("If-None-Match") == etag:
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.end_headers()
+                return
+            ext = os.path.splitext(real)[1].lower()
+            ctype = {"png": "image/png", "svg": "image/svg+xml",
+                     "xpm": "image/x-xpixmap"}.get(ext.lstrip("."), "application/octet-stream")
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("ETag", etag)
+            # 图标基本不变 -> 让浏览器长期缓存, 别每秒都来要一遍
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            try:
+                self.wfile.write(data)
+            except OSError:
+                pass
+        elif path == "/api/version":
+            # 给前端判断"服务端是不是更新过了"(见 loadtip.js)。
+            # 必须 no-store —— 用户那台网络里有设备会缓存响应, 不然这个也会被缓存住。
+            self._json({"ok": True, "v": asset_version()},
+                       extra={"Cache-Control": "no-store"})
+        elif path == "/api/activity":
+            # 给远程桌面用: 进去时把虚拟光标定位到**电脑上鼠标的真实位置**,
+            # 而不是画布正中(用户要求)。顺带把前台窗口/空闲时长也给了。
+            self._json(COLLECTOR.activity())
+        elif path == "/api/time":
+            # 给前端做**时钟对齐**用: 手机的 Date.now() 和电脑的差多少。
+            # 前端连打几次取 RTT 最小的那次, 就能把服务端发来的时间戳换算到
+            # 本地时钟上 —— 摄像头页那个"画面是多少毫秒以前的"就是这么算的
+            # (见 cam.js 的 syncClock / frameAge)。
+            self._json({"ok": True, "s": int(time.time() * 1000)})
+        elif path == "/api/selfcheck":
+            # 一键自检(主页最下面那个按钮)。服务端这半边查的是"机器本身"。
+            # 会**短暂试采一次麦克风**(约 0.9 秒) —— "设备在"不等于"采得到声音"。
+            # 摄像头不在这里开(亮灯 + 独占设备), 交给前端那两条延时测量去验。
+            r = run_selfcheck()
+            s = r["summary"]
+            audit("selfcheck", "自检: %d 项正常, %d 项注意, %d 项异常 (%dms)"
+                               % (s["ok"], s["warn"], s["bad"], r["ms"]))
+            self._json(r)
+        elif path == "/api/audio/hb":
+            # 麦克风的"页面还开着"心跳。摄像头和麦克风现在是两个独立开关,
+            # 收音不能再靠摄像头 WS 的心跳续命(只开麦/关了摄像头都会被误杀),
+            # 所以麦自己刷一次这个时间戳(见 _page_seen 的注释)。
+            # 顺手把服务端管道滞后捎回去 —— 前端要拿它算"声音是多少秒以前的",
+            # 省掉一次单独的轮询。
+            _page_seen["t"] = time.time()
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            sid = (q.get("sid") or [""])[0]
+            self._json({"ok": True, "lag": audio_hub_lag(),
+                        "since": audio_since_get(sid)})
         elif path == "/api/audio/mics":
             # 给前端用: 有哪些麦克风、哪些真的能用(实测)。
-            # 走缓存版 —— 每次真探要 20 秒上下, 而前端一进摄像头页就会调它。
-            mics = audio_list_mics_cached()
+            # 默认走缓存版 —— 前端一进摄像头页就会调它, 每次真探要 1 秒上下。
+            # ?fresh=1 强制**当场重探**: 用户要开麦了, 不能拿几十秒前的旧结论
+            # 去糊弄他(设备可能刚插上/刚拔掉)。
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if (q.get("fresh") or ["0"])[0] not in ("", "0"):
+                mics = audio_list_mics()
+                with _mics_lock:
+                    _mics_cache["t"] = time.time() + 90
+                    _mics_cache["val"] = mics
+            else:
+                mics = audio_list_mics_cached()
             usable = next((m for m in mics if m["usable"]), None)
             self._json({"ok": True, "mics": mics, "usable": usable})
         elif path == "/api/audio/check":
@@ -4620,7 +5595,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # 声音**默认不采**: 只有用户主动点了「开启声音」才会来请求这里。
             # 断开(关页面/点停止)时 ffmpeg 立刻收工。
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            self._serve_audio(src=(q.get("src") or ["default"])[0])
+            self._serve_audio(src=(q.get("src") or ["default"])[0],
+                              sid=(q.get("sid") or [""])[0])
         elif path == "/ws/cam":
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             g = lambda k: (q.get(k) or [None])[0]
@@ -5054,6 +6030,11 @@ def main():
     # —— 改了 server.py 但没重启服务是排查时最常踩的坑。
     audit("boot", f"服务启动 pid={os.getpid()} 输入串行化=on 输入法门禁="
                   f"{'on' if shutil.which('fcitx-remote') else 'off(未装 fcitx-remote)'}")
+    # ffmpeg 是**显式挑**出来的(见 _pick_ffmpeg 的注释): 本机 PATH 里那个
+    # ~/.local/bin/ffmpeg 是没编 pulse 的精简构建, 吃掉它麦克风就全废。
+    # 写进日志, 下次一眼就能看出是不是又挑错了。
+    audit("boot", f"ffmpeg -> {FFMPEG} (支持: "
+                  f"{','.join(sorted(_ffmpeg_devices(FFMPEG) & set(FFMPEG_NEEDS))) or '无'})")
     print(f"[meow-console] listening on {BIND}:{PORT}  (经 lan_forward 对外暴露)", flush=True)
     # 后台预热麦克风探测: 第一次探要真开设备试采(约 3 秒), 不等用户进摄像头页才做。
     # 失败无所谓(没麦克风本来就会返回空列表), 所以吞掉异常。
